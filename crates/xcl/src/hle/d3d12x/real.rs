@@ -1546,7 +1546,23 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    // The last reference: kept until the queues are past the work in flight (`late_release`).
+    // (Two last-but-one releases at once can miss each other here; the object then goes at
+    // once, as before.)
+    let mut held = false;
+    let n = if super::late_release::enabled() {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        if add(this) == 2 {
+            f(this);
+            held = true;
+            0
+        } else {
+            f(this);
+            f(this)
+        }
+    } else {
+        f(this)
+    };
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1571,6 +1587,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
                 u.free(p);
             }
         }
+    }
+    if held {
+        super::late_release::hold(this as usize);
     }
     n
 }
@@ -3326,17 +3345,6 @@ struct Slots {
 
 struct SlotGuard(&'static Slots);
 
-impl Slots {
-    fn acquire(&'static self) -> SlotGuard {
-        let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
-            n = self.cv.wait(n).unwrap();
-        }
-        *n += 1;
-        SlotGuard(self)
-    }
-}
-
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         *self.0.n.lock().unwrap() -= 1;
@@ -3346,17 +3354,88 @@ impl Drop for SlotGuard {
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
 
-/// Before a big driver compile in the background: until 3 GB of commit are free (each takes
-/// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
-fn wait_for_commit() {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    loop {
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 3 << 30 {
-            return;
+/// Before a big driver compile in the background: its turn – one at a time, and 3 GB of commit
+/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
+/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
+/// when that thread builds it itself. Holding such a build back holds the title back: on a
+/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
+/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
+    const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+    let slot = {
+        let mut n = slots.n.lock().unwrap();
+        loop {
+            if wanted() {
+                return None;
+            }
+            if *n < slots.most {
+                break;
+            }
+            n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        *n += 1;
+        SlotGuard(slots)
+    };
+    while !commit_free() {
+        if wanted() {
+            return None;
+        }
+        std::thread::sleep(LOOK);
+    }
+    Some(slot)
+}
+
+/// 3 GB of commit are free (true when that is not known).
+fn big_compile_commit_free() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
+}
+
+#[cfg(test)]
+mod big_compile_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_wanted_build_waits_for_neither_the_slot_nor_the_commit() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        // the slot is taken: a wanted build goes on without one, at once
+        assert!(big_compile_turn(&S, || true, || true).is_none());
+        // … and one that becomes wanted while it waits for the slot goes on then
+        static WANTED: AtomicBool = AtomicBool::new(false);
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || WANTED.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "not wanted yet: it waits for its turn");
+        WANTED.store(true, Ordering::Release);
+        assert!(t.join().unwrap());
+        drop(held);
+        assert_eq!(*S.n.lock().unwrap(), 0);
+        // without the commit: not wanted, it waits; wanted, it goes on and gives the slot back
+        static WANTED2: AtomicBool = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "no commit free: it waits");
+        WANTED2.store(true, Ordering::Release);
+        assert!(t.join().unwrap() && t0.elapsed() < Duration::from_secs(5));
+        assert_eq!(*S.n.lock().unwrap(), 0, "the slot went back");
+    }
+
+    #[test]
+    fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let first = big_compile_turn(&S, || true, || false).expect("its turn");
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || false).is_some());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "one at a time");
+        drop(first);
+        assert!(t.join().unwrap(), "the next one's turn");
+        assert_eq!(*S.n.lock().unwrap(), 0);
     }
 }
 
@@ -3408,13 +3487,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    let started = std::time::Instant::now();
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
+    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
+        .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, super::pso_async::build_is_wanted));
+    let started = std::time::Instant::now();
     let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
@@ -3463,7 +3539,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
 /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
-mod driver_cache {
+pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3504,16 +3580,36 @@ mod driver_cache {
         }
     }
 
+    fn create_staging_file(p: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        create_staging_file_with(p, &NEXT)
+    }
+
+    fn create_staging_file_with(p: &Path, next: &AtomicU64) -> std::io::Result<(PathBuf, std::fs::File)> {
+        loop {
+            let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), next.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+                Ok(file) => return Ok((tmp, file)),
+                // A prior process with this PID may have left a file behind. It is not ours.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
     pub fn write(p: &Path, bytes: &[u8]) -> bool {
+        use std::io::Write;
         if bytes.is_empty() {
             return false;
         }
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-        let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok();
+        let Ok((tmp, mut file)) = create_staging_file(p) else { return false };
+        let written = file.write_all(bytes).is_ok();
+        drop(file);
+        let ok = written && std::fs::rename(&tmp, p).is_ok();
         if !ok {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -3533,6 +3629,11 @@ mod driver_cache {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
 
         #[test]
         fn a_file_is_named_after_its_dxil_and_flags() {
@@ -3561,6 +3662,44 @@ mod driver_cache {
             note(false, Some(&p));
             assert_eq!(load(&p), None);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_overlapping_writer_cannot_modify_the_published_blob() {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-overlap-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let p = dir.join("program.pso");
+            // Another writer, paused after the production staging-file creation step.
+            let (_other_tmp, mut other) = create_staging_file(&p).unwrap();
+            let complete = b"complete second blob";
+            assert!(write(&p, complete));
+            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()));
+            // Resuming the older writer must not change a file already published by this
+            // invocation, even when the older payload is shorter than the newer one.
+            other.write_all(b"old").unwrap();
+            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()), "published bytes must not alias another writer's staging file");
+        }
+
+        #[test]
+        fn an_abandoned_staging_file_is_skipped_and_preserved() {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-stale-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let p = dir.join("program.pso");
+            let occupied = p.with_extension(format!("tmp{}-0", std::process::id()));
+            std::fs::write(&occupied, b"not ours").unwrap();
+            let next = AtomicU64::new(0);
+            let (tmp, mut file) = create_staging_file_with(&p, &next).unwrap();
+            assert_eq!(next.load(Ordering::Relaxed), 2, "the occupied candidate was passed over");
+            assert_ne!(tmp, occupied);
+            file.write_all(b"ours").unwrap();
+            drop(file);
+            std::fs::rename(&tmp, &p).unwrap();
+            assert_eq!(load(&p).as_deref(), Some(b"ours".as_slice()));
+            assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
         }
     }
 }
@@ -4842,15 +4981,25 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
     n
 }
 
-unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+/// Reset the (adopted) PC allocator `raw` itself.
+pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
-    let hr = f(this);
+    let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
+    f(raw)
+}
+
+unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
+    let hr = match super::alloc_pool::title_reset(this) {
+        Some(hr) => hr,
+        None => reset_pc_allocator(this),
+    };
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
@@ -5071,6 +5220,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::list_x::copy_scratch_submitted(this, chunk);
+        super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
