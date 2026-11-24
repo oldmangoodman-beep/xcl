@@ -235,12 +235,18 @@ mod translated {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
-            identity_with(
+            let id =             identity_with(
                 env!("XCL_TRANSLATOR_SOURCE_ID"),
                 super::dxc::toolchain_identity(),
                 Backend::current(),
                 crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
-            )
+            );
+            // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
+            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+            } else {
+                id
+            }
         })
     }
 
@@ -581,6 +587,12 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
+/// The HLSL and profile a console program compiles from at pipeline creation (for
+/// `xcl shaders --export-hlsl`: compile-time investigations outside a title).
+pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool) -> Result<(String, &'static str), String> {
+    console_translation(blob, stage, 0, windows, split_wave64).map(|(t, p)| (t.hlsl, p))
+}
+
 /// A direct DXIL translation that fell back to the HLSL path: one structured log line
 /// (`stage=… reason=…`, the reason with operands stripped) and the live summary counter
 /// (`XCL_DIRECT_DXIL_STATS=1`, `gpu::dxil::coverage`).
@@ -599,6 +611,20 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
+    // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
+    if super::lower_dxil::enabled() {
+        match super::lower_dxil::compute_with(code, &cs, o) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("CS per-lane");
+                dump_direct(blob, &k.dxil);
+                return Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers });
+            }
+            Err(e) => {
+                let reason = crate::gpu::dxil::coverage::record_fallback("CS per-lane", &e);
+                crate::xlog_info!("[SHADER] per-lane fallback reason=\"{reason}\" detail=\"{}\" – per-instruction form", e.lines().next().unwrap_or(""));
+            }
+        }
+    }
     let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
@@ -639,7 +665,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
 
-fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());

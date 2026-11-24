@@ -145,9 +145,18 @@ pub struct Lw {
     pub half: Value,
     /// the memory windows `mem`, `mem1`.. (u2..)
     pub mems: Vec<RawUav>,
+    /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
+    /// Some(globallycoherent)
+    pub heap_mem: Option<bool>,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
+    /// cached decoded format descriptors hoisted to `d3`'s defining block
+    pub fmt_desc_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtDesc>,
+    /// cached single-component format decode parameters hoisted to `d3`'s defining block
+    pub fmt_comp1_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtComp1>,
+    /// cached `IO_UMA_BASE_HI` loaded once in the entry block for multi-window address math
+    pub uma_base_val: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
     /// the lane's scratch array (an alloca in the entry block)
