@@ -131,7 +131,8 @@ fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel
 /// (as the HLSL compute mode's `globallycoherent` windows).
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, 4);
+    let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -368,6 +369,28 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     lw.finish(numthreads, hw)
 }
 
+/// True when a pixel shader uses RDNA2 Primitive Ordered Pixel Shading (POPS):
+/// reads `src_pops_exiting_wave_id` (operand 239) or accesses `HW_REG_POPS_PACKER`
+/// (hardware register 25 via `S_GETREG_B32` / `S_SETREG*`).
+fn uses_pops(insts: &[Decoded]) -> bool {
+    const SRC_POPS_EXITING_WAVE_ID: u64 = 239;
+    const HW_REG_POPS_PACKER: u64 = 25;
+    insts.iter().any(|d| {
+        if matches!(d.inst.name, "S_GETREG_B32" | "S_SETREG_B32" | "S_SETREG_IMM32_B32")
+            && crate::gpu::rdna2::field_value(d.enc, &d.words, "SIMM16").is_some_and(|v| (v & 0x3F) == HW_REG_POPS_PACKER)
+        {
+            return true;
+        }
+        d.ienc.operands.iter().any(|o| {
+            let Some(f) = o.field else { return false };
+            o.input
+                && !o.implicit
+                && (o.ty.starts_with("OPR_SRC") || o.ty.starts_with("OPR_SSRC"))
+                && crate::gpu::rdna2::field_value(d.enc, &d.words, f) == Some(SRC_POPS_EXITING_WAVE_ID)
+        })
+    })
+}
+
 impl Lw {
     /// The translator's state for a program (`insts`, its blocks starting at `leaders`) at
     /// `entry`: the shader with its buffers,
@@ -397,6 +420,9 @@ impl Lw {
         let mut s = Shader::new(stage, (6, 6));
         let io = s.raw_uav(0, 0);
         let res = if kernel || ms.is_some() || matches!(entry, Entry::Geometry(_)) { Some(s.raw_uav(1, 0)) } else { None };
+        if stage == Stage::Pixel && uses_pops(insts) {
+            s.enable_rov();
+        }
         let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
         let i32 = s.m.i32();
         let z = s.m.i32c(0);

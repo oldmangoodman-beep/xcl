@@ -4658,10 +4658,11 @@ impl Em {
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU there; graphics keeps the cached (faster) view
         let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-        let windows = self.opt.mem_windows.clamp(1, 4);
+        let max_win = if self.opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+        let windows = self.opt.mem_windows.clamp(1, max_win);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
-            for k in 1..windows {
+            for k in 1..windows.min(crate::gpu::uma::MAX_WINDOWS as u32) {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");

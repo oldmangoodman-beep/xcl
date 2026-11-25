@@ -8164,6 +8164,96 @@ fn gpu_fmt_encode_int_sat_and_f16_rtz() {
     assert_eq!(r.mem[0x20C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "11_11_10_FLOAT saturates finite overflow and keeps +inf");
 }
 
+/// Direct DXIL and HLSL parity for `fmt_encode`: UINT/SINT saturation (`w < 32`), `w == 32`
+/// passthrough, and RTZ binary16 / 11_11_10_FLOAT rounding (`XCL-BT-026`, #1488, #1269).
+#[test]
+fn gpu_fmt_encode_direct_dxil_int_sat_and_f16_rtz() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let p = prog(&[
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 0), ("SRSRC", 4), ("SOFFSET", 128)], None),    // 16_16_UINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 5), ("SOFFSET", 128)], None),    // 16_16_SINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 4), ("SRSRC", 6), ("SOFFSET", 128)], None),  // 8_8_8_8_UINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("SRSRC", 7), ("SOFFSET", 128)], None),  // 8_8_8_8_SINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 12), ("SRSRC", 8), ("SOFFSET", 128)], None), // 2_10_10_10_SINT
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 16), ("SRSRC", 9), ("SOFFSET", 128)], None),    // 32_UINT
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 17), ("SRSRC", 10), ("SOFFSET", 128)], None),   // 32_SINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 18), ("SRSRC", 11), ("SOFFSET", 128)], None),  // 16_16_FLOAT overflow
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 20), ("SRSRC", 12), ("SOFFSET", 128)], None),  // 16_16_FLOAT normal RTZ
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 22), ("SRSRC", 13), ("SOFFSET", 128)], None),  // 16_16_FLOAT ±inf
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 24), ("SRSRC", 14), ("SOFFSET", 128)], None),  // 16_16_FLOAT subnormal RTZ / -0
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 26), ("SRSRC", 15), ("SOFFSET", 128)], None), // 11_11_10_FLOAT overflow + inf
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 29), ("SRSRC", 16), ("SOFFSET", 128)], None), // 11_11_10_FLOAT NaN / neg / RTZ
+    ]);
+    let mut st = KernelState::default();
+    let fmts = [
+        (4, 0x200, 27), (5, 0x204, 28), (6, 0x208, 60), (7, 0x20C, 61), (8, 0x210, 55),
+        (9, 0x214, 20), (10, 0x218, 21), (11, 0x21C, 29), (12, 0x220, 29), (13, 0x224, 29),
+        (14, 0x228, 29), (15, 0x22C, 43), (16, 0x230, 43),
+    ];
+    for (sr, base, fmt) in fmts {
+        st.sgpr[sr * 4..sr * 4 + 4].copy_from_slice(&vs(base, fmt));
+    }
+    for r in st.vgpr.iter_mut() {
+        r[0] = 70_000u32;
+        r[1] = u32::MAX;
+        r[2] = 40_000i32 as u32;
+        r[3] = (-40_000i32) as u32;
+        r[4] = 300u32;
+        r[5] = 255u32;
+        r[6] = 0u32;
+        r[7] = u32::MAX;
+        r[8] = 200i32 as u32;
+        r[9] = (-200i32) as u32;
+        r[10] = 127i32 as u32;
+        r[11] = (-128i32) as u32;
+        r[12] = 600i32 as u32;
+        r[13] = (-600i32) as u32;
+        r[14] = 0u32;
+        r[15] = (-3i32) as u32;
+        r[16] = 0xDEAD_BEEFu32;
+        r[17] = i32::MIN as u32;
+        r[18] = 65520.0f32.to_bits();
+        r[19] = (-65520.0f32).to_bits();
+        r[20] = 0x3F80_1800; // 1.0 + 0.75 * 2^-10: RNE -> 0x3C01, RTZ -> 0x3C00
+        r[21] = 0xBF80_1800; // -(1.0 + 0.75 * 2^-10): RNE -> 0xBC01, RTZ -> 0xBC00
+        r[22] = f32::INFINITY.to_bits();
+        r[23] = f32::NEG_INFINITY.to_bits();
+        r[24] = 0x3340_0000; // 0.75 * 2^-24: RNE -> 0x0001, RTZ -> 0x0000
+        r[25] = (-0.0f32).to_bits();
+        r[26] = 65520.0f32.to_bits();
+        r[27] = f32::INFINITY.to_bits();
+        r[28] = 65520.0f32.to_bits();
+        r[29] = f32::NAN.to_bits();
+        r[30] = (-1.0f32).to_bits();
+        r[31] = 0x3F81_F800; // 1.0 + 15.75 * 2^-10: RNE -> 0x3C10 (>>4 = 0x3C1), RTZ -> 0x3C0F (>>4 = 0x3C0)
+    }
+    let mem = vec![0u32; 0x100];
+    let t = translate(&p, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let direct_dxil = runner::direct_kernel_full(&p, true).unwrap().dxil;
+    for (backend, dxil) in [("hlsl", hlsl_dxil), ("direct_dxil", direct_dxil)] {
+        let r = runner::run_with_statics(&dxil, &st, &mem, &[], &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
+        assert_eq!(r.mem[0x200 / 4], 0xFFFF_FFFF, "{backend}: 16_16_UINT");
+        assert_eq!(r.mem[0x204 / 4], 0x8000_7FFF, "{backend}: 16_16_SINT");
+        assert_eq!(r.mem[0x208 / 4], 0xFF00_FFFF, "{backend}: 8_8_8_8_UINT");
+        assert_eq!(r.mem[0x20C / 4], 0x807F_807F, "{backend}: 8_8_8_8_SINT");
+        assert_eq!(r.mem[0x210 / 4], 0x1FF | (0x200 << 10) | (2 << 30), "{backend}: 2_10_10_10_SINT");
+        assert_eq!(r.mem[0x214 / 4], 0xDEAD_BEEF, "{backend}: 32_UINT passthrough");
+        assert_eq!(r.mem[0x218 / 4], i32::MIN as u32, "{backend}: 32_SINT passthrough");
+        assert_eq!(r.mem[0x21C / 4], 0xFBFF_7BFF, "{backend}: 16_16_FLOAT finite overflow RTZ");
+        assert_eq!(r.mem[0x220 / 4], 0xBC00_3C00, "{backend}: 16_16_FLOAT normal RTZ");
+        assert_eq!(r.mem[0x224 / 4], 0xFC00_7C00, "{backend}: 16_16_FLOAT ±inf");
+        assert_eq!(r.mem[0x228 / 4], 0x8000_0000, "{backend}: 16_16_FLOAT subnormal RTZ / -0.0");
+        assert_eq!(r.mem[0x22C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "{backend}: 11_11_10_FLOAT overflow + inf");
+        assert_eq!(r.mem[0x230 / 4], 0x3F0 | (0x3C0 << 21), "{backend}: 11_11_10_FLOAT NaN / neg / RTZ");
+    }
+}
+
 #[test]
 fn gpu_signed_bfe_arithmetic_shift() {
     for wave64 in gpu_waves() {
