@@ -79,7 +79,7 @@ fn take_sparse_in(
     if lo_bound >= hi_bound {
         return None;
     }
-    let found = g.0.iter().find_map(|(&o, &l)| {
+    let first_fit = |(&o, &l): (&usize, &usize)| {
         let lo = o.max(lo_bound);
         let hi = o.saturating_add(l).min(hi_bound);
         if lo >= hi {
@@ -94,6 +94,13 @@ fn take_sparse_in(
             at = (next_win.checked_add(align - 1)?) & !(align - 1);
         }
         None
+    };
+    let first = g.0.first_key_value()?;
+    let found = first_fit(first).or_else(|| {
+        // Disjoint free ranges mean only the immediate predecessor can cross lo_bound.
+        // Check it first, then search the starts inside the bounds in address order.
+        g.0.range(..lo_bound).next_back().and_then(first_fit)
+            .or_else(|| g.0.range(lo_bound..hi_bound).find_map(first_fit))
     });
     let (start, len, at) = found?;
     g.0.remove(&start);
@@ -886,6 +893,42 @@ mod tests {
         assert_eq!(u.sparse_release(d), Some(ld));
         assert_eq!(u.sparse_release(r), Some(big));
         assert_eq!(u.sparse_used(), 0);
+    }
+
+    #[test]
+    fn sparse_first_fit_keeps_the_range_crossing_the_lower_bound() {
+        let lo = WINDOW;
+        let hi = lo + 10 * GRAIN;
+        let mut ranges = (
+            BTreeMap::from([
+                (GRAIN, GRAIN),
+                (lo - GRAIN, 4 * GRAIN),
+                (lo + 4 * GRAIN, 4 * GRAIN),
+                (hi, 4 * GRAIN),
+            ]),
+            BTreeMap::new(),
+        );
+
+        // The range that starts before lo wins over the later range.
+        assert_eq!(take_sparse_in(&mut ranges, lo, hi, 2 * GRAIN, GRAIN, true), Some(lo));
+        assert_eq!(ranges.0.get(&(lo - GRAIN)), Some(&GRAIN));
+        assert_eq!(ranges.0.get(&(lo + 2 * GRAIN)), Some(&GRAIN));
+        // The remaining one-grain hole is too small. The next aligned fit is later.
+        assert_eq!(take_sparse_in(&mut ranges, lo, hi, 2 * GRAIN, 4 * GRAIN, true), Some(lo + 4 * GRAIN));
+        let after = ranges.clone();
+        assert_eq!(take_sparse_in(&mut ranges, lo, hi, 3 * GRAIN, GRAIN, true), None);
+        assert_eq!(ranges, after);
+    }
+
+    #[test]
+    fn sparse_first_fit_skips_a_window_boundary_only_when_requested() {
+        let lo = WINDOW - GRAIN;
+        let hi = WINDOW + 2 * GRAIN;
+        let ranges = BTreeMap::from([(GRAIN, GRAIN), (lo - GRAIN, 4 * GRAIN), (hi + GRAIN, GRAIN)]);
+        let mut single = (ranges.clone(), BTreeMap::new());
+        let mut cross = (ranges, BTreeMap::new());
+        assert_eq!(take_sparse_in(&mut single, lo, hi, 2 * GRAIN, GRAIN, true), Some(WINDOW));
+        assert_eq!(take_sparse_in(&mut cross, lo, hi, 2 * GRAIN, GRAIN, false), Some(lo));
     }
 
     #[test]
