@@ -29,6 +29,9 @@ pub const VAR_WIN: u32 = VAR_BUDGET + 2;
 /// arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
+/// slots; the recompiler's `xcl_iw{srsrc}`)
+pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
@@ -115,7 +118,7 @@ impl Init {
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -195,6 +198,9 @@ pub struct Lw {
     pub uma_base_val: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
+    /// the `s_load_dword*` being lowered repeats an earlier one (`reload`): set by the
+    /// translator's loop for that instruction
+    pub reload: Option<super::reload::Reload>,
     /// the lane's scratch array (an alloca in the entry block)
     pub scratch: Option<Value>,
     /// MIMG instructions (pc) whose S# is built from constants in the code: the HLSL
@@ -208,6 +214,8 @@ pub struct Lw {
     pub f32_rm: bool,
     pub track_frexp_denorm: bool,
     pub has_f64_round_op: bool,
+    /// the T# SGPRs of the program's image stores and atomics (`recomp::emit::image_write_srsrcs`)
+    pub img_writes: Vec<u64>,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,
@@ -252,6 +260,10 @@ pub struct Lw {
     /// When set, the wave-wide mask cross-lane instructions see (DPP source lanes,
     /// readfirstlane, ds_swizzle / bpermute) instead of the SSA EXEC.
     pub mask_override: Option<(Value, Value)>,
+    /// split form: a mask an instruction writes is built from this half's ballot alone, as
+    /// when it is never read whole. Set by a caller that reads back only each lane's own bit
+    /// (the per-lane form's bridge), so no exchange meets the other half.
+    pub local_masks: bool,
 }
 
 impl Lw {
@@ -900,7 +912,8 @@ impl Lw {
         // split form: a mask only ever read lane by lane (or going nowhere, or 0 anyway)
         // needs only this half's word (`recomp::x64_masks`, the HLSL `xcl_x_ballot_local`)
         let local = self.split
-            && (self.s.m.const_u64(cond) == Some(0)
+            && (self.local_masks
+                || self.s.m.const_u64(cond) == Some(0)
                 || match *dst {
                     Dst::S(n) => n < 126 && self.whole_live.get(&self.pc).is_some_and(|live| live & (3u128 << n) == 0),
                     Dst::Null => true,
@@ -1078,10 +1091,10 @@ impl Lw {
         if sp_mask != 0 && !self.f32_rm {
             return err(d, "dynamic f32 round mode");
         }
-        if self.has_f64_round_op {
+        if dp_mask != 0 && self.has_f64_round_op {
             return err(d, "dynamic f64 round mode");
         }
-        if self.dyn_rm {
+        if dp_mask != 0 && self.dyn_rm {
             let sd = Self::field(d, "SDST");
             let src = self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?;
             let v = match dp_mask {
