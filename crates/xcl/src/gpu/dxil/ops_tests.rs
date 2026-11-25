@@ -1177,6 +1177,29 @@ fn half_precision_overloads_run() {
     }
 }
 
+#[test]
+fn dot4_add_u8_packed_matches_cpu() {
+    let mut k = kernel();
+    let acc = k.input(0);
+    let a = k.input(1);
+    let b = k.input(2);
+    let d = k.s.dot4_add_u8_packed(acc, a, b);
+    k.out(0, d);
+    let c = k.finish([32, 1, 1]);
+    let accs: Vec<u32> = (0..32).map(|l| if l % 3 == 0 { 0xFFFF_FF00u32.wrapping_add(l) } else { UVALS[l as usize] }).collect();
+    let bs = uvals2();
+    let Some(r) = gpu(&c, &mem_of(&[accs.clone(), UVALS.to_vec(), bs.clone()]), &[], &[]) else { return };
+    for l in 0..32 {
+        let mut want = accs[l];
+        for i in 0..4 {
+            let x = (UVALS[l] >> (8 * i)) & 0xFF;
+            let y = (bs[l] >> (8 * i)) & 0xFF;
+            want = want.wrapping_add(x * y);
+        }
+        assert_eq!(outv(&r, 0)[l], want, "lane {l}: acc={:#x} a={:#x} b={:#x}", accs[l], UVALS[l], bs[l]);
+    }
+}
+
 /// Every literal `op(<opcode>, "<name>", .., FnAttrs::<X>)` in the backend
 /// declares the attributes DXC uses for that opcode (table in
 /// `shader::dxc_fn_attrs`, from DXC 1.9 `-Fc` listings).

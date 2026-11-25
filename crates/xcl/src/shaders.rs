@@ -795,37 +795,137 @@ fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
     ks.iter().map(|&k| (k, max_rank.iter().filter(|&&r| r <= k).count())).collect()
 }
 
-pub fn run(path: &Path, args: &[String]) -> i32 {
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
-    // a flag that needs a value: missing, or another flag in its place, is an error
-    let required = |name: &str| -> Result<Option<&String>, String> {
-        match args.iter().position(|a| a == name) {
-            None => Ok(None),
-            Some(i) => match args.get(i + 1) {
-                Some(v) if !v.starts_with("--") => Ok(Some(v)),
-                _ => Err(format!("xcl shaders: {name} needs a value")),
-            },
-        }
+struct ShadersOptions {
+    top: usize,
+    json: bool,
+    compile: usize,
+    recomp: bool,
+    iface: bool,
+    example: Option<String>,
+    windows: u32,
+    split: Option<bool>,
+    export_hlsl: Option<PathBuf>,
+    min_kb: usize,
+    count: usize,
+    record_hash: Option<u64>,
+    measure_pso: Option<u64>,
+    repeat: usize,
+    precompile: bool,
+    limit: usize,
+    only: Option<String>,
+    pipelines: bool,
+    used_only: bool,
+    direct: bool,
+    sample: usize,
+    seed: u64,
+    validate: bool,
+    compare: bool,
+    threads: Option<usize>,
+    trace: bool,
+    max_bytes: usize,
+    timeout: u64,
+    lanes: bool,
+    hash: Option<u64>,
+    dump: Option<PathBuf>,
+}
+
+fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
+    let mut opts = ShadersOptions {
+        top: 60,
+        json: false,
+        compile: 0,
+        recomp: false,
+        iface: false,
+        example: None,
+        windows: 4,
+        split: None,
+        export_hlsl: None,
+        min_kb: 1024,
+        count: 2,
+        record_hash: None,
+        measure_pso: None,
+        repeat: 1,
+        precompile: false,
+        limit: usize::MAX,
+        only: None,
+        pipelines: false,
+        used_only: false,
+        direct: false,
+        sample: 200,
+        seed: 1,
+        validate: false,
+        compare: false,
+        threads: None,
+        trace: false,
+        max_bytes: 16384,
+        timeout: 10,
+        lanes: false,
+        hash: None,
+        dump: None,
     };
-    let (export_dir, record_hash, measure) = match (required("--export-hlsl"), required("--record-hash"), required("--measure-pso")) {
-        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            eprintln!("{e}");
+    let mut p = crate::cli::Parser::new(args);
+    while let Some(arg) = p.next_arg() {
+        match arg {
+            "--top" => opts.top = p.parse_usize("--top")?,
+            "--json" => opts.json = true,
+            "--compile" => opts.compile = p.parse_usize("--compile")?,
+            "--recomp" => opts.recomp = true,
+            "--iface" => opts.iface = true,
+            "--example" => opts.example = Some(p.value("--example")?.to_string()),
+            "--windows" => {
+                let w = p.parse_usize("--windows")?;
+                opts.windows = u32::try_from(w).map_err(|_| format!("invalid value for --windows: {w}"))?;
+            }
+            "--split" => opts.split = Some(p.parse_bool_01("--split")?),
+            "--export-hlsl" => opts.export_hlsl = Some(PathBuf::from(p.value("--export-hlsl")?)),
+            "--min-kb" => opts.min_kb = p.parse_usize("--min-kb")?,
+            "--count" => opts.count = p.parse_usize("--count")?,
+            "--record-hash" => opts.record_hash = Some(p.parse_hex_u64("--record-hash")?),
+            "--measure-pso" => opts.measure_pso = Some(p.parse_hex_u64("--measure-pso")?),
+            "--repeat" => opts.repeat = p.parse_usize("--repeat")?,
+            "--precompile" => opts.precompile = true,
+            "--limit" => opts.limit = p.parse_usize("--limit")?,
+            "--only" => opts.only = Some(p.value("--only")?.to_ascii_lowercase()),
+            "--pipelines" => opts.pipelines = true,
+            "--used-only" => opts.used_only = true,
+            "--direct" => opts.direct = true,
+            "--sample" => opts.sample = p.parse_usize("--sample")?,
+            "--seed" => opts.seed = p.parse_u64("--seed")?,
+            "--validate" => opts.validate = true,
+            "--compare" => opts.compare = true,
+            "--threads" => opts.threads = Some(p.parse_usize("--threads")?),
+            "--trace" => opts.trace = true,
+            "--max-bytes" => opts.max_bytes = p.parse_usize("--max-bytes")?,
+            "--timeout" => opts.timeout = p.parse_u64("--timeout")?,
+            "--lanes" => opts.lanes = true,
+            "--hash" => opts.hash = Some(p.parse_hex_u64("--hash")?),
+            "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
+            other => return Err(crate::cli::Parser::unexpected(other)),
+        }
+    }
+    Ok(opts)
+}
+
+pub fn run(path: &Path, args: &[String]) -> i32 {
+    let opts = match parse_args(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("xcl shaders: {e}");
             return 2;
         }
     };
     // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
     // (`pso::mem_windows`), as `--precompile`
     let runtime_windows = || {
-        let windows = opt("--windows").unwrap_or(4) as u32;
+        let windows = opts.windows;
         if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
     };
-    let top = opt("--top").unwrap_or(60);
-    let json = args.iter().any(|a| a == "--json");
-    let compile = opt("--compile").unwrap_or(0);
-    let recomp_on = compile > 0 || args.iter().any(|a| a == "--recomp");
-    let iface_on = args.iter().any(|a| a == "--iface");
-    if let Some(m) = args.iter().position(|a| a == "--example").and_then(|i| args.get(i + 1)) {
+    let top = opts.top;
+    let json = opts.json;
+    let compile = opts.compile;
+    let recomp_on = compile > 0 || opts.recomp;
+    let iface_on = opts.iface;
+    if let Some(m) = &opts.example {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
     let t0 = std::time::Instant::now();
@@ -847,7 +947,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if export_dir.is_some() || measure.is_some() {
+        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
@@ -856,64 +956,44 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
-    if let Some(dir) = export_dir {
-        let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
-            Some(Ok(h)) => Some(h),
-            Some(Err(e)) => {
-                eprintln!("xcl shaders: --record-hash: {e}");
-                return 2;
-            }
-            None => None,
-        };
+    if let Some(dir) = &opts.export_hlsl {
         return export_hlsl(
             &input,
-            Path::new(dir),
-            opt("--min-kb").unwrap_or(1024),
-            opt("--count").unwrap_or(2),
+            dir,
+            opts.min_kb,
+            opts.count,
             runtime_windows(),
-            opt("--split").map(|v| v != 0),
-            record_hash,
+            opts.split,
+            opts.record_hash,
         );
     }
-    if let Some(hash) = measure {
-        let hash = match parse_record_hash(hash) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("xcl shaders: --measure-pso: {e}");
-                return 2;
-            }
-        };
+    if let Some(hash) = opts.measure_pso {
         return measure_pso(
             &input,
             hash,
-            opt("--repeat").unwrap_or(1).max(1),
+            opts.repeat.max(1),
             runtime_windows(),
-            opt("--split").map(|v| v != 0),
+            opts.split,
         );
     }
-    if args.iter().any(|a| a == "--precompile") {
-        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
-        let pipelines = args.iter().any(|a| a == "--pipelines");
+    if opts.precompile {
         // `--used-only`: only the compute programs whose pipelines an earlier run of a title used
-        let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
+        let used = opts.used_only.then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
+        return precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0);
     }
-    if args.iter().any(|a| a == "--direct") {
-        return direct_sweep(&input, args, top, json, t0);
+    if opts.direct {
+        return direct_sweep(&input, &opts, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
 }
 
+#[cfg(test)]
 fn parse_record_hash(s: &str) -> Result<u64, String> {
-    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("{s:?} is not a 1–16 digit hexadecimal hash"));
-    }
-    u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    crate::cli::parse_hex_u64_str(s)
 }
 
 fn is_compute_container(blob: &[u8]) -> bool {
@@ -1423,7 +1503,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
@@ -1991,30 +2071,33 @@ fn name_hash(name: &str) -> u64 {
 /// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
 /// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
 /// cannot translate, translation times and (`--compare`) DXIL size vs HLSL + DXC.
-fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std::time::Instant) -> i32 {
+fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) -> i32 {
     use crate::gpu::dxil::coverage::{self, Report, Sample};
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
-    let want = opt("--sample").map(|v| v as usize).unwrap_or(200);
-    let want = if want == 0 { usize::MAX } else { want };
-    let seed = opt("--seed").unwrap_or(1);
-    let validate = args.iter().any(|a| a == "--validate");
-    let compare = args.iter().any(|a| a == "--compare");
-    let windows = opt("--windows").unwrap_or(4) as u32;
-    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
+    let top = opts.top;
+    let json = opts.json;
+    let want = if opts.sample == 0 { usize::MAX } else { opts.sample };
+    let seed = opts.seed;
+    let validate = opts.validate;
+    let compare = opts.compare;
+    let windows = opts.windows;
+    let split = opts.split.unwrap_or(true);
     // records hold one or more programs: sample records, stop at `want` programs
     let order = coverage::sample_indices(input.len(), want, seed);
     let next = AtomicUsize::new(0);
     let taken = AtomicUsize::new(0);
-    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
-    let trace = args.iter().any(|a| a == "--trace");
+    let threads = opts
+        .threads
+        .map(|v| v.max(1))
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+    let trace = opts.trace;
     // big programs translate slowly (SSA over every guarded access): skip above the cap,
     // give up on one after the timeout (its thread is left to finish; the process ends soon)
-    let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
-    let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
+    let max_bytes = opts.max_bytes;
+    let timeout = std::time::Duration::from_secs(opts.timeout);
     let skipped = AtomicUsize::new(0);
     // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
     // translates, its DXIL size against the per-instruction form's, and the refusals ranked
-    let lanes = args.iter().any(|a| a == "--lanes");
+    let lanes = opts.lanes;
     let lanes_tried = AtomicUsize::new(0);
     let lanes_ok = AtomicUsize::new(0);
     let lanes_bytes = AtomicUsize::new(0);
@@ -2023,9 +2106,9 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
-    let only_hash = args.iter().position(|a| a == "--hash").and_then(|i| args.get(i + 1)).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
-    if let Some(d) = &dump_dir {
+    let only_hash = opts.hash;
+    let dump_dir = opts.dump.as_ref();
+    if let Some(d) = dump_dir {
         let _ = std::fs::create_dir_all(d);
     }
     let (order, want, max_bytes) = if only_hash.is_some() { ((0..input.len()).collect(), usize::MAX, 0) } else { (order, want, max_bytes) };
@@ -2059,7 +2142,7 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                             skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        let wave64 = recomp::detect_wave64(code);
+                        let wave64 = recomp::fssm_wave64(f, code);
                         let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows: windows, sampler_base: 0 };
                         if trace {
                             eprintln!("direct: {name} FSSM#{fi} ({} B, {})", code.len(), coverage::stage_name(&mode));

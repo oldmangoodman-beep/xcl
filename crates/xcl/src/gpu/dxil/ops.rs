@@ -410,6 +410,12 @@ impl Shader {
         self.op(53, "quaternary", Some(t), t, &[width, offset, value, replaced], FnAttrs::ReadNone)
     }
 
+    /// `Dot4AddU8Packed(acc, a, b)` (SM 6.4+): `acc + sum_{i=0..3} byte_i(a) * byte_i(b)` (mod 2^32).
+    pub fn dot4_add_u8_packed(&mut self, acc: Value, a: Value, b: Value) -> Value {
+        let i32 = self.m.i32();
+        self.op(164, "dot4AddPacked", Some(i32), i32, &[acc, a, b], FnAttrs::ReadNone)
+    }
+
     fn two_outs(&mut self, op: u32, a: Value, b: Value) -> (Value, Value) {
         let i32 = self.m.i32();
         let st = self.m.named_struct("dx.types.twoi32", &[i32, i32]);
