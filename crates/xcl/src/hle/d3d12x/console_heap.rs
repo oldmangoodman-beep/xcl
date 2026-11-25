@@ -159,6 +159,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
+        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
         *g = Some(Global {
             dev: dev.clone(),
             cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
@@ -172,6 +173,31 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
         });
     }
     true
+}
+
+/// Null views at descriptors `0..MEM_HEAP_BASE` of the shared heap (an SRV / UAV pair per
+/// console slot: even SRV, odd UAV), where shaders land for a T# of zeros (word 0, the PC index,
+/// is 0): they read zeros there rather than whatever an unwritten descriptor holds.
+unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
+    for k in 0..crate::gpu::recomp::MEM_HEAP_BASE as u64 {
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize };
+        if k % 2 == 0 {
+            let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+            };
+            dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&d), at);
+        } else {
+            let d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV::default() },
+            };
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&d), at);
+        }
+    }
 }
 
 static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -646,6 +672,39 @@ mod tests {
             assert_eq!(CALLS.load(Ordering::Relaxed), 0);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
             *GLOBAL.lock().unwrap() = None;
+        }
+    }
+
+    /// A T# of zeros (an empty slot) names descriptors 0 (SRV) and 1 (UAV): those must be
+    /// null views, never a memory window's raw buffer UAV (a texture read of that hangs the GPU).
+    #[test]
+    fn zero_tsharp_does_not_reach_window_views() {
+        use std::ffi::c_void;
+        use std::sync::Mutex as M;
+        static SEEN: M<Vec<(bool, usize, usize)>> = M::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn srv(_this: *mut c_void, r: *mut c_void, _d: *const D3D12_SHADER_RESOURCE_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+            SEEN.lock().unwrap().push((false, r as usize, at.ptr));
+        }
+        unsafe extern "system" fn uav(_this: *mut c_void, r: *mut c_void, _c: *mut c_void, _d: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+            SEEN.lock().unwrap().push((true, r as usize, at.ptr));
+        }
+        let base = crate::gpu::recomp::MEM_HEAP_BASE;
+        assert!(base >= 2, "window views overlap the SRV / UAV pair of a zero T#");
+        assert_eq!(base % 2, 0, "window views must not split a console slot's SRV / UAV pair");
+        let mut vt = [0usize; 20];
+        vt[18] = srv as usize;
+        vt[19] = uav as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        unsafe {
+            let dev = std::mem::ManuallyDrop::new(ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void));
+            null_views(&dev, 0x1000, 32);
+        }
+        let seen = SEEN.lock().unwrap().clone();
+        assert_eq!(seen.len(), base as usize);
+        for (k, &(is_uav, r, at)) in seen.iter().enumerate() {
+            assert_eq!((is_uav, r, at), (k % 2 == 1, 0, 0x1000 + 32 * k), "descriptor {k}");
         }
     }
 

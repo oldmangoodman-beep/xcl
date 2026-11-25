@@ -1974,7 +1974,7 @@ pub fn is_f16_rounded_op(name: &str) -> bool {
         name,
         "v_interp_p2_f16" | "v_cvt_f16_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_fma_f16"
             | "v_pk_fmac_f16" | "v_pk_min_f16" | "v_pk_max_f16" | "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_min_f16"
-            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_fmac_f16"
+            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_div_fixup_f16" | "v_fmac_f16"
             | "v_fmamk_f16" | "v_fmaak_f16" | "v_ldexp_f16" | "v_rcp_f16" | "v_rsq_f16" | "v_sqrt_f16" | "v_log_f16" | "v_exp_f16"
             | "v_sin_f16" | "v_cos_f16" | "v_fract_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_cvt_f16_u16"
             | "v_cvt_f16_i16"
