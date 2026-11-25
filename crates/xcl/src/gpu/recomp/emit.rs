@@ -6316,7 +6316,7 @@ uint rla(uint v, uint l) {
     // do not before SM 6.7), and the console's derivatives (DPP quad_perm, ds_swizzle) read the
     // helper pixels of a quad a primitive's edge splits.
     uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);
-    uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);
+    uint q = select((l & 2u) != 0u, select((l & 1u) != 0u, q3, q2), select((l & 1u) != 0u, q1, q0));
     // A helper lane of another quad: after s_wqm the console's v_readfirstlane often picks
     // one (the first lane of EXEC on a primitive's edge), and a wave read of it is undefined
     // here (0 in practice: every other quad of the wave got the wrong value, e.g. a shader's
@@ -6324,12 +6324,14 @@ uint rla(uint v, uint l) {
     // reader takes that from a live lane of the same quad.
     uint h = l + 32u * xcl_half;
     uint4 xcl_lv = WaveActiveBallot(true);
-    uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;
+    uint hw = h >> 5;
+    uint lv_w = select(hw < 2u, select(hw == 0u, xcl_lv.x, xcl_lv.y), select(hw == 2u, xcl_lv.z, xcl_lv.w));
+    uint nib = (lv_w >> (h & 28u)) & 15u;
     uint src = (h & ~3u) + firstbitlow(nib);
     uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);
-    uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);
-    if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;
-    if ((l >> 2) == (lane_id >> 2)) w = q;
+    uint r = select((l & 2u) != 0u, select((l & 1u) != 0u, r3, r2), select((l & 1u) != 0u, r1, r0));
+    w = select(and(nib != 0u, ((nib >> (h & 3u)) & 1u) == 0u), r, w);
+    w = select((l >> 2) == (lane_id >> 2), q, w);
 #endif
     return w;
 }
@@ -6674,7 +6676,7 @@ uint fclass64(double f) {
 
 #[cfg(test)]
 mod tests {
-    use super::PRELUDE_MEM;
+    use super::{PRELUDE, PRELUDE_MEM};
 
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {
@@ -6684,5 +6686,124 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    #[test]
+    fn rla_pixel_helper_avoids_runtime_vector_indexing_and_branches() {
+        let start = PRELUDE.find("uint rla(uint v, uint l) {").expect("rla in PRELUDE");
+        let rest = &PRELUDE[start..];
+        let end = rest.find("\n}\n").expect("rla closing brace");
+        let rla = &rest[..end + 2];
+        assert!(!rla.contains("xcl_lv["), "runtime vector index remains in rla():\n{rla}");
+        assert!(!rla.contains(" ? "), "scalar ternary remains in rla():\n{rla}");
+        assert!(!rla.contains("if ("), "scalar if-branch remains in rla():\n{rla}");
+        assert!(!rla.contains("pick4("), "PRELUDE::rla() must not depend on PRELUDE_MEM::pick4():\n{rla}");
+        for comp in ["xcl_lv.x", "xcl_lv.y", "xcl_lv.z", "xcl_lv.w", "select("] {
+            assert!(rla.contains(comp), "missing {comp} in rla():\n{rla}");
+        }
+    }
+
+    #[test]
+    fn rla_pixel_shader_compiles_without_local_arrays() {
+        let Ok(dxc_dir) = super::super::dxc::location() else {
+            super::super::runner::skip_test("no DXC");
+            return;
+        };
+        let dxc_exe = dxc_dir.join("dxc.exe");
+        if !dxc_exe.is_file() {
+            super::super::runner::skip_test("no dxc.exe");
+            return;
+        }
+        // Self-contained pixel shader (no PRELUDE_MEM) with 3 dynamic-lane rla() calls.
+        let src = format!(
+            "#define XCL_PIXEL 1\n{PRELUDE}\n\
+            float4 main(float4 p : SV_Position) : SV_Target {{\n\
+                lane_id = WaveGetLaneIndex();\n\
+                uint v = (uint)p.x + ((uint)p.y << 8);\n\
+                uint a = rla(v, lane_id ^ 1u);\n\
+                uint b = rla(v, ((uint)p.x + lane_id) & 63u);\n\
+                uint c = rla(v, ((uint)p.y + 3u) & 127u);\n\
+                return float4(asfloat(a), asfloat(b), asfloat(c), 1.0);\n\
+            }}\n"
+        );
+        let dxil = super::super::dxc::compile(&src, "main", "ps_6_6", &[]).expect("DXC ps_6_6 compile");
+        let tmp = std::env::temp_dir().join(format!("xcl_rla_test_{}.dxil", std::process::id()));
+        std::fs::write(&tmp, &dxil).expect("write temp dxil");
+        let out = std::process::Command::new(&dxc_exe).args(["-dumpbin", tmp.to_str().unwrap()]).output().expect("dxc -dumpbin");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(out.status.success(), "dxc -dumpbin failed: {}", String::from_utf8_lossy(&out.stderr));
+        let ir = String::from_utf8_lossy(&out.stdout);
+        let body = ir.split("define void @main(").nth(1).expect("main body in DXIL disassembly");
+        let body = body.split("\n}\n").next().unwrap_or(body);
+        let allocas = body.lines().filter(|l| l.contains(" = alloca ") || l.trim_start().starts_with("alloca ")).count();
+        let cond_branches = body.lines().filter(|l| l.trim_start().starts_with("br i1 ")).count();
+        assert_eq!(allocas, 0, "expected 0 local arrays in rla() DXIL, got {allocas}");
+        assert_eq!(cond_branches, 0, "expected 0 conditional branches in rla() DXIL, got {cond_branches}");
+    }
+
+    #[test]
+    fn gpu_rla_pixel_shader_matches_reference_including_helper_lanes() {
+        use super::super::{dxc, runner};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+        match (runner::adapter(), runner::wave64_programs_supported(), dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, w, d) => {
+                runner::skip_test(if a.is_err() || w.is_err() {
+                    "no GPU"
+                } else if d.is_err() {
+                    "no DXC"
+                } else {
+                    "no 32/64-lane waves"
+                });
+                return;
+            }
+        }
+        let vs = dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+        let ref_rla = "\
+            uint rla_ref(uint v, uint l) {\n\
+                uint w = WaveReadLaneAt(v, l + 32u * xcl_half);\n\
+                uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);\n\
+                uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);\n\
+                uint h = l + 32u * xcl_half;\n\
+                uint4 xcl_lv = WaveActiveBallot(true);\n\
+                uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;\n\
+                uint src = (h & ~3u) + firstbitlow(nib);\n\
+                uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);\n\
+                uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);\n\
+                if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;\n\
+                if ((l >> 2) == (lane_id >> 2)) w = q;\n\
+                return w;\n\
+            }\n";
+        let src = format!(
+            "#define XCL_PIXEL 1\n{PRELUDE}\n{ref_rla}\n\
+            float4 main(float4 p : SV_Position) : SV_Target {{\n\
+                lane_id = WaveGetLaneIndex();\n\
+                uint v = ((uint)p.x + 1u) + (((uint)p.y + 1u) << 8);\n\
+                uint live0 = WaveActiveBallot(true).x;\n\
+                uint first_q = firstbitlow(wqm(live0));\n\
+                uint first_live = firstbitlow(live0);\n\
+                uint last_live = 31u - firstbithigh(live0);\n\
+                uint qx = rla(v, lane_id ^ 1u);\n\
+                uint qy = rla(v, lane_id ^ 2u);\n\
+                bool ok_q = qx == rla_ref(v, lane_id ^ 1u) && qy == rla_ref(v, lane_id ^ 2u) && rla(v, lane_id ^ 3u) == rla_ref(v, lane_id ^ 3u);\n\
+                bool ok_x = rla(v, first_q) == rla_ref(v, first_q) && rla(v, first_live) == rla_ref(v, first_live) && rla(v, last_live) == rla_ref(v, last_live);\n\
+                return float4((float)qx, (float)qy, ok_q ? 1.0 : 0.0, ok_x ? 1.0 : 0.0);\n\
+            }}\n"
+        );
+        let ps = dxc::compile(&src, "main", "ps_6_6", &[]).unwrap();
+        // Two triangles sharing the diagonal x = y so diagonal quads contain live + helper lanes.
+        let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        let size = 32usize;
+        let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [-1.0; 4]).unwrap();
+        assert_eq!(px.len(), size * size);
+        for y in 0..size {
+            for x in 0..size {
+                let p = px[y * size + x];
+                let want_x = (((x ^ 1) + 1) + ((y + 1) << 8)) as f32;
+                let want_y = ((x + 1) + (((y ^ 1) + 1) << 8)) as f32;
+                assert_eq!(p, [want_x, want_y, 1.0, 1.0], "pixel ({x}, {y}) mismatch: {p:?}");
+            }
+        }
     }
 }

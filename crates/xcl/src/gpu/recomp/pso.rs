@@ -487,22 +487,33 @@ mod translated {
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
-    /// version and sources, a forced compact form, the split target, the per-lane form (`direct_compute`).
+    /// version and sources, compact dispatch policy, the split target, the per-lane form (`direct_compute`).
     fn direct_output() -> u64 {
         static D: OnceLock<u64> = OnceLock::new();
         *D.get_or_init(|| {
-            let id = direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID"));
-            let id = match crate::gpu::dxil::kernel::compact_mode() {
-                Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
-                None => id,
-            };
-            let id = identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()));
-            if crate::gpu::recomp::lower_dxil::enabled() {
-                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
-            } else {
-                id
-            }
+            direct_output_identity(
+                crate::gpu::dxil::kernel::compact_nest_tag().as_deref(),
+                crate::gpu::dxil::kernel::dispatch_piece_limit(),
+            )
         })
+    }
+
+    pub(super) fn direct_output_identity(nest_tag: Option<&str>, split_limit: usize) -> u64 {
+        let id = direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID"));
+        let id = match crate::gpu::dxil::kernel::compact_mode() {
+            Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
+            None => id,
+        };
+        let id = match nest_tag {
+            Some(tag) => identity_for(&id.to_string(), tag),
+            None => id,
+        };
+        let id = identity_for(&id.to_string(), &format!("dispatch-split-{split_limit}"));
+        if crate::gpu::recomp::lower_dxil::enabled() {
+            identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+        } else {
+            id
+        }
     }
 
     /// The identity of `ident`'s entries the direct translator (`direct`: `direct_output`) made
@@ -1592,6 +1603,50 @@ mod shader_cache_tests {
         assert_ne!(rerouted_identity(ident, 7), ident);
         assert_ne!(rerouted_identity(ident, 7), rerouted_identity(ident + 1, 7));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rerouted_disk_entries_follow_compact_nesting_policy() {
+        use std::process::Command;
+
+        const RUN: &str = "XCL_TEST_REROUTED_CACHE_RUN";
+        if let Ok(case) = std::env::var(RUN) {
+            let (marker, expected) = case.split_once(':').unwrap();
+            let marker = marker.parse::<u8>().unwrap();
+            let read = |blob: &[u8], value, rerouted| {
+                translated::cached(&dxc::cache_dir(), blob, Stage::Compute, 0, 1, true, || {
+                    Ok((compiled(value), rerouted))
+                }).unwrap().dxil[67]
+            };
+            assert_eq!(read(b"console-enormous", marker, true), expected.parse::<u8>().unwrap());
+            assert_eq!(read(b"console-plain", marker + 16, false), 17);
+            return;
+        }
+
+        // These identities use OnceLock. Restart to test what changing real CLI settings does
+        // to a shared disk cache, including the HLSL entry written by the first process.
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("xcl-translated-nesting-{}-{nonce}", std::process::id()));
+        for (nest, split, case) in [
+            ("0", "12500", "1:1"),
+            ("4", "12500", "2:2"),
+            ("4", "0", "3:3"),
+            ("off", "12500", "9:1"),
+            ("4", "12500", "9:2"),
+            ("4", "0", "9:3"),
+        ] {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["gpu::recomp::pso::shader_cache_tests::rerouted_disk_entries_follow_compact_nesting_policy", "--exact", "--nocapture"])
+                .env(RUN, case)
+                .env("XCL_DXIL_CACHE", &dir)
+                .env("XCL_TRANSLATED_CACHE", "1")
+                .env("XCL_DIRECT_DXIL", "0")
+                .env("XCL_DIRECT_COMPACT_NEST", nest)
+                .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", split)
+                .output().unwrap();
+            assert!(out.status.success(), "nest={nest}, split={split}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn key(hash: u64) -> ShaderKey {

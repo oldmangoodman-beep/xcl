@@ -130,6 +130,96 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
 }
 
+/// Wave32 compute program with conditional branches across distinct basic blocks so direct
+/// DXIL splitting (`XCL_DIRECT_SPLIT_INSTRUCTIONS`) partitions it into multiple pieces.
+fn split_program() -> Vec<u8> {
+    let list: &[(&str, &str, &[(&str, u64)], Option<u32>)] = &[
+        // Mark wave32 (`detect_wave64` -> false) so `[32, 1, 1]` splits on every wave32 GPU.
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 131), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 133), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 135), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 137), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 139), ("VSRC1", 2)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 141), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 143), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 145), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 147), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 149), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 151), ("VSRC1", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 0), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 2), ("SADDR", 0x7D)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ];
+    list.iter().flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}"))).collect()
+}
+
+#[test]
+fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if !runner::wave32_supported().unwrap_or(false) {
+        runner::skip_test("no wave32 GPU");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-offline-split-pso-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("split.bin"), console_cs(&split_program(), 2 << 1 | 1 << 7, [32, 1, 1])).unwrap();
+    let run = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders")
+            .arg(&input)
+            .args(["--precompile", "--pipelines", "--windows", "1"])
+            .env("XCL_DXIL_CACHE", &cache)
+            .env("XCL_DIRECT_DXIL", "1")
+            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
+            .env("XCL_PSO_DISK_CACHE", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        text
+    };
+    let cold = run();
+    let mut files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
+    files.sort();
+    let pieces = files.len();
+    assert!(pieces >= 2, "expected >= 2 split piece blobs in driver cache, got {files:?}\n{cold}");
+    assert!(
+        files.iter().all(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".chain.pso"))),
+        "split compute precompile must write only .chain.pso files, got {files:?}"
+    );
+    assert!(files.iter().all(|p| p.metadata().unwrap().len() > 0));
+    assert!(cold.contains(&format!("pipelines made on the GPU {pieces}, refused 0")), "{cold}");
+    assert!(cold.contains(&format!("split compute programs: 1 ({pieces} pieces)")), "{cold}");
+
+    let warm = run();
+    assert!(warm.contains(&format!("pipelines loaded from the driver cache {pieces}")), "{warm}");
+
+    // A corrupt .chain.pso is rejected and rebuilt cleanly while sibling pieces stay reused.
+    fs::write(&files[0], b"invalid cached chain pipeline").unwrap();
+    let recovered = run();
+    assert!(recovered.contains(&format!("pipelines made on the GPU {pieces}, refused 0")), "{recovered}");
+    assert!(recovered.contains(&format!("pipelines loaded from the driver cache {}", pieces - 1)), "{recovered}");
+    assert!(files[0].metadata().unwrap().len() > b"invalid cached chain pipeline".len() as u64);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
 /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
 /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.

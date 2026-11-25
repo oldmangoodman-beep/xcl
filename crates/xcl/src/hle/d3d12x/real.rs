@@ -4408,7 +4408,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(dxil, copy.Flags.0).map(|p| if chained { p.with_extension("chain.pso") } else { p });
+    let disk = driver_cache::path_for(dxil, copy.Flags.0, chained);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -4475,7 +4475,14 @@ pub(crate) mod driver_cache {
 
     /// The file of the pipeline made from `dxil` with `flags`.
     pub fn name(dxil: &[u8], flags: i32) -> String {
-        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        name_for(dxil, flags, false)
+    }
+
+    /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
+    /// signature (`dispatch_chain`).
+    pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
+        let ext = if chained { "chain.pso" } else { "pso" };
+        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4489,7 +4496,11 @@ pub(crate) mod driver_cache {
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
-        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        path_for(dxil, flags, false)
+    }
+
+    pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -4579,6 +4590,9 @@ pub(crate) mod driver_cache {
             assert_ne!(name(b"abc", 0), name(b"abc", 1));
             // (the length is in the name: two programs of one hash and different lengths differ)
             assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+            assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
+            assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
+            assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
         }
 
         #[test]
