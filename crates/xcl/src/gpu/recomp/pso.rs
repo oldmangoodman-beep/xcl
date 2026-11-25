@@ -251,6 +251,11 @@ mod translated {
                 Backend::current(),
                 direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
+            // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
+            let id = match crate::gpu::dxil::kernel::compact_mode() {
+                Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
+                _ => id,
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))

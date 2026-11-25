@@ -72,10 +72,43 @@ pub struct Init {
     pub vgpr_base: Option<Value>,
     pub entry: Block,
     pub touched: BTreeSet<u32>,
+    /// the compact form: each register's local variable, and the block that loads them now
+    pub slots: HashMap<u32, Value>,
+    pub mem: Option<Block>,
 }
 
 impl Init {
     pub fn load(&mut self, s: &mut Shader, var: u32) -> Value {
+        let Some(b) = self.mem else { return self.first(s, var) };
+        let p = self.slot(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(true);
+        s.m.set_block(b);
+        let v = s.m.load(p, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        v
+    }
+
+    /// The local variable of `var`, made in the entry block with the register's first value.
+    pub fn slot(&mut self, s: &mut Shader, var: u32) -> Value {
+        if let Some(&p) = self.slots.get(&var) {
+            return p;
+        }
+        let v = self.first(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(false);
+        s.m.set_block(self.entry);
+        let i32 = s.m.i32();
+        let p = s.m.alloca(i32, 4);
+        s.m.store(p, v, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        self.slots.insert(var, p);
+        p
+    }
+
+    fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
         }
