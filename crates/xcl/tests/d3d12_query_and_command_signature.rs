@@ -64,8 +64,13 @@ fn create_query_heap_matches_host_driver() {
             let (mut p_hook, mut p_host) = (std::ptr::null_mut(), std::ptr::null_mut());
             let hr_hook = hooked(dev, &bad, &iid, &mut p_hook);
             let hr_host = host(dev, &bad, &iid, &mut p_host);
-            assert!(hr_hook < 0 && hr_host < 0, "expected failure for {bad:?}: hook={hr_hook:#x}, host={hr_host:#x}");
-            assert!(p_hook.is_null() && p_host.is_null());
+            assert_eq!(hr_hook, hr_host, "HRESULT mismatch for {bad:?}");
+            assert_eq!((p_hook.is_null(), p_host.is_null()), (hr_hook < 0, hr_host < 0), "output for {bad:?}");
+            // The PC runtime refuses these; vkd3d-proton (under Wine) accepts some of them.
+            assert!(hr_host < 0 || xcl::util::under_wine(), "expected failure for {bad:?}: host={hr_host:#x}");
+            for p in [p_hook, p_host].into_iter().filter(|p| !p.is_null()) {
+                drop(ID3D12QueryHeap::from_raw(p));
+            }
         }
 
         // Unknown console IID fails on host with E_NOINTERFACE; XCL falls back to ID3D12QueryHeap.
@@ -123,8 +128,13 @@ fn create_command_signature_matches_host_driver() {
             let (mut p_hook, mut p_host) = (std::ptr::null_mut(), std::ptr::null_mut());
             let hr_hook = hooked(dev, &desc, std::ptr::null_mut(), &iid, &mut p_hook);
             let hr_host = host(dev, &desc, std::ptr::null_mut(), &iid, &mut p_host);
-            assert!(hr_hook < 0 && hr_host < 0, "expected failure: hook={hr_hook:#x}, host={hr_host:#x}");
-            assert!(p_hook.is_null() && p_host.is_null());
+            assert_eq!(hr_hook, hr_host, "HRESULT mismatch for an invalid signature");
+            assert_eq!((p_hook.is_null(), p_host.is_null()), (hr_hook < 0, hr_host < 0), "output for an invalid signature");
+            // The PC runtime refuses these; vkd3d-proton (under Wine) accepts some of them.
+            assert!(hr_host < 0 || xcl::util::under_wine(), "expected failure: host={hr_host:#x}");
+            for p in [p_hook, p_host].into_iter().filter(|p| !p.is_null()) {
+                drop(ID3D12CommandSignature::from_raw(p));
+            }
         }
 
         // Unknown console IID fails on host with E_NOINTERFACE; XCL falls back to ID3D12CommandSignature.

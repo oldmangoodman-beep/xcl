@@ -208,12 +208,15 @@ fn create_placed_errors_and_console_iid_fallback() {
             assert!(p_hook.is_null() && p_host.is_null());
         }
 
-        // Null desc returns error without dereferencing.
-        let (mut p_hook, mut p_host) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let hr_hook = hooked(dev, heap.as_raw(), 0, std::ptr::null(), D3D12_RESOURCE_STATE_COMMON, std::ptr::null(), &iid, &mut p_hook);
-        let hr_host = host(dev, heap.as_raw(), 0, std::ptr::null(), D3D12_RESOURCE_STATE_COMMON, std::ptr::null(), &iid, &mut p_host);
-        assert!(hr_hook < 0 && hr_host < 0, "expected failure on null desc: hook={hr_hook:#x}, host={hr_host:#x}");
-        assert!(p_hook.is_null() && p_host.is_null());
+        // Null desc returns error without dereferencing. (vkd3d-proton, under Wine, dereferences it and
+        // the process ends.)
+        if !xcl::util::under_wine() {
+            let (mut p_hook, mut p_host) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let hr_hook = hooked(dev, heap.as_raw(), 0, std::ptr::null(), D3D12_RESOURCE_STATE_COMMON, std::ptr::null(), &iid, &mut p_hook);
+            let hr_host = host(dev, heap.as_raw(), 0, std::ptr::null(), D3D12_RESOURCE_STATE_COMMON, std::ptr::null(), &iid, &mut p_host);
+            assert!(hr_hook < 0 && hr_host < 0, "expected failure on null desc: hook={hr_hook:#x}, host={hr_host:#x}");
+            assert!(p_hook.is_null() && p_host.is_null());
+        }
 
         // Unknown console IID fails on host with E_NOINTERFACE; XCL falls back to ID3D12Resource.
         let console_iid = GUID::from_u128(0x11223344_5566_7788_99aa_bbccddeeff03);
