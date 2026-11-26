@@ -176,6 +176,7 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
+  GameInput keeps half a second of recent state changes so titles can read inputs between frames.
 - **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
   when no XInput controller is connected – buttons, sticks and triggers, no rumble or light bar.
   `XCL_PLAYSTATION_PAD=0` turns this off.
@@ -202,7 +203,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
-  `report.json` has it under `dxc`.
+  `report.json` has it under `dxc`. A compute program with many memory-window accesses is compiled
+  as two libraries, the program and its accessors, and linked, which is much faster for DXC
+  (`XCL_LINK_MEM=0` turns it off); the linker needs DXC 1.8 or newer. With an older one the first
+  attempt fails, `xcl.log` says so, and every program is compiled whole after that.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
@@ -229,6 +233,19 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
+- When a game folder contains a `shaders.rpf` shader pack or loose `.dxbc` files under
+  `shaders/`, XCL shows shader preparation in the game window before executing title code.
+  The same window then presents the game. The percentage counts
+  processed records. The timer counts seconds since one finished (or preparation started);
+  five seconds without progress counts as a stall, and the window shows when the last one ended.
+  XCL prepares supported shader stages and compute pipelines, including
+  split pieces and their whole fallback. Graphics pipelines that need state supplied by the
+  title are created during play. Later launches reuse matching cache entries.
+  Closing the window cancels the launch. A compiler or driver failure stops it and reports
+  the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
+- For compute shaders that XCL can split, the runtime first tries the saved driver blob for
+  the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
+  or the driver rejects it, XCL builds the split pieces.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
