@@ -407,6 +407,24 @@ impl Lw {
         n: usize,
         f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
     ) -> Vec<Value> {
+        if let (Some(coherent), true) = (self.heap_mem, self.heap_flat) {
+            let z = self.c(0);
+            if guard.is_some_and(|g| self.s.m.const_u64(g) == Some(0)) {
+                return vec![z; n];
+            }
+            let w = self.rd(super::lower::VAR_WIN);
+            let inside = self.cmpc(Pred::ULt, w, self.mems.len() as u32);
+            let ok = match guard {
+                Some(g) if self.s.m.const_u64(g) != Some(1) => self.and(g, inside),
+                _ => inside,
+            };
+            let w = self.sel(ok, w, z);
+            let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
+            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let vals = f(self, m);
+            debug_assert_eq!(vals.len(), n);
+            return vals.into_iter().map(|v| self.sel(ok, v, z)).collect();
+        }
         let i32 = self.s.m.i32();
         let tys = vec![i32; n];
         self.with_mem_many_tys(guard, &tys, f)

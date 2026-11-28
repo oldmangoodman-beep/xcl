@@ -23,9 +23,9 @@
 //! driver does not make reserved: D32S8, MSAA): heaps of the placement's size, shared by
 //! placements inside them, let go 2 s after their last resource (256 MiB ones: 2.8 GB of D32S8).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -108,6 +108,9 @@ impl<H: Clone> Arenas<H> {
     }
 
     fn bytes(&self) -> usize { self.list.iter().map(|a| a.size).sum() }
+    fn bytes_for(&self, dev: usize) -> usize {
+        self.list.iter().filter(|a| a.dev == dev).fold(0, |bytes, a| bytes.saturating_add(a.size))
+    }
 }
 
 // D3D12 heaps are free-threaded
@@ -123,14 +126,609 @@ static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 pub fn arena_bytes() -> (usize, usize) {
     (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
+
+pub(super) fn arena_bytes_for(device: usize) -> usize {
+    ARENAS.lock().unwrap().bytes_for(device)
+}
 static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// `XCL_TEXTURE_BUDGET_EVICT=1`: retain CPU-side identities for live texture SRVs. This is
+/// preparation only: recorded command lists can still name older descriptor contents, so these
+/// records do not make descriptor replacement or texture eviction GPU-safe.
+#[inline]
+pub(super) fn srv_tracking_enabled() -> bool {
+    #[cfg(test)]
+    if SRV_TRACKING_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_TEXTURE_BUDGET_EVICT").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_BUDGET_EVICT=1 - tracking live texture SRV metadata only; texture mappings and descriptors are unchanged");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+static SRV_TRACKING_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SharedViewEpoch(u64);
+
+enum EpochRetirement<R> {
+    Reserved,
+    Receipt(R),
+    Poisoned,
+}
+
+struct SharedViewEpochs<R> {
+    next: u64,
+    poisoned: bool,
+    pending: Vec<(SharedViewEpoch, EpochRetirement<R>)>,
+}
+
+impl<R> SharedViewEpochs<R> {
+    const fn new() -> Self {
+        Self { next: 0, poisoned: false, pending: Vec::new() }
+    }
+
+    fn reserve(&mut self) -> SharedViewEpoch {
+        self.next = self.next.checked_add(1).expect("shared view heap epoch overflow");
+        let epoch = SharedViewEpoch(self.next);
+        self.pending.push((epoch, EpochRetirement::Reserved));
+        epoch
+    }
+
+    fn cancel(&mut self, epoch: SharedViewEpoch) {
+        match self.pending.iter().position(|entry| entry.0 == epoch) {
+            Some(i) if matches!(self.pending[i].1, EpochRetirement::Reserved) => {
+                self.pending.remove(i);
+            }
+            _ => self.poisoned = true,
+        }
+    }
+
+    fn attach(&mut self, epoch: SharedViewEpoch, receipt: R) {
+        match self.pending.iter_mut().find(|entry| entry.0 == epoch) {
+            Some((_, state @ EpochRetirement::Reserved)) => *state = EpochRetirement::Receipt(receipt),
+            _ => self.poisoned = true,
+        }
+    }
+
+    fn poison(&mut self, epoch: SharedViewEpoch) {
+        match self.pending.iter_mut().find(|entry| entry.0 == epoch) {
+            Some((_, state @ EpochRetirement::Reserved)) => *state = EpochRetirement::Poisoned,
+            _ => self.poisoned = true,
+        }
+    }
+
+    fn sweep(&mut self, complete: impl Fn(&R) -> bool) {
+        self.pending.retain(|(_, state)| !matches!(state, EpochRetirement::Receipt(receipt) if complete(receipt)));
+    }
+
+    fn quiescent(&mut self, complete: impl Fn(&R) -> bool) -> bool {
+        self.sweep(complete);
+        !self.poisoned && self.pending.is_empty()
+    }
+}
+
+fn with_quiescent_epochs<R, T>(
+    tracking_enabled: bool,
+    epochs: &Mutex<SharedViewEpochs<R>>,
+    complete: impl Fn(&R) -> bool,
+    mutation: impl FnOnce() -> T,
+) -> Option<T> {
+    if !tracking_enabled {
+        return None;
+    }
+    let mut epochs = epochs.lock().unwrap();
+    if !epochs.quiescent(complete) {
+        return None;
+    }
+    let result = mutation();
+    drop(epochs);
+    Some(result)
+}
+
+static SHARED_VIEW_EPOCHS: Mutex<SharedViewEpochs<super::alloc_pool::SubmissionReceipt>> =
+    Mutex::new(SharedViewEpochs::new());
+
+pub(super) fn reserve_shared_view_epoch() -> SharedViewEpoch {
+    let mut epochs = SHARED_VIEW_EPOCHS.lock().unwrap();
+    epochs.sweep(super::alloc_pool::SubmissionReceipt::is_complete);
+    epochs.reserve()
+}
+
+pub(super) fn cancel_shared_view_epoch(epoch: SharedViewEpoch) {
+    SHARED_VIEW_EPOCHS.lock().unwrap().cancel(epoch);
+}
+
+pub(super) fn attach_shared_view_epoch(epoch: SharedViewEpoch, receipt: super::alloc_pool::SubmissionReceipt) {
+    SHARED_VIEW_EPOCHS.lock().unwrap().attach(epoch, receipt);
+}
+
+pub(super) fn poison_shared_view_epoch(epoch: SharedViewEpoch) {
+    SHARED_VIEW_EPOCHS.lock().unwrap().poison(epoch);
+}
+
+/// Run a descriptor mutation only while every tracked shared-view submission is retired, holding
+/// the epoch lock until the mutation ends so a new reservation cannot cross the check. This lock
+/// is outermost: the closure may take descriptor backing/tracker locks, but must not submit GPU
+/// work or call anything that reserves another shared-view epoch.
+///
+/// A missing post-execute receipt permanently returns `None`, so an untracked submission (or a
+/// reused queue address) can never be mistaken for quiescence.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite stage
+pub(super) fn with_quiescent_shared_view_heap<T>(mutation: impl FnOnce() -> T) -> Option<T> {
+    with_quiescent_epochs(
+        srv_tracking_enabled(), &SHARED_VIEW_EPOCHS, super::alloc_pool::SubmissionReceipt::is_complete, mutation,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct SrvSlot {
+    heap_generation: u64,
+    slot: u32,
+}
+
+impl SrvSlot {
+    fn of(slot: &super::console_heap::Slot) -> Self {
+        Self { heap_generation: slot.generation, slot: slot.k }
+    }
+}
+
+/// Numeric COM identities are never dereferenced here. Resource and heap lifetime hooks remove
+/// them; a later descriptor-generation design must still prove queue-fence safety before use.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct TrackedSrv {
+    generation: u64,
+    device: usize,
+    resource: usize,
+    pc_srv: u64,
+    shared_srv: u64,
+    index: u32,
+    desc: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    /// Exact XCL ABI descriptor bytes written for this logical generation. Only shared-heap slots
+    /// are tracked: their global word-0 index makes an unhooked raw overwrite observable.
+    words: [u32; 8],
+}
+
+#[derive(Default)]
+struct TrackedSrvs {
+    next_generation: u64,
+    by_slot: HashMap<SrvSlot, TrackedSrv>,
+}
+
+impl TrackedSrvs {
+    fn write(&mut self, slot: SrvSlot, entry: Option<TrackedSrv>) {
+        self.by_slot.remove(&slot);
+        if let Some(mut entry) = entry {
+            self.next_generation = self.next_generation.wrapping_add(1).max(1);
+            entry.generation = self.next_generation;
+            self.by_slot.insert(slot, entry);
+        }
+    }
+
+    fn copy_range(
+        &mut self,
+        device: usize,
+        copies: &[(SrvSlot, u64, u64, u32, SrvSlot, bool, [u32; 8], [u32; 8])],
+    ) {
+        let sources: Vec<_> = copies.iter().map(|(src, _, _, _, _, track_source, ..)|
+            track_source.then(|| self.by_slot.get(src).copied()).flatten()).collect();
+        for ((_, pc_srv, shared_srv, index, dst, _, source_words, destination_words), source) in copies.iter().zip(sources) {
+            let entry = source.filter(|entry| entry.words == *source_words).map(|mut entry| {
+                entry.device = device;
+                entry.pc_srv = *pc_srv;
+                entry.shared_srv = *shared_srv;
+                entry.index = *index;
+                entry.words = *destination_words;
+                entry
+            });
+            self.write(*dst, entry);
+        }
+    }
+
+    fn forget_heap(&mut self, generation: u64) {
+        self.by_slot.retain(|slot, _| slot.heap_generation != generation);
+    }
+
+    fn forget_resource(&mut self, resource: usize) {
+        self.by_slot.retain(|_, entry| entry.resource != resource);
+    }
+
+    /// Apply raw-memory observations made without this lock. A concurrent tracked overwrite has
+    /// another logical generation and is omitted from this snapshot rather than judged against
+    /// words observed for its predecessor.
+    fn reconcile_observed(&mut self, observed: &[(SrvSlot, u64, Option<[u32; 8]>)]) -> Vec<(SrvSlot, TrackedSrv)> {
+        let mut snapshot = Vec::new();
+        for &(slot, generation, words) in observed {
+            let Some(entry) = self.by_slot.get(&slot).copied().filter(|entry| entry.generation == generation) else { continue };
+            if words == Some(entry.words) {
+                snapshot.push((slot, entry));
+            } else {
+                self.by_slot.remove(&slot);
+            }
+        }
+        snapshot
+    }
+}
+
+static TRACKED_SRVS: Mutex<Option<TrackedSrvs>> = Mutex::new(None);
+static TRACKED_SRV_WRITES: Mutex<()> = Mutex::new(());
+static TRACKED_SRV_LIFETIMES: Mutex<()> = Mutex::new(());
+
+pub(super) type TrackedSrvWriteGuard = std::sync::MutexGuard<'static, ()>;
+pub(super) type TrackedSrvLifetimeGuard = std::sync::MutexGuard<'static, ()>;
+
+/// Serialize an entire hooked descriptor mutation while tracking is enabled. Operation tokens
+/// alone order hook starts, not native/console writes that complete in the opposite order.
+pub(super) fn lock_tracked_srv_write() -> Option<TrackedSrvWriteGuard> {
+    srv_tracking_enabled().then(|| TRACKED_SRV_WRITES.lock().unwrap())
+}
+
+/// Exclude final native resource Release while a tracked entry is turned into a strong owner.
+/// This is deliberately distinct from `TRACKED_SRV_WRITES`: descriptor hooks hold the write gate
+/// across driver calls which may make a temporary, non-final resource Release.
+pub(super) fn lock_tracked_srv_lifetime() -> Option<TrackedSrvLifetimeGuard> {
+    srv_tracking_enabled().then(|| TRACKED_SRV_LIFETIMES.lock().unwrap())
+}
+
+/// Record the descriptor currently in `slot`. `None` clears an SRV overwritten by another view.
+pub(super) fn track_srv(
+    device: usize,
+    resource: usize,
+    slot: &super::console_heap::Slot,
+    desc: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    words: [u32; 8],
+) {
+    if !srv_tracking_enabled() || slot.shared_srv == 0 {
+        return;
+    }
+    let texture_view = desc.is_none_or(|v| {
+        v.ViewDimension != D3D12_SRV_DIMENSION_BUFFER && v.ViewDimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+    });
+    let entry = (resource != 0 && texture_view && is_placed_texture(resource)).then_some(TrackedSrv {
+        generation: 0,
+        device,
+        resource,
+        pc_srv: slot.pc_srv,
+        shared_srv: slot.shared_srv,
+        index: slot.index,
+        desc,
+        words,
+    });
+    TRACKED_SRVS.lock().unwrap().get_or_insert_with(Default::default).write(SrvSlot::of(slot), entry);
+}
+
+pub(super) fn clear_tracked_srv(slot: &super::console_heap::Slot) {
+    if srv_tracking_enabled() {
+        TRACKED_SRVS.lock().unwrap().get_or_insert_with(Default::default).write(SrvSlot::of(slot), None);
+    }
+}
+
+pub(super) fn copy_tracked_srvs(
+    device: usize,
+    copies: &[(super::console_heap::Slot, super::console_heap::Slot, [u32; 8], [u32; 8])],
+) {
+    if !srv_tracking_enabled() || copies.is_empty() {
+        return;
+    }
+    let copies: Vec<_> = copies
+        .iter()
+        .map(|(src, dst, source_words, destination_words)|
+            (SrvSlot::of(src), dst.pc_srv, dst.shared_srv, dst.index, SrvSlot::of(dst),
+                src.shared_srv != 0 && dst.shared_srv != 0, *source_words, *destination_words))
+        .collect();
+    TRACKED_SRVS.lock().unwrap().get_or_insert_with(Default::default).copy_range(device, &copies);
+}
+
+pub(super) fn forget_srv_heap(generation: u64) {
+    if !srv_tracking_enabled() {
+        return;
+    }
+    let _write = lock_tracked_srv_write();
+    if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
+        tracked.forget_heap(generation);
+    }
+}
+
+/// Remove candidates for a descriptor heap that reached final native `Release`, while the heap
+/// lifetime gate still excludes snapshots. Do not take `TRACKED_SRV_WRITES`: a descriptor hook
+/// may hold it across a driver call which reenters a temporary heap Release.
+pub(super) fn forget_srv_heap_after_release(
+    generation: u64, lifetime: Option<&super::console_heap::HeapLifetimeGuard>,
+) {
+    debug_assert!(!srv_tracking_enabled() || lifetime.is_some());
+    if lifetime.is_some() {
+        if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
+            tracked.forget_heap(generation);
+        }
+    }
+}
+
+fn forget_tracked_srvs_locked(resource: usize) {
+    if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
+        tracked.forget_resource(resource);
+    }
+}
+
+#[cfg(test)]
+fn forget_tracked_srvs(resource: usize) {
+    if !srv_tracking_enabled() {
+        return;
+    }
+    let _write = lock_tracked_srv_write();
+    forget_tracked_srvs_locked(resource);
+}
+
+/// Clone an owner for one exact tracked resource while final `Release` is excluded. The tracker
+/// mutex makes the snapshot coherent; this does not take the descriptor-write gate. A later
+/// mutator must take that gate and revalidate the logical generation, as well as lease the exact
+/// heap generation, before using `pc_srv` or `shared_srv`.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite stage
+fn lease_tracked_srv_resource(slot: SrvSlot, generation: u64) -> Option<(TrackedSrv, ID3D12Resource, super::console_heap::ViewSlotLease)> {
+    let (entry, resource) = lease_tracked_srv_resource_with(slot, generation, |resource| {
+        let raw = resource as *mut std::ffi::c_void;
+        unsafe { ID3D12Resource::from_raw_borrowed(&raw).cloned() }
+    })?;
+    let heap = super::console_heap::lease_view_slot(
+        slot.heap_generation, slot.slot, entry.pc_srv, entry.shared_srv, entry.index,
+    )?;
+    Some((entry, resource, heap))
+}
+
+fn lease_tracked_srv_resource_with<T>(
+    slot: SrvSlot, generation: u64, lease: impl FnOnce(usize) -> Option<T>,
+) -> Option<(TrackedSrv, T)> {
+    if !srv_tracking_enabled() {
+        return None;
+    }
+    let _lifetime = TRACKED_SRV_LIFETIMES.lock().unwrap();
+    let entry = TRACKED_SRVS
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .by_slot
+        .get(&slot)
+        .copied()
+        .filter(|entry| entry.generation == generation)?;
+    let owner = lease(entry.resource)?;
+    Some((entry, owner))
+}
+
+/// Execute one point-in-time mutation of an exact tracked SRV generation. Queue quiescence is
+/// held outermost so no new shared-view submission can cross the mutation. Strong resource and
+/// heap owners are acquired before `WRITE`, then the tracker generation and all eight console
+/// words are revalidated immediately before `mutate` runs. The tracker mutex is not held across
+/// `mutate`; `WRITE` is, so the closure must call only unhooked descriptor operations and must not
+/// submit work or reserve another shared-view epoch.
+///
+/// Title code can write console descriptor memory without using a hook. Such a write can race
+/// after the point-in-time word check, so this primitive deliberately promises no stronger
+/// atomicity than the title's descriptor-lifetime rules. A mismatch fails closed and forgets only
+/// the stale generation. Strong owners are dropped after `WRITE` and the tracker lock are gone.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite policy
+fn with_exact_tracked_srv_mutation<T>(
+    slot: SrvSlot,
+    generation: u64,
+    mutate: impl FnOnce(&TrackedSrv, &ID3D12Resource, &super::console_heap::ViewSlotLease) -> T,
+) -> Option<T> {
+    with_exact_tracked_srv_mutation_on(
+        slot,
+        generation,
+        lease_tracked_srv_resource,
+        |slot| super::console_heap::exact_view_slot_words(slot.heap_generation, slot.slot),
+        mutate,
+    )
+}
+
+fn with_exact_tracked_srv_mutation_on<T, Resource, Heap>(
+    slot: SrvSlot,
+    generation: u64,
+    lease: impl FnOnce(SrvSlot, u64) -> Option<(TrackedSrv, Resource, Heap)>,
+    observe_words: impl FnOnce(SrvSlot) -> Option<[u32; 8]>,
+    mutate: impl FnOnce(&TrackedSrv, &Resource, &Heap) -> T,
+) -> Option<T> {
+    with_quiescent_shared_view_heap(|| {
+        let (snapshot, resource, heap) = lease(slot, generation)?;
+        let result = {
+            let _write = lock_tracked_srv_write()?;
+            let valid = {
+                let mut tracked = TRACKED_SRVS.lock().unwrap();
+                let current = tracked.as_mut()?.by_slot.get(&slot).copied()?;
+                if current.generation != generation {
+                    return None;
+                }
+                // This is TRACKED_SRVS -> HEAPS. Final heap cleanup drops HEAPS before taking
+                // TRACKED_SRVS, and descriptor-hook lookups also take them sequentially, so there
+                // is no nested inverse while the exact words are observed.
+                if observe_words(slot) != Some(current.words) {
+                    tracked.as_mut()?.by_slot.remove(&slot);
+                    return None;
+                }
+                // The generation identifies the complete immutable tracker snapshot. Drop this
+                // mutex before the supplied operation; WRITE keeps hooked mutations excluded.
+                current
+            };
+            debug_assert_eq!(valid.generation, snapshot.generation);
+            Some(mutate(&valid, &resource, &heap))
+        };
+        // `resource` and `heap` drop here, after the tracker and WRITE guards above.
+        result
+    })
+    .flatten()
+}
+
+/// One exact tracked descriptor and the native owners which make its resource and heap safe to
+/// use during a batch mutation.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite policy
+struct ExactSrvMutation<'a, Resource, Heap> {
+    entry: TrackedSrv,
+    resource: &'a Resource,
+    heap: &'a Heap,
+}
+
+/// Execute one point-in-time mutation of a batch of tracked SRV generations. One quiescent epoch
+/// and one descriptor-write exclusion cover the whole batch; missing leases and stale candidates
+/// fail closed independently, in the caller's deterministic order. The operation is not called if
+/// no candidate survives revalidation. The supplied operation has the same restrictions as
+/// `with_exact_tracked_srv_mutation`: it must use only unhooked descriptor operations and must not
+/// submit work or reserve another shared-view epoch.
+///
+/// Raw title descriptor writes remain outside XCL's exclusion. All eight words are observed under
+/// `WRITE` immediately before the operation, but title code can still race after that point; a
+/// future policy must obey the title's descriptor-lifetime rules.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite policy
+fn with_exact_tracked_srv_mutations<T>(
+    candidates: &[(SrvSlot, u64)],
+    mutate: impl FnOnce(&[ExactSrvMutation<'_, ID3D12Resource, super::console_heap::ViewSlotLease>]) -> T,
+) -> Option<T> {
+    with_exact_tracked_srv_mutations_on(
+        candidates,
+        lease_tracked_srv_resource,
+        |slots| super::console_heap::view_slot_words(slots),
+        mutate,
+    )
+}
+
+fn with_exact_tracked_srv_mutations_on<T, Resource, Heap>(
+    candidates: &[(SrvSlot, u64)],
+    mut lease: impl FnMut(SrvSlot, u64) -> Option<(TrackedSrv, Resource, Heap)>,
+    observe_words: impl FnOnce(&[(u64, u32)]) -> Vec<Option<[u32; 8]>>,
+    mutate: impl FnOnce(&[ExactSrvMutation<Resource, Heap>]) -> T,
+) -> Option<T> {
+    if !srv_tracking_enabled() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let candidates: Vec<_> = candidates.iter().copied().filter(|candidate| seen.insert(*candidate)).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    with_quiescent_shared_view_heap(|| {
+        let leased: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|(slot, generation)| lease(slot, generation).map(|(snapshot, resource, heap)| {
+                (slot, generation, snapshot, resource, heap)
+            }))
+            .collect();
+        if leased.is_empty() {
+            return None;
+        }
+        let slots: Vec<_> = leased.iter().map(|(slot, ..)| (slot.heap_generation, slot.slot)).collect();
+
+        // `leased` owns every native object and was declared before `write`: unwind therefore
+        // drops the later-declared guard first, even for candidates rejected below.
+        let mut valid = Vec::with_capacity(leased.len());
+        let write = lock_tracked_srv_write()?;
+        let observed = observe_words(&slots);
+        let mut validated = Vec::with_capacity(leased.len());
+        {
+            let mut tracked = TRACKED_SRVS.lock().unwrap();
+            let tracked = tracked.as_mut()?;
+            for (i, (slot, generation, snapshot, ..)) in leased.iter().enumerate() {
+                let Some(current) = tracked.by_slot.get(slot).copied() else {
+                    validated.push(None);
+                    continue;
+                };
+                if current.generation != *generation {
+                    validated.push(None);
+                    continue;
+                }
+                let words = observed.get(i).copied().flatten();
+                if words != Some(current.words) {
+                    // `current` was read under this mutex and still names the requested exact
+                    // generation, so removal cannot erase a concurrent replacement.
+                    tracked.by_slot.remove(slot);
+                    validated.push(None);
+                    continue;
+                }
+                debug_assert_eq!(snapshot.generation, current.generation);
+                validated.push(Some(current));
+            }
+        }
+        for ((_, _, _, resource, heap), entry) in leased.iter().zip(validated) {
+            if let Some(entry) = entry {
+                valid.push(ExactSrvMutation { entry, resource, heap });
+            }
+        }
+        if valid.is_empty() {
+            drop(write);
+            drop(valid);
+            drop(leased);
+            return None;
+        }
+        let result = mutate(&valid);
+        drop(write);
+        drop(valid);
+        drop(leased);
+        Some(result)
+    })
+    .flatten()
+}
+
+/// An exact, on-demand snapshot for a future residency consumer. It is deliberately not on the
+/// submit path: scanning every live SRV there would turn descriptor count into foreground cost.
+/// A consumer must still capture descriptor generations with recorded lists and queue fences;
+/// title code can raw-write descriptor memory immediately after this point-in-time snapshot.
+#[allow(dead_code)]
+fn reconciled_tracked_srvs() -> Vec<(SrvSlot, TrackedSrv)> {
+    if !srv_tracking_enabled() {
+        return Vec::new();
+    }
+    let candidates: Vec<_> = TRACKED_SRVS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|tracked| tracked.by_slot.iter().map(|(&slot, entry)| (slot, entry.generation)).collect())
+        .unwrap_or_default();
+    let slots: Vec<_> = candidates.iter().map(|(slot, _)| (slot.heap_generation, slot.slot)).collect();
+    let words = super::console_heap::view_slot_words(&slots);
+    let observed: Vec<_> = candidates
+        .into_iter()
+        .zip(words)
+        .map(|((slot, generation), words)| (slot, generation, words))
+        .collect();
+    TRACKED_SRVS.lock().unwrap().as_mut().map_or_else(Vec::new, |tracked| tracked.reconcile_observed(&observed))
+}
 
 /// A texture backed by one of the aliasable D3D12 heaps.
 pub(super) fn is_placed_texture(resource: usize) -> bool {
     PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
 }
 
+#[cfg(test)]
 pub(super) fn forget(resource: usize) {
+    forget_tracked_srvs(resource);
+    forget_resource_backing(resource);
+}
+
+/// Remove descriptor records after native final `Release`, while the caller still holds the
+/// lifetime gate acquired before that call. Do not acquire the descriptor-write gate here: an
+/// unrelated hook may hold it across a driver call whose temporary resource Release waits on the
+/// lifetime gate. The tracker mutex makes removal atomic with lease snapshots. A future descriptor
+/// transaction must take the write gate and revalidate the exact generation and descriptor words;
+/// a same-resource descriptor hook concurrent with final Release is invalid object lifetime use.
+/// Once this returns no new resource lease can start, so the caller may drop the lifetime gate
+/// before doing unrelated sparse/page/arena cleanup.
+pub(super) fn forget_tracked_after_resource_release(
+    resource: usize, lifetime: Option<&TrackedSrvLifetimeGuard>,
+) {
+    debug_assert!(!srv_tracking_enabled() || lifetime.is_some());
+    if lifetime.is_some() {
+        forget_tracked_srvs_locked(resource);
+    }
+}
+
+pub(super) fn forget_resource_backing_after_release(resource: usize) {
+    forget_resource_backing(resource);
+}
+
+fn forget_resource_backing(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
@@ -233,6 +831,8 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
+    /// virtual, resident, and SRV-sampled texel accounting for sampled placed textures (`None` for GPU-owned targets)
+    texels: Option<TexelMeta>,
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
@@ -242,6 +842,8 @@ struct Target {
 struct Levels {
     /// (the group's first subresource, its first tile in the resource, its tiles, mapped)
     groups: Vec<(u32, u32, u32, bool)>,
+    /// Physical-page keys owned by each mapped group.
+    group_tiles: Vec<(Vec<usize>, Vec<(usize, usize)>)>,
     /// the texture's levels (the last group's go up to here)
     mips: u32,
 }
@@ -264,7 +866,8 @@ impl Levels {
             }
             next = g.1.checked_add(g.2)?;
         }
-        (next == total && !groups.is_empty()).then_some(Levels { groups, mips })
+        let group_tiles = vec![(Vec::new(), Vec::new()); groups.len()];
+        (next == total && !groups.is_empty()).then_some(Levels { groups, group_tiles, mips })
     }
 
     /// The levels of group `k`.
@@ -276,6 +879,12 @@ impl Levels {
     fn group_of(&self, level: u32) -> usize {
         self.groups.partition_point(|g| g.0 <= level).saturating_sub(1)
     }
+}
+
+fn take_level_tiles(levels: Option<&mut Levels>) -> Vec<(Vec<usize>, Vec<(usize, usize)>)> {
+    levels
+        .map(|levels| levels.group_tiles.iter_mut().map(std::mem::take).collect())
+        .unwrap_or_default()
 }
 
 /// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture of one slice on the
@@ -313,6 +922,221 @@ fn level_stats() -> (u64, u64, u64, u64) {
     (l(0), l(1), l(2), l(3))
 }
 
+/// Snapshot of placed sampled-texture residency and SRV mip coverage (`XCL_ACTIVITY`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TexelStats {
+    pub sampled_textures: u64,
+    pub srv_textures: u64,
+    pub total_texels: u64,
+    pub resident_texels: u64,
+    pub srv_sampled_texels: u64,
+}
+
+static TEXEL_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+pub fn texel_stats() -> TexelStats {
+    let l = |k: usize| TEXEL_STATS[k].load(std::sync::atomic::Ordering::Relaxed);
+    TexelStats {
+        sampled_textures: l(0),
+        srv_textures: l(1),
+        total_texels: l(2),
+        resident_texels: l(3),
+        srv_sampled_texels: l(4),
+    }
+}
+
+fn mip_texels(width: u64, height: u32, depth: u16, dim: i32, mip: u32) -> u64 {
+    let shift = mip.min(63);
+    let w = (width >> shift).max(1);
+    let slices = (depth as u64).max(1);
+    if dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
+        let h = ((height as u64) >> shift).max(1);
+        let d = ((depth as u64) >> shift).max(1);
+        w.saturating_mul(h).saturating_mul(d)
+    } else if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D.0 {
+        w.saturating_mul(slices)
+    } else {
+        let h = ((height as u64) >> shift).max(1);
+        w.saturating_mul(h).saturating_mul(slices)
+    }
+}
+
+fn range_texels(width: u64, height: u32, depth: u16, dim: i32, mips: std::ops::Range<u32>) -> u64 {
+    mips.fold(0u64, |acc, m| acc.saturating_add(mip_texels(width, height, depth, dim, m)))
+}
+
+fn srv_mip_range(res_mips: u32, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> std::ops::Range<u32> {
+    let Some(v) = desc else { return 0..res_mips };
+    // SAFETY: each branch reads only the union field named by `v.ViewDimension`.
+    let (most_detailed, mip_levels, min_lod_clamp) = unsafe {
+        match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => {
+                let s = &v.Anonymous.Texture1D;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let s = &v.Anonymous.Texture1DArray;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let s = &v.Anonymous.Texture2D;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMS | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => (0, 1, 0.0),
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let s = &v.Anonymous.Texture2DArray;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => {
+                let s = &v.Anonymous.Texture3D;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let s = &v.Anonymous.TextureCube;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let s = &v.Anonymous.TextureCubeArray;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            _ => return 0..0,
+        }
+    };
+    let end = if mip_levels == 0 || mip_levels == u32::MAX {
+        res_mips
+    } else {
+        most_detailed.saturating_add(mip_levels).min(res_mips)
+    };
+    let clamp_mip = if min_lod_clamp.is_finite() && min_lod_clamp > 0.0 {
+        min_lod_clamp.floor() as u32
+    } else {
+        0
+    };
+    let start = most_detailed.max(clamp_mip).min(end);
+    start..end
+}
+
+fn srv_slice_range(res_slices: u32, dim: i32, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> std::ops::Range<u32> {
+    if dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
+        return 0..1;
+    }
+    let limit = res_slices.max(1);
+    let Some(v) = desc else { return 0..limit };
+    // SAFETY: each branch reads only the union field named by `v.ViewDimension`.
+    let (first, count) = unsafe {
+        match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D | D3D12_SRV_DIMENSION_TEXTURE2D | D3D12_SRV_DIMENSION_TEXTURE2DMS => (0, 1),
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let s = &v.Anonymous.Texture1DArray;
+                (s.FirstArraySlice, s.ArraySize)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let s = &v.Anonymous.Texture2DArray;
+                (s.FirstArraySlice, s.ArraySize)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                let s = &v.Anonymous.Texture2DMSArray;
+                (s.FirstArraySlice, s.ArraySize)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => (0, 6),
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let s = &v.Anonymous.TextureCubeArray;
+                (s.First2DArrayFace, s.NumCubes.saturating_mul(6))
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => (0, 1),
+            _ => return 0..0,
+        }
+    };
+    let start = first.min(limit);
+    start..first.saturating_add(count).min(limit)
+}
+
+/// Add `new` to sorted, disjoint half-open ranges and return how many indices were new.
+fn union_range(ranges: &mut Vec<std::ops::Range<u32>>, new: std::ops::Range<u32>) -> u32 {
+    if new.is_empty() {
+        return 0;
+    }
+    let before = ranges.iter().map(|r| r.end - r.start).sum::<u32>();
+    let first = ranges.partition_point(|range| range.end < new.start);
+    let mut end = first;
+    let mut merged = new;
+    while end < ranges.len() && ranges[end].start <= merged.end {
+        merged.start = merged.start.min(ranges[end].start);
+        merged.end = merged.end.max(ranges[end].end);
+        end += 1;
+    }
+    if first == end {
+        ranges.insert(first, merged);
+    } else {
+        ranges[first] = merged;
+        ranges.drain(first + 1..end);
+    }
+    let after = ranges.iter().map(|r| r.end - r.start).sum::<u32>();
+    after - before
+}
+
+struct TexelMeta {
+    width: u64,
+    height: u32,
+    depth: u16,
+    mips: u16,
+    dim: i32,
+    total_texels: u64,
+    resident_texels: u64,
+    srv_slices: Vec<Vec<std::ops::Range<u32>>>,
+    srv_sampled_texels: u64,
+}
+
+impl TexelMeta {
+    fn from_desc(desc: &D3D12_RESOURCE_DESC, resident: bool) -> Self {
+        let mips = desc.MipLevels.max(1);
+        let total_texels = range_texels(desc.Width, desc.Height, desc.DepthOrArraySize, desc.Dimension.0, 0..mips as u32);
+        TexelMeta {
+            width: desc.Width,
+            height: desc.Height,
+            depth: desc.DepthOrArraySize,
+            mips,
+            dim: desc.Dimension.0,
+            total_texels,
+            resident_texels: if resident { total_texels } else { 0 },
+            srv_slices: vec![Vec::new(); mips as usize],
+            srv_sampled_texels: 0,
+        }
+    }
+
+    fn record_srv(&mut self, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> (bool, u64) {
+        let first_srv = self.srv_sampled_texels == 0;
+        let mips = srv_mip_range(self.mips as u32, desc);
+        let slices = srv_slice_range(self.depth as u32, self.dim, desc);
+        let mut added = 0u64;
+        for mip in mips {
+            let new_slices = union_range(&mut self.srv_slices[mip as usize], slices.clone()) as u64;
+            if new_slices == 0 {
+                continue;
+            }
+            let per_slice = if self.dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
+                mip_texels(self.width, self.height, self.depth, self.dim, mip)
+            } else {
+                mip_texels(self.width, self.height, 1, self.dim, mip)
+            };
+            added = added.saturating_add(per_slice.saturating_mul(new_slices));
+        }
+        self.srv_sampled_texels = self.srv_sampled_texels.saturating_add(added);
+        (first_srv && added != 0, added)
+    }
+}
+
+fn record_texel_insert(texels: &Option<TexelMeta>) {
+    let Some(tm) = texels.as_ref() else { return };
+    TEXEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if tm.total_texels > 0 {
+        TEXEL_STATS[2].fetch_add(tm.total_texels, std::sync::atomic::Ordering::Relaxed);
+    }
+    if tm.resident_texels > 0 {
+        TEXEL_STATS[3].fetch_add(tm.resident_texels, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Levels {
     /// Its tiles that have pages.
     fn mapped_tiles(&self) -> u64 {
@@ -348,6 +1172,9 @@ struct TilePool {
     free_by_heap: Vec<Vec<u32>>,
     /// Whether `free_by_heap[h]` must be sorted descending before popping.
     dirty_sort: Vec<bool>,
+    /// Fresh-allocation packing class for heap `h`. Shared address pages may give either class
+    /// live owners here, so this is never proof that a heap is safe to evict.
+    heap_evictable: Vec<bool>,
     /// Total free tiles currently available across all heaps.
     free_total: usize,
     /// Tiles given back, reusable after `COOL`.
@@ -359,42 +1186,46 @@ impl TilePool {
         TilePool {
             free_by_heap: Vec::new(),
             dirty_sort: Vec::new(),
+            heap_evictable: Vec::new(),
             free_total: 0,
             cooling: std::collections::VecDeque::new(),
         }
     }
 
-    fn add_heap_at(&mut self, slot: u32, pool_pages: u32) {
+    fn add_heap_at(&mut self, slot: u32, pool_pages: u32, evictable: bool) {
         let idx = slot as usize;
         if idx >= self.free_by_heap.len() {
             self.free_by_heap.resize_with(idx + 1, Vec::new);
             self.dirty_sort.resize(idx + 1, false);
+            self.heap_evictable.resize(idx + 1, false);
         }
         debug_assert!(self.free_by_heap[idx].is_empty());
         self.free_by_heap[idx] = (0..pool_pages).rev().collect();
         self.dirty_sort[idx] = false;
+        self.heap_evictable[idx] = evictable;
         self.free_total += pool_pages as usize;
     }
 
     /// Reclaim completely empty cooled heaps (`free_by_heap[h].len() == pool_pages`), keeping up
-    /// to `keep_spare` empty heaps warm so steady-state streaming never thrashes `CreateHeap`.
+    /// to `keep_spare` empty heaps of each class warm so steady-state streaming never thrashes `CreateHeap`.
     /// Returns the reclaimed heap indices so the caller can drop their `ID3D12Heap`s.
     fn reclaim_empty_heaps(&mut self, keep_spare: usize, pool_pages: u32) -> Vec<u32> {
         let full = pool_pages as usize;
-        let mut empty: Vec<usize> = self
-            .free_by_heap
-            .iter()
-            .enumerate()
-            .filter_map(|(h, tiles)| (tiles.len() == full).then_some(h))
-            .collect();
-        if empty.len() <= keep_spare {
-            return Vec::new();
-        }
-        let mut reclaimed = Vec::with_capacity(empty.len() - keep_spare);
-        for h in empty.drain(keep_spare..) {
+        let mut kept = [0usize; 2];
+        let mut reclaimed = Vec::new();
+        for h in 0..self.free_by_heap.len() {
+            if self.free_by_heap[h].len() != full {
+                continue;
+            }
+            let class = self.heap_evictable[h] as usize;
+            if kept[class] < keep_spare {
+                kept[class] += 1;
+                continue;
+            }
             self.free_by_heap[h].clear();
             self.free_by_heap[h].shrink_to_fit();
             self.dirty_sort[h] = false;
+            self.heap_evictable[h] = false;
             self.free_total -= full;
             reclaimed.push(h as u32);
         }
@@ -430,16 +1261,19 @@ impl TilePool {
         }
     }
 
-    /// Pick the pool heap to take up to `rem` tiles from:
+    /// Pick a pool heap in the requested allocation class to take up to `rem` tiles from:
     /// 1. `preferred` if it fits all `rem` tiles (keeps partial-overlap placements on 1 heap),
     /// 2. otherwise best-fit heap with `len >= rem` (fits the whole texture in 1 heap without
     ///    splitting fuller pools),
     /// 3. otherwise the heap with the most free tiles (minimizing distinct heaps touched).
-    fn pick_heap(&self, rem: usize, preferred: Option<u32>) -> Option<usize> {
+    fn pick_heap(&self, rem: usize, preferred: Option<u32>, evictable: bool) -> Option<usize> {
         if self.free_total == 0 {
             return None;
         }
-        if let Some(p) = preferred.map(|h| h as usize).filter(|&h| h < self.free_by_heap.len()) {
+        if let Some(p) = preferred
+            .map(|h| h as usize)
+            .filter(|&h| h < self.free_by_heap.len() && self.heap_evictable.get(h).copied() == Some(evictable))
+        {
             if self.free_by_heap[p].len() >= rem {
                 return Some(p);
             }
@@ -447,6 +1281,9 @@ impl TilePool {
         let mut best_fit: Option<(usize, usize)> = None;
         let mut largest: Option<(usize, usize)> = None;
         for (h, tiles) in self.free_by_heap.iter().enumerate() {
+            if self.heap_evictable.get(h).copied() != Some(evictable) {
+                continue;
+            }
             let len = tiles.len();
             if len == 0 {
                 continue;
@@ -462,13 +1299,14 @@ impl TilePool {
         best_fit.or(largest).map(|(h, _)| h)
     }
 
-    /// Allocate `count` tiles, preferring a single heap and ascending contiguous offsets.
-    /// `make_heap` allocates a new backing pool heap of `pool_pages` tiles when `free_total == 0`.
-    /// On failure, any tiles already taken are returned untouched.
+    /// Allocate `count` tiles in one allocation class, preferring a single heap and ascending
+    /// contiguous offsets. `make_heap` allocates a new backing pool heap when the class has no
+    /// free tiles. On failure, any tiles already taken are returned untouched.
     fn take_batch(
         &mut self,
         count: usize,
         preferred: Option<u32>,
+        evictable: bool,
         now: std::time::Instant,
         pool_pages: u32,
         mut make_heap: impl FnMut() -> Option<u32>,
@@ -480,14 +1318,14 @@ impl TilePool {
         let mut out = Vec::with_capacity(count);
         while out.len() < count {
             let rem = count - out.len();
-            let h = match self.pick_heap(rem, preferred) {
+            let h = match self.pick_heap(rem, preferred, evictable) {
                 Some(h) => h,
                 None => {
                     let Some(new_h) = make_heap() else {
                         self.return_tiles(&out);
                         return None;
                     };
-                    self.add_heap_at(new_h, pool_pages);
+                    self.add_heap_at(new_h, pool_pages, evictable);
                     new_h as usize
                 }
             };
@@ -579,6 +1417,21 @@ fn keep_spare_pools() -> usize {
     })
 }
 
+/// A superseded texture whose NULL mapping is held until work submitted before it has finished.
+struct HeldUnmap {
+    res: ID3D12Resource,
+    total: u32,
+    used: Vec<usize>,
+    used_extra: Vec<(usize, usize)>,
+    level_tiles: Vec<(Vec<usize>, Vec<(usize, usize)>)>,
+    /// Completion marks for every relevant title or upload queue.
+    marks: Vec<(ID3D12Fence, u64)>,
+}
+
+fn all_marks_complete<F>(marks: &[(F, u64)], mut completed: impl FnMut(&F) -> u64) -> bool {
+    marks.iter().all(|(fence, value)| completed(fence) >= *value)
+}
+
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
@@ -600,6 +1453,10 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// queue → reusable completion fence and its last signalled value
+    unmap_fences: std::collections::HashMap<usize, (ID3D12Fence, u64)>,
+    /// Superseded mappings waiting for all pre-existing queue work to finish.
+    held_unmaps: Vec<HeldUnmap>,
     /// cached `reservable()` answers for `(DXGI_FORMAT, SampleCount)` on this device
     reservable_cache: std::collections::HashMap<(i32, u32), bool>,
     /// reusable scratch buffers for `map()`
@@ -614,6 +1471,110 @@ unsafe impl Send for Pages {}
 
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
+
+struct BeforeExecuteQueue<D> {
+    serial: Mutex<()>,
+    /// A queue's device is immutable. Cache only a successful, non-null lookup; failures retry.
+    device: OnceLock<D>,
+}
+
+impl<D> Default for BeforeExecuteQueue<D> {
+    fn default() -> Self {
+        Self { serial: Mutex::new(()), device: OnceLock::new() }
+    }
+}
+
+impl<D> BeforeExecuteQueue<D> {
+    /// Called with `serial` held, so the first successful lookup is also the only successful lookup.
+    fn cached_or_try_device(&self, lookup: impl FnOnce() -> Option<D>) -> Option<&D> {
+        if let Some(device) = self.device.get() {
+            return Some(device);
+        }
+        let device = lookup()?;
+        let _ = self.device.set(device);
+        self.device.get()
+    }
+}
+
+type BeforeExecuteGate = BeforeExecuteQueue<ID3D12Device>;
+
+fn wait_gates() -> &'static Mutex<HashMap<usize, Arc<BeforeExecuteGate>>> {
+    static GATES: OnceLock<Mutex<HashMap<usize, Arc<BeforeExecuteGate>>>> = OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remove_wait_gate<D>(gates: &Mutex<HashMap<usize, Arc<BeforeExecuteQueue<D>>>>, queue: usize) -> Option<Arc<BeforeExecuteQueue<D>>> {
+    gates.lock().unwrap().remove(&queue)
+}
+
+/// CPU time inside the residency work one `XCL_ACTIVITY` look caused. The look owns this
+/// thread-local accumulator; internal uploads on the same thread join the same sample without
+/// adding shared counters to the submission path.
+#[derive(Default)]
+pub(super) struct BeforeExecuteTiming {
+    pub gate_wait: std::time::Duration,
+    pub device: std::time::Duration,
+    pub unmap_poll: std::time::Duration,
+    pub state: std::time::Duration,
+    pub queue_wait: std::time::Duration,
+    pub retirement: std::time::Duration,
+    pub calls: usize,
+    pub device_cache_hits: usize,
+    pub device_queries: usize,
+    pub mapping_waits: usize,
+    pub reclaim_passes: usize,
+    pub retirement_passes: usize,
+}
+
+thread_local! {
+    static BEFORE_EXECUTE_TIMING: std::cell::RefCell<Option<BeforeExecuteTiming>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Begin an activity look's residency measurement. Retried sparse preparation reaches this more
+/// than once, so an already-active accumulator is preserved until `take_before_execute_timing`.
+pub(super) fn begin_before_execute_timing() {
+    BEFORE_EXECUTE_TIMING.with(|timing| {
+        let mut timing = timing.borrow_mut();
+        if timing.is_none() {
+            *timing = Some(BeforeExecuteTiming::default());
+        }
+    });
+}
+
+pub(super) fn take_before_execute_timing() -> Option<BeforeExecuteTiming> {
+    BEFORE_EXECUTE_TIMING.with(|timing| timing.borrow_mut().take())
+}
+
+fn before_execute_timing_active() -> bool {
+    BEFORE_EXECUTE_TIMING.with(|timing| timing.borrow().is_some())
+}
+
+fn record_before_execute_timing(measured: BeforeExecuteTiming) {
+    BEFORE_EXECUTE_TIMING.with(|timing| {
+        let mut timing = timing.borrow_mut();
+        let Some(total) = timing.as_mut() else { return };
+        total.gate_wait += measured.gate_wait;
+        total.device += measured.device;
+        total.unmap_poll += measured.unmap_poll;
+        total.state += measured.state;
+        total.queue_wait += measured.queue_wait;
+        total.retirement += measured.retirement;
+        total.calls = total.calls.saturating_add(measured.calls);
+        total.device_cache_hits = total.device_cache_hits.saturating_add(measured.device_cache_hits);
+        total.device_queries = total.device_queries.saturating_add(measured.device_queries);
+        total.mapping_waits = total.mapping_waits.saturating_add(measured.mapping_waits);
+        total.reclaim_passes = total.reclaim_passes.saturating_add(measured.reclaim_passes);
+        total.retirement_passes = total.retirement_passes.saturating_add(measured.retirement_passes);
+    });
+}
+
+fn reserve_page_wait(waited: &mut HashMap<usize, u64>, queue: usize, value: u64) -> bool {
+    if value == 0 || waited.get(&queue).copied().unwrap_or(0) >= value {
+        return false;
+    }
+    waited.insert(queue, value);
+    true
+}
 
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
@@ -640,6 +1601,8 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            unmap_fences: std::collections::HashMap::new(),
+            held_unmaps: Vec::new(),
             reservable_cache: std::collections::HashMap::new(),
             scratch_heaps: Vec::new(),
             scratch_flags: Vec::new(),
@@ -719,7 +1682,7 @@ impl Pages {
             );
         }
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::real::native_queue_signal(&self.queue, &self.fence, self.value);
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -744,7 +1707,91 @@ impl Pages {
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::real::native_queue_signal(&self.queue, &self.fence, self.value);
+    }
+
+    /// Mark work submitted so far on every active queue. Retirement marks cover queues which
+    /// stopped accepting signals before this snapshot. Failure is closed: the mapping stays live.
+    unsafe fn mark_unmap(
+        &mut self,
+        dev: &ID3D12Device,
+        queues: &[ID3D12CommandQueue],
+        retiring: &[(ID3D12Fence, u64)],
+        blocked: bool,
+    ) -> Option<(Vec<(ID3D12Fence, u64)>, Vec<(ID3D12CommandQueue, ID3D12Fence, u64)>)> {
+        if blocked {
+            return None;
+        }
+        let mut marks = Vec::with_capacity(retiring.len() + queues.len());
+        let mut signals = Vec::with_capacity(queues.len());
+        for (fence, value) in retiring {
+            let mut fence_dev: Option<ID3D12Device> = None;
+            fence.GetDevice(&mut fence_dev).ok()?;
+            if fence_dev.as_ref().is_some_and(|owner| owner.as_raw() == dev.as_raw()) {
+                marks.push((fence.clone(), *value));
+            }
+        }
+        let mut seen = HashSet::new();
+        for queue in queues {
+            let key = queue.as_raw() as usize;
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut queue_dev: Option<ID3D12Device> = None;
+            if queue.GetDevice(&mut queue_dev).is_err() || queue_dev.as_ref().is_none_or(|d| d.as_raw() != dev.as_raw()) {
+                continue;
+            }
+            let entry = match self.unmap_fences.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let fence = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                    entry.insert((fence, 0))
+                }
+            };
+            let next = entry.1 + 1;
+            entry.1 = next;
+            marks.push((entry.0.clone(), next));
+            signals.push((queue.clone(), entry.0.clone(), next));
+        }
+        Some((marks, signals))
+    }
+
+    /// Strong fence owners to poll without holding `PAGES`.
+    fn held_unmap_fences(&self) -> Vec<ID3D12Fence> {
+        self.held_unmaps.iter().flat_map(|held| held.marks.iter().map(|(fence, _)| fence.clone())).collect()
+    }
+
+    /// Submit completed NULL mappings and return their resource owners for release after unlock.
+    unsafe fn release_held_unmaps(
+        &mut self,
+        now: std::time::Instant,
+        mut completed: impl FnMut(&ID3D12Fence) -> u64,
+    ) -> Vec<ID3D12Resource> {
+        let mut done = Vec::new();
+        for held in std::mem::take(&mut self.held_unmaps) {
+            if all_marks_complete(&held.marks, &mut completed) {
+                let key = held.res.as_raw() as usize;
+                if let Some(levels) = self.targets.get_mut(&key).and_then(|target| target.levels.as_mut()) {
+                    LEVEL_STATS[2].fetch_sub(levels.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+                    levels.groups.iter_mut().for_each(|group| group.3 = false);
+                }
+                if let Some(tm) = self.targets.get_mut(&key).and_then(|target| target.texels.as_mut()) {
+                    if tm.resident_texels > 0 {
+                        TEXEL_STATS[3].fetch_sub(tm.resident_texels, std::sync::atomic::Ordering::Relaxed);
+                        tm.resident_texels = 0;
+                    }
+                }
+                self.unmap(&held.res, held.total);
+                self.release_tiles(held.used, held.used_extra, now, true);
+                for (used, used_extra) in held.level_tiles {
+                    self.release_tiles(used, used_extra, now, true);
+                }
+                done.push(held.res);
+            } else {
+                self.held_unmaps.push(held);
+            }
+        }
+        done
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -782,12 +1829,15 @@ impl Pages {
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize)
+        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize, false)
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind_range(
+        &mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize,
+        console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, evictable: bool,
+    ) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -809,7 +1859,7 @@ impl Pages {
 
         let pools = &mut self.pools;
         let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+        let fresh = pool.take_batch(missing, preferred, evictable, now, POOL_PAGES, || {
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
         })?;
@@ -857,6 +1907,20 @@ impl Pages {
         self.map(res, sub, &tiles);
         Some((used, used_extra))
     }
+}
+
+/// Poll a snapshot without `PAGES`; a held unmap added meanwhile has no observation and stays held.
+unsafe fn held_unmap_completions(dev_key: usize) -> Vec<(ID3D12Fence, u64)> {
+    let mut fences = {
+        let pages = PAGES.lock().unwrap();
+        pages.get(&dev_key).and_then(Option::as_ref).map(Pages::held_unmap_fences).unwrap_or_default()
+    };
+    fences.sort_unstable_by_key(|fence| fence.as_raw() as usize);
+    fences.dedup_by_key(|fence| fence.as_raw() as usize);
+    fences.into_iter().map(|fence| {
+        let value = fence.GetCompletedValue();
+        (fence, value)
+    }).collect()
 }
 
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall
@@ -1003,6 +2067,7 @@ unsafe fn place_on_pages(
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
+    let texels = (!require_aligned && super::memory_report::enabled()).then(|| TexelMeta::from_desc(desc, levels.is_none()));
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1010,10 +2075,12 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                record_texel_insert(&texels);
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, texels });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
+                record_texel_insert(&texels);
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, texels });
                 true
             } else {
                 false
@@ -1031,29 +2098,52 @@ unsafe fn place_on_pages(
     Some(hr)
 }
 
-/// Unmap a placed texture superseded by a placement with a different address range, returning its
-/// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
+/// Hold a superseded texture's mapping until work submitted before this call has finished.
+/// Polling completion on the CPU avoids a dependency from the mapping queue back to a title queue,
+/// which may itself already be waiting for later mapping work.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
-    let key = res.as_raw() as usize;
-    let mut g = PAGES.lock().unwrap();
-    let now = std::time::Instant::now();
-    for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.get_mut(&key) else { continue };
-        if !t.mapped {
-            return;
-        }
-        let total = t.total;
-        let used = std::mem::take(&mut t.used);
-        let used_extra = std::mem::take(&mut t.used_extra);
-        t.mapped = false;
-        if let Some(l) = t.levels.as_mut() {
-            LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
-            l.groups.iter_mut().for_each(|g| g.3 = false);
-        }
-        pages.unmap(res, total);
-        pages.release_tiles(used, used_extra, now, true);
+    let mut dev: Option<ID3D12Device> = None;
+    if res.GetDevice(&mut dev).is_err() {
         return;
     }
+    let Some(dev) = dev else { return };
+    let dev_key = dev.as_raw() as usize;
+    let observed = held_unmap_completions(dev_key);
+    let mut completion = super::present::queue_completion_snapshot();
+    completion.active.extend(super::title_textures::upload_queues());
+    let key = res.as_raw() as usize;
+    let (done, signals) = {
+        let mut g = PAGES.lock().unwrap();
+        let Some(Some(pages)) = g.get_mut(&dev_key) else { return };
+        if !pages.targets.get(&key).is_some_and(|target| target.mapped) {
+            return;
+        }
+        let Some((marks, signals)) = pages.mark_unmap(&dev, &completion.active, &completion.retiring, completion.blocked) else {
+            crate::xlog_warn!("D3D12.X: could not guard a superseded texture unmap; keeping its mapping");
+            return;
+        };
+        let Some(target) = pages.targets.get_mut(&key) else { return };
+        let held = HeldUnmap {
+            res: res.clone(),
+            total: target.total,
+            used: std::mem::take(&mut target.used),
+            used_extra: std::mem::take(&mut target.used_extra),
+            level_tiles: take_level_tiles(target.levels.as_mut()),
+            marks,
+        };
+        target.mapped = false;
+        pages.held_unmaps.push(held);
+        let done = pages.release_held_unmaps(std::time::Instant::now(), |fence| {
+            observed_completion(&observed, fence, |known, current| known.as_raw() == current.as_raw())
+        });
+        (done, signals)
+    };
+    for (queue, fence, value) in signals {
+        if super::real::native_queue_signal(&queue, &fence, value).is_err() {
+            crate::xlog_warn!("D3D12.X: could not signal a superseded texture unmap marker; keeping its mapping");
+        }
+    }
+    drop(done);
 }
 
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
@@ -1072,6 +2162,26 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     if mapped {
         return true;
     }
+    // A deferred unmap never changed the resource's tiles. Cancel it and restore their ownership.
+    if let Some(index) = pages.held_unmaps.iter().position(|held| held.res.as_raw() as usize == key) {
+        let held = pages.held_unmaps.swap_remove(index);
+        if let Some(target) = pages.targets.get_mut(&key) {
+            target.used = held.used;
+            target.used_extra = held.used_extra;
+            if let Some(levels) = target.levels.as_mut().filter(|levels| levels.group_tiles.len() == held.level_tiles.len()) {
+                levels.group_tiles = held.level_tiles;
+            } else {
+                for (used, used_extra) in held.level_tiles {
+                    target.used.extend(used);
+                    target.used_extra.extend(used_extra);
+                }
+            }
+            target.mapped = true;
+        }
+        drop(g);
+        drop(held.res);
+        return true;
+    }
     // (lazy levels: they get their pages again with their next texels)
     if let Some(t) = pages.targets.get_mut(&key).filter(|t| t.levels.is_some()) {
         t.mapped = true;
@@ -1084,6 +2194,12 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
+        if let Some(tm) = t.texels.as_mut() {
+            if tm.resident_texels == 0 && tm.total_texels > 0 {
+                tm.resident_texels = tm.total_texels;
+                TEXEL_STATS[3].fetch_add(tm.total_texels, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     true
 }
@@ -1093,14 +2209,30 @@ fn forget_pages(resource: usize) {
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.remove(&resource) else { continue };
+        let Some(mut t) = pages.targets.remove(&resource) else { continue };
         if let Some(l) = &t.levels {
             LEVEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[1].fetch_sub(t.total as u64, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some(tm) = &t.texels {
+            TEXEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if tm.srv_sampled_texels != 0 {
+                TEXEL_STATS[1].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                TEXEL_STATS[4].fetch_sub(tm.srv_sampled_texels, std::sync::atomic::Ordering::Relaxed);
+            }
+            if tm.total_texels > 0 {
+                TEXEL_STATS[2].fetch_sub(tm.total_texels, std::sync::atomic::Ordering::Relaxed);
+            }
+            if tm.resident_texels > 0 {
+                TEXEL_STATS[3].fetch_sub(tm.resident_texels, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
+            for (used, used_extra) in take_level_tiles(t.levels.as_mut()) {
+                pages.release_tiles(used, used_extra, now, false);
+            }
         }
         return;
     }
@@ -1132,6 +2264,17 @@ impl<H, F: Clone> RetireQueue<H, F> {
         Vec::new()
     }
 
+    /// Strong owners of every fence whose completion can change a sweep decision. The caller
+    /// polls them after dropping the retirement-state lock, then rechecks the current batches.
+    fn completion_fences(&self) -> Vec<F> {
+        let mut fences: Vec<_> = self.fences.values().map(|(fence, _)| fence.clone()).collect();
+        for batch in &self.batches {
+            fences.extend(batch.unmap_mark.as_ref().map(|(fence, _)| fence.clone()));
+            fences.extend(batch.marks.iter().map(|(fence, _)| fence.clone()));
+        }
+        fences
+    }
+
     /// Reap completed batches and prune dead-queue fences once completed; caller drops outside locks.
     fn sweep_with(&mut self, live_queues: &HashSet<usize>, mut completed: impl FnMut(&F) -> u64) -> (Vec<RetiringBatch<H, F>>, Vec<F>) {
         let (mut done, mut kept) = (Vec::new(), Vec::new());
@@ -1143,12 +2286,55 @@ impl<H, F: Clone> RetireQueue<H, F> {
         let pruned = stale.into_iter().filter_map(|k| self.fences.remove(&k).map(|(f, _)| f)).collect();
         (done, pruned)
     }
+
+    /// In-flight batches own their marks; only the address-keyed reusable fence is removed.
+    fn forget_queue(&mut self, queue: usize) -> Option<F> {
+        self.fences.remove(&queue).map(|(fence, _)| fence)
+    }
+}
+
+fn observed_completion<F>(observed: &[(F, u64)], fence: &F, mut same: impl FnMut(&F, &F) -> bool) -> u64 {
+    observed.iter().find_map(|(known, value)| same(known, fence).then_some(*value)).unwrap_or(0)
 }
 
 unsafe impl Send for RetireQueue<ID3D12Heap, ID3D12Fence> {}
 
-static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<ID3D12Heap, ID3D12Fence>>>> = Mutex::new(None);
+type DeviceRetire = std::sync::Arc<Mutex<RetireQueue<ID3D12Heap, ID3D12Fence>>>;
+
+/// Per-device retirement states. The registry is held only while acquiring a strong state lease;
+/// fence creation, queue signaling, polling, and COM destruction never hold it.
+static RETIRE: Mutex<Option<std::collections::HashMap<usize, DeviceRetire>>> = Mutex::new(None);
 static RETIRING_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn device_retire_state(dev_key: usize) -> DeviceRetire {
+    RETIRE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(dev_key)
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(RetireQueue::new())))
+        .clone()
+}
+
+/// Remove raw queue-address state before a retired queue's final owner can be released. Fence and
+/// cached device objects are extracted from their locks and dropped afterward; batches keep clones.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let queue = id.raw();
+    let page_fences = {
+        let mut pages = PAGES.lock().unwrap();
+        pages.values_mut().flatten().filter_map(|pages| {
+            pages.waited.remove(&queue);
+            pages.unmap_fences.remove(&queue)
+        }).collect::<Vec<_>>()
+    };
+    let wait_gate = remove_wait_gate(wait_gates(), queue);
+    let states: Vec<_> = RETIRE.lock().unwrap().as_ref().into_iter().flat_map(|devices| devices.values().cloned()).collect();
+    let gone: Vec<_> = states
+        .iter()
+        .filter_map(|state| state.lock().unwrap().forget_queue(queue))
+        .collect();
+    drop((page_fences, gone, wait_gate));
+}
 
 /// Collect all known live command queues belonging to `dev_key` (deduplicated by raw ptr).
 unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueue>) -> Vec<(usize, ID3D12CommandQueue)> {
@@ -1160,9 +2346,8 @@ unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueu
             out.push((key, q));
         }
     };
-    for raw in super::present::known_queues() {
-        let raw = raw as *mut c_void;
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) { add(q.clone()); }
+    for q in super::present::active_queues_held() {
+        add(q);
     }
     for q in extra.into_iter().cloned().chain(super::title_textures::upload_queues()).chain(super::sparse::queue()) {
         add(q);
@@ -1175,17 +2360,36 @@ unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueu
 unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<ID3D12Heap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
     let queues = collect_device_queues(dev_key, extra_queue);
     let live_keys: HashSet<usize> = queues.iter().map(|&(k, _)| k).collect();
-    let _drop_outside_locks = {
-        let mut guard = RETIRE.lock().unwrap();
-        let map = guard.get_or_insert_with(std::collections::HashMap::new);
-        if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
-        let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
-        let before = rq.batches.len();
-        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
-        let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
-        RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
-        (immediate, done, pruned)
+    let state = if newly_reclaimed.is_empty() {
+        let registry = RETIRE.lock().unwrap();
+        let Some(state) = registry.as_ref().and_then(|map| map.get(&dev_key)).cloned() else { return };
+        state
+    } else {
+        device_retire_state(dev_key)
     };
+    let (immediate, mut probes) = {
+        let mut rq = state.lock().unwrap();
+        let before = rq.batches.len();
+        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| super::real::native_queue_signal(q, f, v).is_ok());
+        RETIRING_BATCHES.fetch_add(rq.batches.len() - before, std::sync::atomic::Ordering::AcqRel);
+        (immediate, rq.completion_fences())
+    };
+    // Deduplication and every COM call/drop happen without RETIRE held. The strong snapshots keep
+    // raw addresses from being reused while results are identified by their exact fence object.
+    probes.sort_unstable_by_key(|fence| fence.as_raw() as usize);
+    probes.dedup_by_key(|fence| fence.as_raw() as usize);
+    let observed: Vec<_> = probes.into_iter().map(|fence| {
+        let completed = fence.GetCompletedValue();
+        (fence, completed)
+    }).collect();
+    let (done, pruned) = {
+        let mut rq = state.lock().unwrap();
+        rq.sweep_with(&live_keys, |fence| {
+            observed_completion(&observed, fence, |known, current| known.as_raw() == current.as_raw())
+        })
+    };
+    RETIRING_BATCHES.fetch_sub(done.len(), std::sync::atomic::Ordering::AcqRel);
+    drop((immediate, done, pruned, observed));
 }
 
 /// Before GPU work on `queue`: have it wait for every tile mapping made so far on its device,
@@ -1193,24 +2397,60 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
 /// per second per device) retire completely empty 64 MiB VRAM pool heaps and idle arenas behind
 /// per-queue GPU fence signals across all live queues on the device.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
-    let mut dev: Option<ID3D12Device> = None;
-    if queue.GetDevice(&mut dev).is_err() {
-        return;
+    let measure = before_execute_timing_active();
+    let mut measured = BeforeExecuteTiming { calls: measure as usize, ..Default::default() };
+    let gate_started = measure.then(std::time::Instant::now);
+    let queue_key = queue.as_raw() as usize;
+    let wait_gate = wait_gates().lock().unwrap().entry(queue_key).or_default().clone();
+    let _queue_serial = wait_gate.serial.lock().unwrap();
+    if let Some(started) = gate_started {
+        measured.gate_wait = started.elapsed();
     }
-    let Some(dev) = dev else { return };
+    if measure {
+        let cached = wait_gate.device.get().is_some();
+        measured.device_cache_hits = cached as usize;
+        measured.device_queries = (!cached) as usize;
+    }
+    let device_started = measure.then(std::time::Instant::now);
+    let dev = wait_gate.cached_or_try_device(|| {
+        let mut dev: Option<ID3D12Device> = None;
+        queue.GetDevice(&mut dev).ok()?;
+        dev
+    });
+    let Some(dev) = dev else {
+        if let Some(started) = device_started {
+            measured.device = started.elapsed();
+        }
+        if measure {
+            record_before_execute_timing(measured);
+        }
+        return;
+    };
+    if let Some(started) = device_started {
+        measured.device = started.elapsed();
+    }
     let dev_key = dev.as_raw() as usize;
     let now = std::time::Instant::now();
+    let poll_started = measure.then(std::time::Instant::now);
+    let unmap_completions = held_unmap_completions(dev_key);
+    if let Some(started) = poll_started {
+        measured.unmap_poll = started.elapsed();
+    }
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    let mut completed_unmaps = Vec::new();
+    let mut wait = None;
+    let state_started = measure.then(std::time::Instant::now);
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            let key = queue.as_raw() as usize;
-            if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-                let _ = queue.Wait(&pages.fence, pages.value);
-                super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
-                pages.waited.insert(key, pages.value);
+            completed_unmaps = pages.release_held_unmaps(now, |fence| {
+                observed_completion(&unmap_completions, fence, |known, current| known.as_raw() == current.as_raw())
+            });
+            let value = pages.value;
+            if reserve_page_wait(&mut pages.waited, queue_key, value) {
+                wait = Some((pages.fence.clone(), value));
             }
             if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
                 pages.last_reclaim = now;
@@ -1222,19 +2462,88 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             }
         }
     }
+    if let Some(started) = state_started {
+        measured.state = started.elapsed();
+        measured.mapping_waits = wait.is_some() as usize;
+        measured.reclaim_passes = do_reclaim as usize;
+    }
+    let queue_wait_started = measure.then(std::time::Instant::now);
+    if let Some((fence, value)) = wait {
+        let _ = super::real::native_queue_wait(queue, &fence, value);
+        super::list_x::note_internal_wait(queue_key, "texture page mappings", &fence, value);
+    }
+    if let Some(started) = queue_wait_started {
+        measured.queue_wait = started.elapsed();
+    }
+    let retirement_started = measure.then(std::time::Instant::now);
     if do_reclaim {
         newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
     }
-    if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
-        retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
+    let retire = do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0;
+    if retire {
+        retire_heaps_and_sweep(dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
+    }
+    drop(completed_unmaps);
+    if let Some(started) = retirement_started {
+        measured.retirement = started.elapsed();
+        measured.retirement_passes = retire as usize;
+    }
+    if measure {
+        record_before_execute_timing(measured);
     }
 }
 
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// A tile mapping on `dev`'s page queue, as `map` leaves it (the fence advanced and signalled
+/// there): the value a queue must wait for before work that uses the pages. None: no pages on
+/// this device (no tiled resources).
+#[cfg(test)]
+pub(super) unsafe fn note_mapping_for_test(dev: &ID3D12Device) -> Option<u64> {
+    let mut g = PAGES.lock().unwrap();
+    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
+    pages.value += 1;
+    super::real::native_queue_signal(&pages.queue, &pages.fence, pages.value).ok()?;
+    Some(pages.value)
+}
+
+/// The page mapping value `queue` was last made to wait for on `dev` (`before_execute`).
+#[cfg(test)]
+pub(super) fn waited_for_test(dev: usize, queue: usize) -> u64 {
+    let g = PAGES.lock().unwrap();
+    g.get(&dev).and_then(|p| p.as_ref()).and_then(|p| p.waited.get(&queue).copied()).unwrap_or(0)
+}
+
 /// Tile identities of one mapped resource: title pages, then extra pages.
 /// A device-wide byte count also falls when unrelated idle pages are swept.
+#[cfg(test)]
+fn target_page_keys(target: &Target) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let mut used = target.used.clone();
+    let mut extra = target.used_extra.clone();
+    if let Some(levels) = &target.levels {
+        for (level_used, level_extra) in &levels.group_tiles {
+            used.extend(level_used);
+            extra.extend(level_extra);
+        }
+    }
+    (used, extra)
+}
+
+#[cfg(test)]
+fn target_tiles(pages: &Pages, target: &Target) -> Option<(Vec<Tile>, Vec<Tile>)> {
+    let (used, extra) = target_page_keys(target);
+    let used = used
+        .iter()
+        .map(|key| pages.pages.get(key).map(|page| page.tile))
+        .collect::<Option<Vec<_>>>()?;
+    let extra = extra
+        .iter()
+        .map(|key| pages.extra_pages.get(key).map(|page| page.tile))
+        .collect::<Option<Vec<_>>>()?;
+    (used.len() + extra.len() == target.total as usize).then_some((used, extra))
+}
+
 #[cfg(test)]
 pub(super) fn mapped_tiles_for(device: usize, resource: usize) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
     let g = PAGES.lock().unwrap();
@@ -1243,16 +2552,21 @@ pub(super) fn mapped_tiles_for(device: usize, resource: usize) -> Option<(Vec<(u
     if !target.mapped {
         return None;
     }
-    let used = target.used.iter().map(|key| p.pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    let extra = target.used_extra.iter().map(|key| p.extra_pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    (used.len() + extra.len() == target.total as usize).then_some((used, extra))
+    target_tiles(p, target)
 }
 
-#[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     let Some(Some(p)) = g.get(&device) else { return (0, 0) };
-    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    let pages = p.pages.len().saturating_add(p.extra_pages.len()).saturating_mul(PAGE);
+    let pools = p.pools.len().saturating_mul(POOL_PAGES as usize).saturating_mul(PAGE);
+    (pages, pools)
+}
+
+#[cfg(test)]
+fn held_unmaps_for(device: usize) -> usize {
+    let g = PAGES.lock().unwrap();
+    g.get(&device).and_then(Option::as_ref).map_or(0, |pages| pages.held_unmaps.len())
 }
 
 /// Pool/tile identities used by one mapped resource: title pages, then extra pages.
@@ -1263,9 +2577,7 @@ pub(super) fn tile_mappings_for(device: usize, resource: usize) -> Option<(Vec<(
     let p = g.get(&device)?.as_ref()?;
     let target = p.targets.get(&resource)?;
     if !target.mapped { return None; }
-    let used = target.used.iter().map(|key| p.pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    let extra = target.used_extra.iter().map(|key| p.extra_pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    (used.len() + extra.len() == target.total as usize).then_some((used, extra))
+    target_tiles(p, target)
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
@@ -1335,12 +2647,20 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, false) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
-            t.used.extend(used);
-            t.used_extra.extend(used_extra);
             if let Some(l) = t.levels.as_mut() {
                 l.groups[k].3 = true;
+                l.group_tiles[k].0.extend(used);
+                l.group_tiles[k].1.extend(used_extra);
+            }
+            if let Some(tm) = t.texels.as_mut() {
+                let added = range_texels(tm.width, tm.height, tm.depth, tm.dim, levels.clone());
+                let delta = tm.total_texels.saturating_sub(tm.resident_texels).min(added);
+                if delta > 0 {
+                    tm.resident_texels += delta;
+                    TEXEL_STATS[3].fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             LEVEL_STATS[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             let groups = LEVEL_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1353,6 +2673,26 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         return fresh;
     }
     Vec::new()
+}
+
+/// Record which mip levels of placed sampled texture `resource` an SRV can sample.
+pub(super) fn note_srv(resource: usize, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) {
+    if !super::memory_report::enabled() || resource == 0 || !is_placed_texture(resource) {
+        return;
+    }
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        let Some(t) = pages.targets.get_mut(&resource) else { continue };
+        let Some(tm) = t.texels.as_mut() else { return };
+        let (first_srv, added) = tm.record_srv(desc);
+        if first_srv {
+            TEXEL_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if added > 0 {
+            TEXEL_STATS[4].fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+        }
+        return;
+    }
 }
 
 /// Whether `resource` is a texture whose levels get their pages one by one (`map_levels`).
@@ -1420,6 +2760,827 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn before_execute_queue_caches_only_a_successful_device_lookup() {
+        let state = BeforeExecuteQueue::<u32>::default();
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let _serial = state.serial.lock().unwrap();
+            assert_eq!(state.cached_or_try_device(|| {
+                calls.set(calls.get() + 1);
+                Some(17)
+            }).copied(), Some(17));
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn before_execute_queue_retries_failed_and_null_device_lookups() {
+        let state = BeforeExecuteQueue::<u32>::default();
+        let calls = std::cell::Cell::new(0);
+        let lookup = || {
+            calls.set(calls.get() + 1);
+            (calls.get() == 3).then_some(23)
+        };
+        for expected in [None, None, Some(23), Some(23)] {
+            let _serial = state.serial.lock().unwrap();
+            assert_eq!(state.cached_or_try_device(lookup).copied(), expected);
+        }
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn removing_before_execute_queue_makes_reused_address_fresh() {
+        let gates = Mutex::new(HashMap::<usize, Arc<BeforeExecuteQueue<u32>>>::new());
+        let old = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = old.serial.lock().unwrap();
+            assert_eq!(old.cached_or_try_device(|| Some(29)).copied(), Some(29));
+        }
+        gates.lock().unwrap().insert(5, old);
+        drop(remove_wait_gate(&gates, 5));
+
+        let fresh = gates.lock().unwrap().entry(5).or_default().clone();
+        assert!(fresh.device.get().is_none());
+        let _serial = fresh.serial.lock().unwrap();
+        assert_eq!(fresh.cached_or_try_device(|| Some(31)).copied(), Some(31));
+    }
+
+    struct RegistryLockCheckingOwner {
+        id: usize,
+        gates: Arc<Mutex<HashMap<usize, Arc<BeforeExecuteQueue<RegistryLockCheckingOwner>>>>>,
+        dropped_outside_lock: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for RegistryLockCheckingOwner {
+        fn drop(&mut self) {
+            self.dropped_outside_lock.store(self.gates.try_lock().is_ok(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn removed_before_execute_owner_drops_outside_registry_lock() {
+        let gates: Arc<Mutex<HashMap<usize, Arc<BeforeExecuteQueue<RegistryLockCheckingOwner>>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let dropped_outside_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = state.serial.lock().unwrap();
+            state.cached_or_try_device(|| Some(RegistryLockCheckingOwner {
+                id: 37,
+                gates: gates.clone(),
+                dropped_outside_lock: dropped_outside_lock.clone(),
+            }));
+        }
+        gates.lock().unwrap().insert(7, state);
+        drop(remove_wait_gate(&gates, 7));
+        assert!(dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn retained_before_execute_queue_survives_concurrent_key_reuse() {
+        let gates: Arc<Mutex<HashMap<usize, Arc<BeforeExecuteQueue<RegistryLockCheckingOwner>>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let old_dropped_outside_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let old = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = old.serial.lock().unwrap();
+            old.cached_or_try_device(|| Some(RegistryLockCheckingOwner {
+                id: 41,
+                gates: gates.clone(),
+                dropped_outside_lock: old_dropped_outside_lock.clone(),
+            }));
+        }
+        gates.lock().unwrap().insert(9, old.clone());
+
+        let (retained_tx, retained_rx) = std::sync::mpsc::channel();
+        let (reused_tx, reused_rx) = std::sync::mpsc::channel();
+        let retained = std::thread::spawn(move || {
+            let _serial = old.serial.lock().unwrap();
+            let owner = old.cached_or_try_device(|| None).unwrap();
+            retained_tx.send(owner.id).unwrap();
+            reused_rx.recv().unwrap();
+            assert_eq!(owner.id, 41);
+        });
+
+        assert_eq!(retained_rx.recv().unwrap(), 41);
+        drop(remove_wait_gate(&gates, 9));
+        assert!(!old_dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+
+        let fresh_dropped_outside_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fresh = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = fresh.serial.lock().unwrap();
+            let owner = fresh.cached_or_try_device(|| Some(RegistryLockCheckingOwner {
+                id: 43,
+                gates: gates.clone(),
+                dropped_outside_lock: fresh_dropped_outside_lock.clone(),
+            })).unwrap();
+            assert_eq!(owner.id, 43);
+        }
+        gates.lock().unwrap().insert(9, fresh.clone());
+        reused_tx.send(()).unwrap();
+        retained.join().unwrap();
+        assert!(old_dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+
+        drop(remove_wait_gate(&gates, 9));
+        drop(fresh);
+        assert!(fresh_dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[derive(Clone)]
+    struct FakeReceipt {
+        fence: Arc<std::sync::atomic::AtomicU64>,
+        value: u64,
+    }
+
+    fn fake_complete(receipt: &FakeReceipt) -> bool {
+        receipt.fence.load(std::sync::atomic::Ordering::Relaxed) >= receipt.value
+    }
+
+    #[test]
+    fn before_execute_timing_is_one_thread_local_activity_sample() {
+        drop(take_before_execute_timing());
+        assert!(!before_execute_timing_active());
+        begin_before_execute_timing();
+        begin_before_execute_timing();
+        record_before_execute_timing(BeforeExecuteTiming {
+            gate_wait: std::time::Duration::from_micros(3),
+            calls: 1,
+            device_cache_hits: 1,
+            mapping_waits: 1,
+            ..Default::default()
+        });
+        record_before_execute_timing(BeforeExecuteTiming {
+            state: std::time::Duration::from_micros(7),
+            calls: 1,
+            device_queries: 1,
+            reclaim_passes: 1,
+            ..Default::default()
+        });
+        let timing = take_before_execute_timing().unwrap();
+        assert_eq!(timing.gate_wait, std::time::Duration::from_micros(3));
+        assert_eq!(timing.state, std::time::Duration::from_micros(7));
+        assert_eq!((timing.calls, timing.device_cache_hits, timing.device_queries), (2, 1, 1));
+        assert_eq!((timing.mapping_waits, timing.reclaim_passes), (1, 1));
+        assert!(!before_execute_timing_active());
+    }
+
+    #[test]
+    fn shared_view_epochs_cancel_retire_and_remain_monotonic() {
+        let mut epochs = SharedViewEpochs::new();
+        let cancelled = epochs.reserve();
+        let retiring = epochs.reserve();
+        assert!(cancelled.0 < retiring.0);
+        epochs.cancel(cancelled);
+
+        let fence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        epochs.attach(retiring, FakeReceipt { fence: Arc::clone(&fence), value: 3 });
+        assert!(!epochs.quiescent(fake_complete));
+        fence.store(3, std::sync::atomic::Ordering::Relaxed);
+        assert!(epochs.quiescent(fake_complete));
+        assert!(epochs.reserve().0 > retiring.0, "retirement never reuses an epoch identity");
+    }
+
+    #[test]
+    fn reused_queue_address_cannot_retire_an_old_epoch() {
+        let mut epochs = SharedViewEpochs::new();
+        let old_epoch = epochs.reserve();
+        let old_generation_fence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        epochs.attach(old_epoch, FakeReceipt { fence: Arc::clone(&old_generation_fence), value: 7 });
+
+        // A new queue generation at the same numeric address owns another fence. Its progress
+        // cannot satisfy the strong fence owner retained by the old epoch's receipt.
+        let replacement_generation_fence = Arc::new(std::sync::atomic::AtomicU64::new(99));
+        assert_eq!(replacement_generation_fence.load(std::sync::atomic::Ordering::Relaxed), 99);
+        assert!(!epochs.quiescent(fake_complete));
+        old_generation_fence.store(7, std::sync::atomic::Ordering::Relaxed);
+        assert!(epochs.quiescent(fake_complete));
+    }
+
+    #[test]
+    fn untracked_shared_view_epoch_never_becomes_quiescent() {
+        let mut epochs = SharedViewEpochs::<FakeReceipt>::new();
+        let epoch = epochs.reserve();
+        epochs.poison(epoch);
+        assert!(!epochs.quiescent(fake_complete));
+    }
+
+    #[test]
+    fn disabled_tracking_cannot_authorize_descriptor_mutation() {
+        let epochs = Mutex::new(SharedViewEpochs::<FakeReceipt>::new());
+        let mut ran = false;
+        assert!(with_quiescent_epochs(false, &epochs, fake_complete, || ran = true).is_none());
+        assert!(!ran);
+    }
+
+    #[test]
+    fn quiescent_mutation_excludes_new_reservations() {
+        let epochs = Arc::new(Mutex::new(SharedViewEpochs::<FakeReceipt>::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mutation_epochs = Arc::clone(&epochs);
+        let mutation = std::thread::spawn(move || {
+            with_quiescent_epochs(true, &mutation_epochs, fake_complete, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+        let reserve_epochs = Arc::clone(&epochs);
+        let reserve = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let epoch = reserve_epochs.lock().unwrap().reserve();
+            reserved_tx.send(epoch).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(reserved_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        assert!(mutation.join().unwrap().is_some());
+        assert_eq!(reserved_rx.recv().unwrap(), SharedViewEpoch(1));
+        reserve.join().unwrap();
+    }
+
+    fn tracked_entry(resource: usize, pc_srv: u64) -> TrackedSrv {
+        let mut words = [0u32; 8];
+        words[0] = pc_srv as u32;
+        words[1] = resource as u32;
+        words[3] = 9 << 28;
+        TrackedSrv {
+            generation: 0, device: 7, resource, pc_srv, shared_srv: pc_srv + 1,
+            index: pc_srv as u32, desc: Some(D3D12_SHADER_RESOURCE_VIEW_DESC::default()), words,
+        }
+    }
+
+    fn srv_slot(heap_generation: u64, slot: u32) -> SrvSlot {
+        SrvSlot { heap_generation, slot }
+    }
+
+    struct MutationOwner(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for MutationOwner {
+        fn drop(&mut self) {
+            assert!(TRACKED_SRV_WRITES.try_lock().is_ok(), "strong owner dropped under WRITE");
+            assert!(TRACKED_SRVS.try_lock().is_ok(), "strong owner dropped under tracker lock");
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct UnwindMutationOwner {
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        unlocked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for UnwindMutationOwner {
+        fn drop(&mut self) {
+            use std::sync::TryLockError;
+            let available = |mutex: &'static Mutex<()>| match mutex.try_lock() {
+                Ok(guard) => { drop(guard); true }
+                Err(TryLockError::Poisoned(error)) => { drop(error.into_inner()); true }
+                Err(TryLockError::WouldBlock) => false,
+            };
+            let write = available(&TRACKED_SRV_WRITES) as usize;
+            let tracker = match TRACKED_SRVS.try_lock() {
+                Ok(guard) => { drop(guard); true }
+                Err(TryLockError::Poisoned(error)) => { drop(error.into_inner()); true }
+                Err(TryLockError::WouldBlock) => false,
+            } as usize;
+            self.unlocked.fetch_or(write | tracker << 1, std::sync::atomic::Ordering::Relaxed);
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn begin_mutation_test(entry: TrackedSrv, slot: SrvSlot) -> (u64, [u32; 8]) {
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        *SHARED_VIEW_EPOCHS.lock().unwrap() = SharedViewEpochs::new();
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(entry));
+        let current = tracked.by_slot[&slot];
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+        (current.generation, current.words)
+    }
+
+    fn end_mutation_test() {
+        TRACKED_SRVS.lock().unwrap().take();
+        *SHARED_VIEW_EPOCHS.lock().unwrap() = SharedViewEpochs::new();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn exact_srv_mutation_revalidates_then_drops_owners_outside_inner_locks() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = srv_slot(60, 2);
+        let (generation, words) = begin_mutation_test(tracked_entry(0x6010, 0xA0), slot);
+        let snapshot = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = with_exact_tracked_srv_mutation_on(
+            slot,
+            generation,
+            |_, _| Some((snapshot, MutationOwner(Arc::clone(&drops)), MutationOwner(Arc::clone(&drops)))),
+            |_| Some(words),
+            |entry, _, _| {
+                assert_eq!(entry.resource, 0x6010);
+                assert!(SHARED_VIEW_EPOCHS.try_lock().is_err(), "epoch was not held outermost");
+                assert!(TRACKED_SRV_WRITES.try_lock().is_err(), "WRITE was not held for mutation");
+                assert!(TRACKED_SRVS.try_lock().is_ok(), "tracker lock crossed mutation");
+                17
+            },
+        );
+        assert_eq!(result, Some(17));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        end_mutation_test();
+    }
+
+    #[test]
+    fn exact_srv_mutation_rejects_a_changed_generation_without_removing_it() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = srv_slot(61, 1);
+        let (generation, words) = begin_mutation_test(tracked_entry(0x6110, 0xA4), slot);
+        let old = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = with_exact_tracked_srv_mutation_on(
+            slot,
+            generation,
+            |_, _| {
+                // Model a hooked overwrite after the owners were acquired but before WRITE.
+                TRACKED_SRVS.lock().unwrap().as_mut().unwrap().write(slot, Some(tracked_entry(0x6120, 0xA4)));
+                Some((old, MutationOwner(Arc::clone(&drops)), MutationOwner(Arc::clone(&drops))))
+            },
+            |_| Some(words),
+            |_, _, _| panic!("stale mutation ran"),
+        );
+        assert_eq!(result, None);
+        let newer = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        assert_ne!(newer.generation, generation);
+        assert_eq!(newer.resource, 0x6120);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        end_mutation_test();
+    }
+
+    #[test]
+    fn exact_srv_mutation_forgets_raw_mismatch_or_missing_heap_backing() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for missing in [false, true] {
+            let slot = srv_slot(62 + missing as u64, 0);
+            let (generation, words) = begin_mutation_test(tracked_entry(0x6210, 0xA8), slot);
+            let snapshot = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut changed = words;
+            changed[5] ^= 1;
+            let result = with_exact_tracked_srv_mutation_on(
+                slot,
+                generation,
+                |_, _| Some((snapshot, MutationOwner(Arc::clone(&drops)), MutationOwner(Arc::clone(&drops)))),
+                |_| (!missing).then_some(changed),
+                |_, _, _| panic!("invalid raw descriptor mutation ran"),
+            );
+            assert_eq!(result, None);
+            assert!(!TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot.contains_key(&slot));
+            assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+            end_mutation_test();
+        }
+    }
+
+    #[test]
+    fn exact_srv_mutation_fails_closed_when_resource_or_heap_lease_is_gone() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = srv_slot(64, 0);
+        let (generation, _) = begin_mutation_test(tracked_entry(0x6410, 0xAC), slot);
+        let result = with_exact_tracked_srv_mutation_on(
+            slot,
+            generation,
+            |_, _| None::<(TrackedSrv, (), ())>,
+            |_| panic!("observed words without strong owners"),
+            |_, _, _| panic!("mutation ran without strong owners"),
+        );
+        assert_eq!(result, None);
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot.contains_key(&slot));
+        end_mutation_test();
+    }
+
+    #[test]
+    fn exact_srv_batch_deduplicates_and_revalidates_mixed_candidates_once() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        *SHARED_VIEW_EPOCHS.lock().unwrap() = SharedViewEpochs::new();
+        let (a, b, c, d, e) = (
+            srv_slot(70, 0), srv_slot(70, 1), srv_slot(70, 2), srv_slot(70, 3), srv_slot(70, 4),
+        );
+        let mut tracked = TrackedSrvs::default();
+        for (slot, resource, pc) in [(a, 0xA010, 0xB0), (b, 0xB010, 0xB4), (c, 0xC010, 0xB8), (d, 0xD010, 0xBC), (e, 0xE010, 0xC0)] {
+            tracked.write(slot, Some(tracked_entry(resource, pc)));
+        }
+        let old_b = tracked.by_slot[&b];
+        let snapshots = tracked.by_slot.clone();
+        tracked.write(b, Some(tracked_entry(0xB020, 0xB4)));
+        let newer_b = tracked.by_slot[&b];
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let candidates = [
+            (a, snapshots[&a].generation),
+            (a, snapshots[&a].generation),
+            (b, old_b.generation),
+            (c, snapshots[&c].generation),
+            (d, snapshots[&d].generation),
+            (e, snapshots[&e].generation),
+        ];
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut lease_calls = Vec::new();
+        let mut observations = 0;
+        let result = with_exact_tracked_srv_mutations_on(
+            &candidates,
+            |slot, generation| {
+                assert!(SHARED_VIEW_EPOCHS.try_lock().is_err(), "lease escaped the batch epoch");
+                assert!(TRACKED_SRV_WRITES.try_lock().is_ok(), "WRITE was taken while leasing owners");
+                lease_calls.push((slot, generation));
+                (slot != d).then(|| {
+                    let snapshot = snapshots[&slot];
+                    (snapshot, MutationOwner(Arc::clone(&drops)), MutationOwner(Arc::clone(&drops)))
+                })
+            },
+            |slots| {
+                observations += 1;
+                assert!(TRACKED_SRV_WRITES.try_lock().is_err(), "raw words were observed outside WRITE");
+                assert!(TRACKED_SRVS.try_lock().is_ok(), "tracker lock crossed raw observation");
+                assert_eq!(slots, &[(70, 0), (70, 1), (70, 2), (70, 4)]);
+                let mut changed_c = snapshots[&c].words;
+                changed_c[6] ^= 1;
+                vec![Some(snapshots[&a].words), Some(old_b.words), Some(changed_c), Some(snapshots[&e].words)]
+            },
+            |valid| {
+                assert!(SHARED_VIEW_EPOCHS.try_lock().is_err(), "batch mutation escaped its epoch");
+                assert!(TRACKED_SRV_WRITES.try_lock().is_err(), "batch mutation escaped WRITE");
+                assert!(TRACKED_SRVS.try_lock().is_ok(), "tracker lock crossed batch mutation");
+                assert_eq!(valid.iter().map(|entry| entry.entry.resource).collect::<Vec<_>>(), vec![0xA010, 0xE010]);
+                // Touch both strong-owner references: the batch exposes only validated owners.
+                assert!(valid.iter().all(|entry| Arc::ptr_eq(&entry.resource.0, &entry.heap.0)));
+                29
+            },
+        );
+        assert_eq!(result, Some(29));
+        assert_eq!(lease_calls, vec![
+            (a, snapshots[&a].generation), (b, old_b.generation), (c, snapshots[&c].generation),
+            (d, snapshots[&d].generation), (e, snapshots[&e].generation),
+        ]);
+        assert_eq!(observations, 1, "batch observed raw words more than once");
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 8, "strong owners did not drop after the batch");
+        {
+            let tracked = TRACKED_SRVS.lock().unwrap();
+            let tracked = tracked.as_ref().unwrap();
+            assert_eq!(tracked.by_slot[&b].generation, newer_b.generation, "stale generation removed its replacement");
+            assert!(!tracked.by_slot.contains_key(&c), "raw mismatch remained tracked");
+            assert!(tracked.by_slot.contains_key(&d), "missing lease removed a still-current candidate");
+        }
+        end_mutation_test();
+    }
+
+    #[test]
+    fn exact_srv_batch_empty_or_tracking_disabled_does_no_work() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+        if !srv_tracking_enabled() {
+            let candidate = [(srv_slot(80, 0), 1)];
+            assert_eq!(with_exact_tracked_srv_mutations_on(
+                &candidate,
+                |_, _| panic!("tracking-disabled batch leased an owner"),
+                |_| panic!("tracking-disabled batch observed words"),
+                |_: &[ExactSrvMutation<'_, (), ()>]| panic!("tracking-disabled batch mutated"),
+            ), None);
+        }
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(with_exact_tracked_srv_mutations_on(
+            &[],
+            |_, _| panic!("empty batch leased an owner"),
+            |_| panic!("empty batch observed words"),
+            |_: &[ExactSrvMutation<'_, (), ()>]| panic!("empty batch mutated"),
+        ), None);
+        let slot = srv_slot(81, 0);
+        let (generation, _) = begin_mutation_test(tracked_entry(0x8110, 0xD0), slot);
+        let snapshot = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        assert_eq!(with_exact_tracked_srv_mutations_on(
+            &[(slot, generation)],
+            |_, _| Some((snapshot, (), ())),
+            |_| vec![None],
+            |_: &[ExactSrvMutation<'_, (), ()>]| panic!("all-stale batch mutated"),
+        ), None);
+        assert!(!TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot.contains_key(&slot));
+        end_mutation_test();
+    }
+
+    #[test]
+    fn exact_srv_batch_unwind_drops_guards_before_strong_owners() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = srv_slot(82, 0);
+        let (generation, words) = begin_mutation_test(tracked_entry(0x8210, 0xD4), slot);
+        let snapshot = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unlocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_exact_tracked_srv_mutations_on(
+                &[(slot, generation)],
+                |_, _| Some((
+                    snapshot,
+                    UnwindMutationOwner { drops: Arc::clone(&drops), unlocked: Arc::clone(&unlocked) },
+                    UnwindMutationOwner { drops: Arc::clone(&drops), unlocked: Arc::clone(&unlocked) },
+                )),
+                |_| vec![Some(words)],
+                |_| -> () { panic!("test batch unwind") },
+            )
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(unlocked.load(std::sync::atomic::Ordering::Relaxed), 3,
+            "strong owners unwound before WRITE or tracker lock");
+        TRACKED_SRV_WRITES.clear_poison();
+        SHARED_VIEW_EPOCHS.clear_poison();
+        end_mutation_test();
+    }
+
+    #[test]
+    fn tracked_srv_copy_requires_exact_source_words() {
+        let mut tracked = TrackedSrvs::default();
+        let (source, copied, raw_changed) = (srv_slot(1, 0), srv_slot(2, 0), srv_slot(2, 1));
+        tracked.write(source, Some(tracked_entry(10, 100)));
+        let source_words = tracked.by_slot[&source].words;
+        let mut copied_words = source_words;
+        copied_words[0] = 21;
+        tracked.copy_range(8, &[(source, 201, 202, 21, copied, true, source_words, copied_words)]);
+        assert_eq!(tracked.by_slot[&copied].resource, 10);
+
+        let mut changed_words = source_words;
+        changed_words[1] ^= 1;
+        tracked.copy_range(8, &[(source, 301, 302, 31, raw_changed, true, changed_words, copied_words)]);
+        assert!(!tracked.by_slot.contains_key(&raw_changed));
+        tracked.write(raw_changed, Some(tracked_entry(30, 300)));
+        tracked.copy_range(8, &[(source, 301, 302, 31, raw_changed, false, source_words, copied_words)]);
+        assert!(!tracked.by_slot.contains_key(&raw_changed), "an untrackable source clears the destination");
+    }
+
+    #[test]
+    fn tracked_srv_reconciliation_invalidates_same_index_word_change() {
+        let mut tracked = TrackedSrvs::default();
+        let slot = srv_slot(1, 0);
+        tracked.write(slot, Some(tracked_entry(10, 100)));
+        let generation = tracked.by_slot[&slot].generation;
+        let mut changed = tracked.by_slot[&slot].words;
+        changed[1] ^= 1;
+        assert_eq!(changed[0], tracked.by_slot[&slot].words[0], "the PC descriptor index is unchanged");
+        assert!(tracked.reconcile_observed(&[(slot, generation, Some(changed))]).is_empty());
+        assert!(tracked.by_slot.is_empty(), "all eight console words identify the logical descriptor");
+    }
+
+    #[test]
+    fn tracked_srv_reconciliation_rejects_cross_heap_local_index_collision() {
+        let mut tracked = TrackedSrvs::default();
+        let (source, destination) = (srv_slot(1, 3), srv_slot(2, 3));
+        tracked.write(source, Some(tracked_entry(10, 6)));
+        tracked.write(destination, Some(tracked_entry(20, 6)));
+        let generation = tracked.by_slot[&destination].generation;
+        let copied_words = tracked.by_slot[&source].words;
+        assert_eq!(copied_words[0], tracked.by_slot[&destination].words[0], "fallback heaps repeat local index 2*k");
+        assert!(tracked.reconcile_observed(&[(destination, generation, Some(copied_words))]).is_empty());
+        assert!(!tracked.by_slot.contains_key(&destination));
+        assert!(tracked.by_slot.contains_key(&source));
+    }
+
+    #[test]
+    fn tracked_srv_reconciliation_does_not_remove_a_newer_generation() {
+        let mut tracked = TrackedSrvs::default();
+        let slot = srv_slot(1, 4);
+        tracked.write(slot, Some(tracked_entry(10, 8)));
+        let observed_generation = tracked.by_slot[&slot].generation;
+        tracked.write(slot, Some(tracked_entry(20, 8)));
+        let stale_words = tracked_entry(10, 8).words;
+        assert!(tracked.reconcile_observed(&[(slot, observed_generation, Some(stale_words))]).is_empty());
+        assert_eq!(tracked.by_slot[&slot].resource, 20);
+    }
+
+    #[test]
+    fn tracked_srv_global_cleanup_hooks_are_gated_and_exact() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).extend([10, 20]);
+        let (heap_40, heap_41) = (srv_slot(40, 0), srv_slot(41, 0));
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(heap_40, Some(tracked_entry(10, 100)));
+        tracked.write(heap_41, Some(tracked_entry(20, 200)));
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+        forget_srv_heap(40);
+        forget(20);
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().is_some_and(|tracked| tracked.by_slot.is_empty()));
+        PLACED_TEXTURES.lock().unwrap().as_mut().unwrap().remove(&10);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn tracked_srv_lease_excludes_final_release_and_locked_cleanup() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let slot = srv_slot(52, 3);
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(tracked_entry(0x5210, 0x80)));
+        let generation = tracked.by_slot[&slot].generation;
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let lease = std::thread::spawn(move || {
+            lease_tracked_srv_resource_with(slot, generation, |resource| {
+                entered_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                Some(resource)
+            })
+            .map(|(entry, owner)| (entry.resource, owner))
+        });
+        entered_rx.recv().unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _lifetime = lock_tracked_srv_lifetime();
+            released_tx.send(()).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(released_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "final Release crossed a resource lease in progress");
+        continue_tx.send(()).unwrap();
+        assert_eq!(lease.join().unwrap(), Some((0x5210, 0x5210)));
+        released_rx.recv().unwrap();
+        release.join().unwrap();
+
+        let lifetime = lock_tracked_srv_lifetime();
+        forget_tracked_after_resource_release(0x5210, lifetime.as_ref());
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().is_some_and(|tracked| tracked.by_slot.is_empty()));
+        drop(lifetime);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn descriptor_write_allows_nonfinal_release_before_concurrent_lease() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let slot = srv_slot(53, 2);
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(tracked_entry(0x5310, 0x84)));
+        let generation = tracked.by_slot[&slot].generation;
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (release_entered_tx, release_entered_rx) = std::sync::mpsc::channel();
+        let (finish_release_tx, finish_release_rx) = std::sync::mpsc::channel();
+        let (drop_write_tx, drop_write_rx) = std::sync::mpsc::channel();
+        let hook = std::thread::spawn(move || {
+            let _write = lock_tracked_srv_write();
+            // Model a driver temporary Release reentering while a descriptor hook holds WRITE.
+            // A non-final Release takes only LIFETIME, then returns to the hook.
+            let lifetime = lock_tracked_srv_lifetime();
+            release_entered_tx.send(()).unwrap();
+            finish_release_rx.recv().unwrap();
+            drop(lifetime);
+            drop_write_rx.recv().unwrap();
+        });
+        release_entered_rx.recv().unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (leased_tx, leased_rx) = std::sync::mpsc::channel();
+        let lease = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let leased = lease_tracked_srv_resource_with(slot, generation, Some)
+                .map(|(entry, owner)| (entry.resource, owner));
+            leased_tx.send(leased).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(leased_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "a lease crossed the resource Release lifetime gate");
+        finish_release_tx.send(()).unwrap();
+        assert_eq!(leased_rx.recv().unwrap(), Some((0x5310, 0x5310)),
+            "lease acquisition waited for the descriptor-write gate and deadlocked the hook");
+        lease.join().unwrap();
+        drop_write_tx.send(()).unwrap();
+        hook.join().unwrap();
+
+        let lifetime = lock_tracked_srv_lifetime();
+        forget_tracked_after_resource_release(0x5310, lifetime.as_ref());
+        drop(lifetime);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn descriptor_heap_final_cleanup_does_not_invert_reentrant_write_order() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let slot = srv_slot(55, 0);
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(tracked_entry(0x5510, 0x90)));
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (clean_tx, clean_rx) = std::sync::mpsc::channel();
+        let (cleaned_tx, cleaned_rx) = std::sync::mpsc::channel();
+        let final_release = std::thread::spawn(move || {
+            let lifetime = super::super::console_heap::lock_lifetime();
+            held_tx.send(()).unwrap();
+            clean_rx.recv().unwrap();
+            forget_srv_heap_after_release(55, lifetime.as_ref());
+            cleaned_tx.send(()).unwrap();
+            drop(lifetime);
+        });
+        held_rx.recv().unwrap();
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+        let hook = std::thread::spawn(move || {
+            let _write = lock_tracked_srv_write();
+            write_tx.send(()).unwrap();
+            let lifetime = super::super::console_heap::lock_lifetime();
+            drop(lifetime);
+            drop_rx.recv().unwrap();
+        });
+        write_rx.recv().unwrap();
+        clean_tx.send(()).unwrap();
+        cleaned_rx.recv_timeout(std::time::Duration::from_secs(1)).expect("final cleanup must not wait for WRITE");
+        final_release.join().unwrap();
+        drop_tx.send(()).unwrap();
+        hook.join().unwrap();
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().is_some_and(|tracked| tracked.by_slot.is_empty()));
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn final_release_cleanup_does_not_wait_for_unrelated_descriptor_write() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (slot_a, slot_b) = (srv_slot(54, 0), srv_slot(54, 1));
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot_a, Some(tracked_entry(0x5410, 0x88)));
+        tracked.write(slot_b, Some(tracked_entry(0x5420, 0x8c)));
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (lifetime_held_tx, lifetime_held_rx) = std::sync::mpsc::channel();
+        let (clean_tx, clean_rx) = std::sync::mpsc::channel();
+        let (cleaned_tx, cleaned_rx) = std::sync::mpsc::channel();
+        let final_release = std::thread::spawn(move || {
+            let lifetime = lock_tracked_srv_lifetime();
+            lifetime_held_tx.send(()).unwrap();
+            clean_rx.recv().unwrap();
+            forget_tracked_after_resource_release(0x5410, lifetime.as_ref());
+            cleaned_tx.send(()).unwrap();
+            drop(lifetime);
+        });
+        lifetime_held_rx.recv().unwrap();
+
+        let (write_held_tx, write_held_rx) = std::sync::mpsc::channel();
+        let (release_attempted_tx, release_attempted_rx) = std::sync::mpsc::channel();
+        let (release_returned_tx, release_returned_rx) = std::sync::mpsc::channel();
+        let (drop_write_tx, drop_write_rx) = std::sync::mpsc::channel();
+        let unrelated_hook = std::thread::spawn(move || {
+            let _write = lock_tracked_srv_write();
+            write_held_tx.send(()).unwrap();
+            // Model resource B's driver call making a temporary Release while WRITE is held.
+            release_attempted_tx.send(()).unwrap();
+            let lifetime = lock_tracked_srv_lifetime();
+            release_returned_tx.send(()).unwrap();
+            drop(lifetime);
+            drop_write_rx.recv().unwrap();
+        });
+        write_held_rx.recv().unwrap();
+        release_attempted_rx.recv().unwrap();
+
+        clean_tx.send(()).unwrap();
+        cleaned_rx.recv_timeout(std::time::Duration::from_secs(1)).expect(
+            "resource A final cleanup waited for WRITE while resource B Release waited for LIFETIME",
+        );
+        final_release.join().unwrap();
+        release_returned_rx.recv().unwrap();
+        drop_write_tx.send(()).unwrap();
+        unrelated_hook.join().unwrap();
+
+        {
+            let tracked = TRACKED_SRVS.lock().unwrap();
+            let tracked = tracked.as_ref().unwrap();
+            assert!(!tracked.by_slot.contains_key(&slot_a));
+            assert_eq!(tracked.by_slot[&slot_b].resource, 0x5420);
+        }
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn title_queue_mapping_wait_reservation_is_monotonic_and_per_queue() {
+        let mut waited = HashMap::new();
+        assert!(!reserve_page_wait(&mut waited, 1, 0));
+        assert!(reserve_page_wait(&mut waited, 1, 4));
+        assert!(!reserve_page_wait(&mut waited, 1, 4));
+        assert!(!reserve_page_wait(&mut waited, 1, 3));
+        assert!(reserve_page_wait(&mut waited, 2, 3));
+        assert!(reserve_page_wait(&mut waited, 1, 5));
+        assert_eq!(waited, HashMap::from([(1, 5), (2, 3)]));
+    }
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
@@ -1446,6 +3607,72 @@ mod tests {
         assert_eq!(Levels::new(&[(0, 4), (4, 1)], None, 6, 2), None);
         assert_eq!(Levels::new(&[(0, 4), (4, 0)], None, 4, 2), None);
         assert_eq!(Levels::new(&[], None, 0, 1), None);
+    }
+
+    #[test]
+    fn level_tile_owners_round_trip_through_a_deferred_unmap() {
+        let mut levels = Levels::new(&[(0, 2), (2, 1)], None, 3, 2).unwrap();
+        levels.group_tiles[0] = (vec![0x1000, 0x2000], vec![(0x3000, 0)]);
+        levels.group_tiles[1] = (vec![0x4000], Vec::new());
+        let expected = levels.group_tiles.clone();
+
+        let held = take_level_tiles(Some(&mut levels));
+        assert_eq!(held, expected);
+        assert!(levels.group_tiles.iter().all(|(used, extra)| used.is_empty() && extra.is_empty()));
+
+        levels.group_tiles = held;
+        assert_eq!(levels.group_tiles, expected, "cancelling a deferred unmap restores every group owner");
+    }
+
+    #[test]
+    fn resource_release_takes_every_level_group_owner() {
+        let mut levels = Levels::new(&[(0, 1), (1, 1)], Some((2, 1)), 3, 4).unwrap();
+        levels.group_tiles[0].0.push(0x1000);
+        levels.group_tiles[1].1.push((0x2000, 1));
+        levels.group_tiles[2].0.push(0x3000);
+
+        let released = take_level_tiles(Some(&mut levels));
+        let used: Vec<_> = released.iter().flat_map(|owners| owners.0.iter().copied()).collect();
+        let extra: Vec<_> = released.iter().flat_map(|owners| owners.1.iter().copied()).collect();
+        assert_eq!(used, [0x1000, 0x3000]);
+        assert_eq!(extra, [(0x2000, 1)]);
+        assert!(levels.group_tiles.iter().all(|(used, extra)| used.is_empty() && extra.is_empty()));
+    }
+
+    #[test]
+    fn test_mapping_observation_includes_level_group_owners() {
+        let mut levels = Levels::new(&[(0, 1)], Some((1, 1)), 2, 2).unwrap();
+        levels.group_tiles[0].0.push(0x1000);
+        levels.group_tiles[1].1.push((0x2000, 1));
+        let target = Target {
+            va: 0x1000,
+            console_bytes: None,
+            total: 2,
+            mapped: true,
+            used: Vec::new(),
+            used_extra: Vec::new(),
+            levels: Some(levels),
+            texels: None,
+        };
+
+        assert_eq!(target_page_keys(&target), (vec![0x1000], vec![(0x2000, 1)]));
+    }
+
+    #[test]
+    fn shared_page_identity_is_the_title_address_not_allocation_class() {
+        let mut pages = HashMap::new();
+        for _evictable in [false, true] {
+            pages
+                .entry(0x1000)
+                .and_modify(|page: &mut Page| page.users += 1)
+                .or_insert(Page { tile: (0, 1), users: 1, idle_since: None });
+        }
+
+        // Both policies share one page. `heap_evictable` is only a packing hint for fresh tiles;
+        // future eviction must inspect live page owners rather than trusting the heap class.
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[&0x1000].users, 2);
+        assert_eq!(pages[&0x1000].tile, (0, 1));
     }
 
     #[test]
@@ -1509,7 +3736,7 @@ mod tests {
         const P: u32 = 64;
         let mut live: Vec<Vec<Tile>> = Vec::new();
         for _ in 0..100 {
-            live.push(pool.take_batch(P as usize, None, t0, P, &mut make).unwrap());
+            live.push(pool.take_batch(P as usize, None, false, t0, P, &mut make).unwrap());
         }
         assert_eq!(heaps_made.get(), 100);
         assert_eq!(pool.free_total, 0);
@@ -1529,7 +3756,7 @@ mod tests {
         // - yield 1 single contiguous tile range (0..32) per texture!
         let t1 = t0 + COOL + Duration::from_millis(1);
         for _ in 0..100 {
-            let alloc = pool.take_batch(32, None, t1, P, &mut make).unwrap();
+            let alloc = pool.take_batch(32, None, false, t1, P, &mut make).unwrap();
             assert_eq!(alloc.len(), 32);
             let h0 = alloc[0].0;
             assert!(alloc.iter().all(|&(h, _)| h == h0), "texture scattered across multiple heaps");
@@ -1545,16 +3772,52 @@ mod tests {
             pool.push_cooling((3, t), t1);
         }
         let t2 = t1 + COOL + Duration::from_millis(1);
-        let pref = pool.take_batch(8, Some(7), t2, P, &mut make).unwrap();
+        let pref = pool.take_batch(8, Some(7), false, t2, P, &mut make).unwrap();
         assert!(pref.iter().all(|&(h, _)| h == 7), "preferred heap should be chosen");
         assert_eq!(heap_ranges_trimmed(7, &pref), [(true, 10, 8)]);
 
         // Rollback on OOM: requesting more tiles than available when make_heap fails returns every
         // popped tile cleanly so free_total is preserved.
         assert_eq!(pool.free_total, 8);
-        let fail = pool.take_batch(16, None, t2, P, || None);
+        let fail = pool.take_batch(16, None, false, t2, P, || None);
         assert!(fail.is_none());
         assert_eq!(pool.free_total, 8, "OOM rollback must return all popped tiles");
+    }
+
+    #[test]
+    fn tile_pool_keeps_evictable_and_pinned_tiles_in_separate_heaps() {
+        let t0 = Instant::now();
+        let mut pool = TilePool::new();
+        let next_slot = std::cell::Cell::new(0u32);
+        let mut alloc_slot = || {
+            let slot = next_slot.get();
+            next_slot.set(slot + 1);
+            Some(slot)
+        };
+
+        const P: u32 = 64;
+        let evictable = pool.take_batch(32, None, true, t0, P, &mut alloc_slot).unwrap();
+        let pinned = pool.take_batch(32, None, false, t0, P, &mut alloc_slot).unwrap();
+        let evictable_again = pool.take_batch(32, None, true, t0, P, &mut alloc_slot).unwrap();
+
+        assert!(evictable.iter().chain(&evictable_again).all(|&(h, _)| h == evictable[0].0));
+        assert!(pinned.iter().all(|&(h, _)| h == pinned[0].0));
+        assert_ne!(evictable[0].0, pinned[0].0, "allocation classes must not share a pool heap");
+    }
+
+    #[test]
+    fn tile_pool_keeps_one_warm_spare_for_each_allocation_class() {
+        const P: u32 = 64;
+        let mut pool = TilePool::new();
+        pool.add_heap_at(0, P, false);
+        pool.add_heap_at(1, P, false);
+        pool.add_heap_at(2, P, true);
+        pool.add_heap_at(3, P, true);
+
+        assert_eq!(pool.reclaim_empty_heaps(1, P), [1, 3]);
+        assert_eq!(pool.free_total, 2 * P as usize);
+        assert_eq!(pool.pick_heap(P as usize, None, false), Some(0));
+        assert_eq!(pool.pick_heap(P as usize, None, true), Some(2));
     }
 
     /// Empty cooled pool heaps (above the warm spare count) are reclaimed cleanly back to VRAM and
@@ -1574,10 +3837,10 @@ mod tests {
         };
 
         const P: u32 = 64;
-        let h0 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
-        let h1 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
-        let h2 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
-        let h3 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
+        let h0 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
+        let h1 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
+        let h2 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
+        let h3 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
         assert_eq!(next_slot.get(), 4);
         assert_eq!(pool.free_total, 0);
 
@@ -1602,13 +3865,13 @@ mod tests {
         free_slots.borrow_mut().extend(reclaimed);
 
         // First 64-tile allocation reuses warm spare heap 1 (no new heap allocated).
-        let reuse_spare = pool.take_batch(P as usize, None, t1, P, &mut alloc_slot).unwrap();
+        let reuse_spare = pool.take_batch(P as usize, None, false, t1, P, &mut alloc_slot).unwrap();
         assert!(reuse_spare.iter().all(|&(h, _)| h == 1));
         assert_eq!(free_slots.borrow().len(), 2);
 
         // Next 64-tile allocation consumes heap 0's 63 free tiles plus 1 tile from reclaimed slot 3
         // without advancing `next_slot`.
-        let reuse_slot = pool.take_batch(P as usize, None, t1, P, &mut alloc_slot).unwrap();
+        let reuse_slot = pool.take_batch(P as usize, None, false, t1, P, &mut alloc_slot).unwrap();
         assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 0).count(), 63);
         assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 3).count(), 1);
         assert_eq!(next_slot.get(), 4);
@@ -1696,6 +3959,100 @@ mod tests {
     }
 
     #[test]
+    fn deferred_unmap_requires_every_queue_mark() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let first = Arc::new(AtomicU64::new(0));
+        let second = Arc::new(AtomicU64::new(0));
+        let marks = [(first.clone(), 2), (second.clone(), 1)];
+        assert!(!all_marks_complete(&marks, |fence| fence.load(Ordering::SeqCst)));
+        first.store(2, Ordering::SeqCst);
+        assert!(!all_marks_complete(&marks, |fence| fence.load(Ordering::SeqCst)), "one completed queue must not release the mapping");
+        second.store(1, Ordering::SeqCst);
+        assert!(all_marks_complete(&marks, |fence| fence.load(Ordering::SeqCst)));
+    }
+
+    #[test]
+    fn retirement_completion_poll_is_unlocked_and_new_marks_fail_closed() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let first = Arc::new(AtomicU64::new(1));
+        let late = Arc::new(AtomicU64::new(0));
+        let state = Mutex::new(RetireQueue::<u32, Arc<AtomicU64>>::new());
+        {
+            let mut rq = state.lock().unwrap();
+            rq.fences.insert(1, (first.clone(), 1));
+            rq.batches.push(RetiringBatch { heaps: vec![101], unmap_mark: None, marks: vec![(first.clone(), 1)] });
+        }
+
+        let probes = state.lock().unwrap().completion_fences();
+        let mut inserted = false;
+        let observed: Vec<_> = probes.into_iter().map(|fence| {
+            assert!(state.try_lock().is_ok(), "completion polling held retirement state");
+            if !inserted {
+                inserted = true;
+                state.lock().unwrap().batches.extend([
+                    RetiringBatch { heaps: vec![202], unmap_mark: None, marks: vec![(first.clone(), 2)] },
+                    RetiringBatch { heaps: vec![303], unmap_mark: None, marks: vec![(late.clone(), 1)] },
+                ]);
+            }
+            let completed = fence.load(Ordering::SeqCst);
+            (fence, completed)
+        }).collect();
+
+        let (done, pruned) = state.lock().unwrap().sweep_with(&HashSet::from([1]), |fence| {
+            observed_completion(&observed, fence, Arc::ptr_eq)
+        });
+        assert_eq!(done.iter().flat_map(|batch| &batch.heaps).copied().collect::<Vec<_>>(), [101]);
+        assert!(pruned.is_empty());
+        let rq = state.lock().unwrap();
+        assert_eq!(rq.batches.len(), 2);
+        assert_eq!(rq.batches[0].heaps, [202], "a higher requirement added during the poll must be tested against the observed value");
+        assert_eq!(rq.batches[1].heaps, [303], "a new fence added during the poll had no observation and must remain retired");
+    }
+
+    #[test]
+    fn device_retirement_state_is_leased_outside_the_registry() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (first_key, second_key) = (0x7ffe_7600usize, 0x7ffe_7700usize);
+        {
+            let mut registry = RETIRE.lock().unwrap();
+            let map = registry.get_or_insert_with(std::collections::HashMap::new);
+            map.remove(&first_key);
+            map.remove(&second_key);
+        }
+
+        let first = device_retire_state(first_key);
+        let second = device_retire_state(second_key);
+        let first_guard = first.lock().unwrap();
+        assert!(RETIRE.try_lock().is_ok(), "one device's driver turn must not hold the retirement registry");
+        assert!(second.try_lock().is_ok(), "one device must not serialize another device's retirement work");
+
+        let removed = RETIRE.lock().unwrap().as_mut().unwrap().remove(&first_key).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &removed));
+        let replacement = device_retire_state(first_key);
+        assert!(!std::sync::Arc::ptr_eq(&first, &replacement), "a removed device key gets a fresh state while old work retains its lease");
+
+        drop(first_guard);
+        drop(removed);
+        let mut registry = RETIRE.lock().unwrap();
+        registry.as_mut().unwrap().remove(&first_key);
+        registry.as_mut().unwrap().remove(&second_key);
+    }
+
+    #[test]
+    fn forgetting_queue_cache_preserves_inflight_batch_marks() {
+        use std::sync::{atomic::AtomicU64, Arc};
+        let mut rq = RetireQueue::<u32, Arc<AtomicU64>>::new();
+        assert!(rq
+            .retire_with(vec![101], None, &[(7, 7usize)], || Some(Arc::new(AtomicU64::new(0))), |_, _, _| true)
+            .is_empty());
+        let cached = rq.fences[&7].0.clone();
+        let gone = rq.forget_queue(7).expect("cached queue fence");
+        assert!(Arc::ptr_eq(&gone, &cached) && !rq.fences.contains_key(&7));
+        assert_eq!(rq.batches.len(), 1);
+        assert!(Arc::strong_count(&cached) >= 3, "the in-flight batch lost its own fence clone");
+    }
+
+    #[test]
     fn gpu_retire_queue_holds_heap_until_blocked_queue_passes_mark() {
         let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
@@ -1728,6 +4085,87 @@ mod tests {
             assert_eq!((done.len(), pruned.len(), dropped.load(Ordering::SeqCst)), (1, 1, false));
             drop((done, pruned));
             assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn superseded_texture_waits_for_every_title_queue() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let first: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let second: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let polling: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            super::super::present::note_execute(first.as_raw(), &[]);
+            super::super::present::note_execute(second.as_raw(), &[]);
+            let gate_first: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let gate_second: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            first.Wait(&gate_first, 1).unwrap();
+            second.Wait(&gate_second, 1).unwrap();
+
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 512,
+                Height: 512,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let mut raw = std::ptr::null_mut();
+            let hr = place_pages(dev.as_raw(), 0x7_1000_0000, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut raw);
+            if hr.is_none_or(|hr| hr < 0) || raw.is_null() {
+                return crate::gpu::recomp::runner::skip_test("reserved texture unavailable");
+            }
+            let resource = ID3D12Resource::from_raw(raw);
+            let dev_key = dev.as_raw() as usize;
+            let bytes = page_bytes_for(dev_key).0;
+            assert!(bytes >= 16 * PAGE);
+
+            unmap_superseded(&resource);
+            before_execute(&polling);
+            assert_eq!(held_unmaps_for(dev_key), 1);
+            assert_eq!(page_bytes_for(dev_key).0, bytes, "blocked queues must keep the physical tiles live");
+
+            gate_first.Signal(1).unwrap();
+            let first_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            first.Signal(&first_done, 1).unwrap();
+            first_done.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            before_execute(&polling);
+            assert_eq!(held_unmaps_for(dev_key), 1, "the second queue still owns prior work");
+
+            gate_second.Signal(1).unwrap();
+            let second_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            second.Signal(&second_done, 1).unwrap();
+            second_done.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            before_execute(&polling);
+            assert_eq!(held_unmaps_for(dev_key), 0);
+            assert!(page_bytes_for(dev_key).0 < bytes, "tiles return only after every queue completes");
+
+            let mut remap_raw = std::ptr::null_mut();
+            let remap_hr = place_pages(dev.as_raw(), 0x7_2000_0000, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut remap_raw);
+            assert!(remap_hr.is_some_and(|hr| hr >= 0) && !remap_raw.is_null());
+            let remapped = ID3D12Resource::from_raw(remap_raw);
+            let remap_bytes = page_bytes_for(dev_key).0;
+            first.Wait(&gate_first, 2).unwrap();
+            second.Wait(&gate_second, 2).unwrap();
+            unmap_superseded(&remapped);
+            assert_eq!(held_unmaps_for(dev_key), 1);
+            assert!(remap_if_unmapped(&remapped));
+            assert_eq!(held_unmaps_for(dev_key), 0, "remapping cancels the deferred unmap");
+            assert_eq!(page_bytes_for(dev_key).0, remap_bytes, "cancellation preserves the original tiles");
+            gate_first.Signal(2).unwrap();
+            gate_second.Signal(2).unwrap();
+            drop(remapped);
+            drop(resource);
         }
     }
 
@@ -2173,5 +4611,126 @@ mod tests {
             );
             assert!(new_calls < old_calls);
         }
+    }
+
+    #[test]
+    fn mip_texels_and_range_for_2d_array_3d_and_1d() {
+        assert_eq!(mip_texels(64, 32, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 0), 64 * 32);
+        assert_eq!(mip_texels(64, 32, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 1), 32 * 16);
+        assert_eq!(mip_texels(64, 32, 6, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 2), 16 * 8 * 6);
+        assert_eq!(mip_texels(64, 32, 8, D3D12_RESOURCE_DIMENSION_TEXTURE3D.0, 2), 16 * 8 * 2);
+        assert_eq!(mip_texels(64, 1, 4, D3D12_RESOURCE_DIMENSION_TEXTURE1D.0, 3), 8 * 4);
+        assert_eq!(range_texels(4, 4, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 0..3), 16 + 4 + 1);
+    }
+
+    #[test]
+    fn srv_mip_range_respects_most_detailed_mip_levels_and_min_lod_clamp() {
+        assert_eq!(srv_mip_range(5, None), 0..5);
+        let srv_2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 1,
+                    MipLevels: 3,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 2.75,
+                },
+            },
+            ..Default::default()
+        };
+        assert_eq!(srv_mip_range(6, Some(&srv_2d)), 2..4);
+
+        let srv_all = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 2,
+                    MipLevels: u32::MAX,
+                    FirstArraySlice: 0,
+                    ArraySize: 2,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+            ..Default::default()
+        };
+        assert_eq!(srv_mip_range(5, Some(&srv_all)), 2..5);
+    }
+
+    #[test]
+    fn texel_meta_unions_overlapping_srv_ranges_without_double_counting() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            ..Default::default()
+        };
+        let mut tm = TexelMeta::from_desc(&desc, false);
+        assert_eq!(tm.total_texels, 64 + 16 + 4 + 1);
+        assert_eq!(tm.resident_texels, 0);
+
+        let srv_low = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 1, MipLevels: 2, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&srv_low)), (true, 16 + 4));
+
+        let srv_all = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 4, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&srv_all)), (false, 64 + 1));
+        assert_eq!(tm.record_srv(Some(&srv_all)), (false, 0));
+        assert_eq!(tm.srv_sampled_texels, tm.total_texels);
+    }
+
+    #[test]
+    fn texel_meta_unions_array_slices_without_counting_the_whole_mip() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 6,
+            MipLevels: 1,
+            ..Default::default()
+        };
+        let mut tm = TexelMeta::from_desc(&desc, false);
+        let view = |first| D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    FirstArraySlice: first,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&view(0))), (true, 4096));
+        assert_eq!(tm.record_srv(Some(&view(0))), (false, 0));
+        assert_eq!(tm.record_srv(Some(&view(1))), (false, 4096));
+        assert_eq!(tm.srv_sampled_texels, 8192);
+        assert_eq!(tm.total_texels, 6 * 4096);
+
+        let ms = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: 4, ArraySize: 1 },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&ms)), (false, 4096));
+        assert_eq!(tm.srv_sampled_texels, 3 * 4096);
     }
 }

@@ -43,6 +43,7 @@ whole-wave:
 | `ds_bpermute` (any lane) | 32 words: each half gives its lanes |
 | DPP16, DPP8, `ds_swizzle`, `v_permlane(x)16` | none: the ISA keeps them inside a 32-lane half (`WaveReadLaneAt(v, l & 31)`) |
 | `s_load*` / `s_buffer_load*` with GLC (or DLC) | up to 16 words: half 0's values for both (memory another wave writes may change between the two halves' loads; without GLC the console's scalar cache is not coherent either, so plain loads are read by both halves) |
+| an LDS access (`ds_read*`, `ds_write*`, the LDS atomics) in kernel, compute and mesh mode | no words: the halves meet before it, so each half's earlier instructions are done (hazard 6) |
 
 So both halves hold the full 64-bit EXEC / VCC / masks and identical SGPRs; every branch is
 taken the same way by both, and the existing scalar code (`s_bcnt1_i32_b64`, `s_ff1`,
@@ -66,8 +67,9 @@ SGPRs of both halves and the tests fail if they ever differ.
   verdict (`WaveReadLaneFirst`); a fence, then the read. Slots are double-buffered by the
   parity of k: the partner can be at most one exchange ahead, so it never overwrites the
   slot being read. The wait is bounded (2^20 polls): if it ever runs out (a desynchronised
-  pair – should not happen, see hazards), the wave stops exchanging (`xcl_x_dead`) and
-  finishes with half-local values instead of hanging the GPU until a TDR. This relies on
+  pair – should not happen, see hazards), compare-exchange marks the partner's arrival
+  counter failed unless that partner arrived first. Both halves then stop before later
+  instructions can consume half-local exchange values. This relies on
   co-resident waves of one group making progress, which holds on GPUs (all waves of a group
   are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
   variant everywhere (the test suite passes with it too).
@@ -100,6 +102,18 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    without the remap).
 4. **`WaveReadLaneAt` with a per-lane index** – used inside a half as before.
 5. **Forward progress** – only the multi-wave variant spins; see above.
+6. **LDS order** – a console wave runs an instruction in all 64 lanes before the next one,
+   so a lane reads the LDS another lane wrote an instruction earlier with no `s_barrier`.
+   Two halves that meet only at exchanges read such a word before it is written, or after a
+   later write (`gpu_split_wave64_lds_follows_instruction_order`: up to three quarters of
+   the threads on an RTX 5070 Ti). The halves therefore meet before an LDS access, except a
+   read right after a read in the same basic block (two reads need no order) or an access
+   after an exchange that lies between it and the block's previous access (the exchange is
+   a meeting). The meeting orders instructions, not the lanes of one instruction: when
+   lanes of both halves write or atomically update the same word in one instruction, which
+   half goes first is not the console's order. Geometry mode has no meetings: it assumes ES
+   code reads no other lane's item before the `s_barrier` (ES lanes write their own items,
+   and the phases meet at a group barrier).
 
 ### Masks read lane by lane
 
@@ -139,7 +153,7 @@ destination, 0 in every lane), which are the same in both halves either way.
 
 A wave64 program pays one exchange per mask write that is read whole (`v_cmp*` feeding
 `s_and_saveexec`, `s_cbranch_vccz`, `s_bcnt1`, …) and per readlane / readfirstlane /
-ds_bpermute / coherent scalar load, nothing per ALU, memory or DPP instruction, nor for
+ds_bpermute / coherent scalar load / LDS access, nothing per ALU, global memory or DPP instruction, nor for
 masks read lane by lane (selects, 64-bit carry chains). Wave32 programs and everything on GPUs with 64-lane waves are
 unchanged (the HLSL of every native translation the test suite makes is byte-identical). A
 wave64 VS / PS pays nothing for a lane ≥ 32 read as a constant (the lane read is skipped) and
@@ -211,8 +225,9 @@ wave64 VS / PS (13 210 programs; 749 – 748 PS, 1 VS – were flagged by the ol
 
 ### The form
 
-For a wave64 VS / PS with `split_wave64`, `upper_lanes.rs` follows what the console's lanes
-32..63 hold through the program, a forward data-flow pass over its control flow:
+For a wave64 VS / PS, `upper_lanes.rs` follows what the console's lanes 32..63 hold through the
+program, a forward data-flow pass over its control flow. Constants are used only in the
+`split_wave64` form; spill shadows are also used in native partial waves:
 - EXEC's upper word, with the SGPRs as words known to be 0, all ones, or anything: 0 at the
   start, 0 in every mask a VALU instruction writes while it is 0, combined by the bitwise SALU
   and saveexec forms. While it is 0 no VALU instruction writes lanes 32..63.
@@ -227,56 +242,48 @@ Each read then gets:
   which no program can depend on;
 - a constant: that constant (`uint t = c; if (!xcl_hw32) t = rla(…);`);
 - a slot: its shadow `xcl_sh<vgpr>_<lane>`, a scalar every `v_writelane` of that slot also
-  writes;
+  writes. A read uses the native lane when it was physically launched and the shadow otherwise
+  (pixel helper lanes are present as members of a live quad);
 - unknown: stays a hazard – `wave_hazards` reports only these.
 
-Spill slots < 32 are read from their shadows as well, whatever the wave size, as long as no
-other instruction has written the VGPR since the slot's `v_writelane`: in a partial wave (a
-primitive's edge) a lane that was not launched loses what `v_writelane` put there. 287 pixel
-shaders of the pack (3 540 reads) spill to lanes < 32.
+Spill slots < 32 are read directly from their shadows, as long as no other instruction has
+written the VGPR since the slot's `v_writelane`. For slots ≥ 32 the entry physical-presence mask
+selects the native lane when it exists and the shadow when it did not launch. 287 pixel shaders
+of the pack (3 540 reads) spill to lanes < 32.
 
-The wave size is checked at run time (`xcl_hw32 = WaveGetLaneCount() < 64`), so a driver that
-picks 64 lanes runs the program as before.
+The wave size is checked at run time (`xcl_hw32 = WaveGetLaneCount() < 64`) for constants. Spill
+slots additionally capture the physical lanes at entry (`ballot(true)`, or helper-inclusive
+`ballot_px(true)` for pixels).
 
-Which GPUs get the form: every GPU whose wave range includes 32 (`pso::graphics_wave32`), not
-only those without 64-lane waves. D3D12 has no `WaveSize` for graphics shaders, so the driver
+Which GPUs get the constant form: every GPU whose wave range includes 32 (`pso::graphics_wave32`),
+not only those without 64-lane waves. Spill shadows are emitted at every wave size. D3D12 has no
+`WaveSize` for graphics shaders, so the driver
 picks, and an RDNA2 driver (RX 6600 XT, issue #42) runs a wave64 PS in waves of 32 although it
 reports 32–64: without the form, `v_readlane` 32 wrapped to lane 0 there
 (`gpu_wave64_ps_whole_wave_reductions` summed twice). Compute, mesh and geometry programs set
 `[WaveSize(64)]` and still get the split form only on GPUs without 64-lane waves.
 
-On a GPU with 64-lane waves only, nothing changes: the HLSL of every program of the pack is
-identical to the one before
-(`retail_wave64_graphics_lane_forms` prints digests of the native form, and of the other modes'
-32-lane form, to compare builds).
+On a GPU with 64-lane waves only, programs with spill slots gain their shadows; other programs'
+native HLSL is unchanged (`retail_wave64_graphics_lane_forms` prints digests of the forms to
+compare builds).
 
 In the pack every read resolves: 1 082 constants, 355 unwritten, 3 740 slot reads; none is
 left unsafe. Only a program with a constant or a slot to read gets the form: the HLSL changes
 for 613 programs (the 436 reductions and the 287 with spill slots, which overlap), all of
 which DXC compiles. Tests on the GPU: `gpu_wave64_ps_whole_wave_reductions`
 (the pack's reduction as min and as a sum, and the waterfall read, checked per hardware wave
-against a console wave of the same lanes), `gpu_wave64_ps_spill_slots` (whole target and a
+against a console wave of the same lanes and for min in a partial three-quad wave),
+`gpu_wave64_ps_spill_slots` (whole target and a
 6-pixel triangle), `gpu_wave64_vs_spill_slots_and_identity` (a wave of 3 vertices).
 
 ### What is still not exact
 
-**Lanes the PC did not launch, inside a wave** – on every GPU and wave size, and before this
-change too. The console runs whole-wave code in all 64 lanes, inactive ones included; the
-translation runs it only in the lanes the PC GPU launched. In a partial wave, the reduction's
-DPP / `v_permlanex16` steps read lanes that were never launched (undefined) instead of the
-identity the console put there – not only lanes 32..63. The lanes ≥ 32 of a 32-lane wave are
-handled above because they are all missing and all hold the identity; a lane missing among
-launched ones holds a partial result that the translation does not have. Making that exact
-needs the reduction recognised as a whole (`WaveActiveMin` / `Max` / `BitOr` over the
-launched lanes, with the identity for the lanes outside the mask) – not done. Measured on an
-RTX 5070 Ti (the reduction of `gpu_wave64_ps_whole_wave_reductions` drawn as a 3-quad
-triangle, lanes 12..31 not launched): those lanes read 0, so a min reduction (identity -1)
-gives 0, while max / or / sum (identity 0) and the waterfall read are right. 325 of the 436
-reduction programs have a min reduction (322 a max, 433 an or).
-
-Spill slots of lanes that were not launched are also still lost in the native form (GPUs with
-64-lane waves, which keep the HLSL as it was), and in the 32-lane form for slots ≥ 32 when the
-driver picks 64 lanes.
+The compiler's exact min/max/and/or whole-wave reduction pattern is recognised as a whole and
+rebuilt with a wave operation over the launched lanes. Lanes outside its saved mask hold the
+operation's identity, so omitting console lanes the PC did not launch does not change the result.
+The three-quad case that previously made min return 0 is covered by
+`gpu_wave64_ps_whole_wave_reductions`. Other whole-wave sequences that do not match this exact
+pattern can still read undefined values from lanes the PC did not launch.
 
 ## Relation to earlier work
 

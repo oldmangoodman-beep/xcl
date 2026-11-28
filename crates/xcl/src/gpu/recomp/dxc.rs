@@ -9,11 +9,11 @@
 //! kept for `report.json` ([`toolchain`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Graphics::Direct3D::Dxc::{
@@ -391,10 +391,105 @@ struct Job {
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
     /// one of the title's threads waits for it
     wanted: Wanted,
+    /// time from submission until a worker admits this compile under the memory limit
+    queue_stall: Option<crate::stall::Span<'static>>,
+}
+
+struct CompileQueue {
+    jobs: Mutex<VecDeque<Job>>,
+    changed: Condvar,
+    workers: AtomicUsize,
+}
+
+impl CompileQueue {
+    fn new() -> Self {
+        Self { jobs: Mutex::new(VecDeque::new()), changed: Condvar::new(), workers: AtomicUsize::new(0) }
+    }
+
+    fn push(&self, job: Job) -> Result<(), Job> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if self.workers.load(Ordering::Acquire) == 0 {
+            return Err(job);
+        }
+        jobs.push_back(job);
+        drop(jobs);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    fn take(&self) -> Job {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = take_next_job(&mut jobs) {
+                return job;
+            }
+            jobs = self.changed.wait(jobs).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+struct CompileWorker(Arc<CompileQueue>);
+
+impl Drop for CompileWorker {
+    fn drop(&mut self) {
+        if self.0.workers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.jobs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+}
+
+/// Wanted jobs overtake unwanted ones; both classes remain FIFO.
+fn take_next_job(jobs: &mut VecDeque<Job>) -> Option<Job> {
+    let position = jobs.iter().position(|job| (job.wanted)()).unwrap_or(0);
+    jobs.remove(position)
 }
 
 /// Whether one of the title's threads waits for a compile (asked again while it is held back).
 pub type Wanted = Box<dyn Fn() -> bool + Send>;
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn job(name: &str, wanted: Wanted) -> Job {
+        let (reply, _) = std::sync::mpsc::channel();
+        Job {
+            src: name.into(),
+            entry: String::new(),
+            profile: String::new(),
+            extra: Vec::new(),
+            reply,
+            wanted,
+            queue_stall: None,
+        }
+    }
+
+    #[test]
+    fn wanted_dxc_jobs_overtake_background_fifo() {
+        let mut jobs = VecDeque::from([
+            job("background-1", Box::new(|| false)),
+            job("wanted-1", Box::new(|| true)),
+            job("wanted-2", Box::new(|| true)),
+            job("background-2", Box::new(|| false)),
+        ]);
+        let order: Vec<_> = (0..4).map(|_| take_next_job(&mut jobs).unwrap().src).collect();
+        assert_eq!(order, ["wanted-1", "wanted-2", "background-1", "background-2"]);
+    }
+
+    #[test]
+    fn queued_job_is_rechecked_after_foreground_promotion() {
+        let wanted = Arc::new(AtomicBool::new(false));
+        let check = wanted.clone();
+        let mut jobs = VecDeque::from([
+            job("background", Box::new(|| false)),
+            job("promoted", Box::new(move || check.load(Ordering::Acquire))),
+        ]);
+        wanted.store(true, Ordering::Release);
+        assert_eq!(take_next_job(&mut jobs).unwrap().src, "promoted");
+        assert_eq!(take_next_job(&mut jobs).unwrap().src, "background");
+    }
+}
 
 /// Compiles the title waits for that go on at once however little commit is left (each takes
 /// 0.1 – 0.7 GB).
@@ -424,15 +519,60 @@ pub fn set_memory_reserve(gb: u64) {
 }
 
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
-static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct MemoryGate {
+    gate: Mutex<()>,
+    working: std::sync::atomic::AtomicUsize,
+}
+
+impl MemoryGate {
+    const fn new() -> Self {
+        Self { gate: Mutex::new(()), working: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    /// Evaluates commit headroom and `WANTED_AT_ONCE` atomically with `working` admission so
+    /// concurrent worker wakeups cannot admit a burst past either cap.
+    fn try_admit(&self, reserve_bytes: u64, avail: impl FnOnce() -> Option<u64>, timed_out: bool, wanted: &Wanted) -> bool {
+        let _guard = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = self.working.load(Ordering::Acquire);
+        let need = reserve_bytes.saturating_add((cur as u64) << 30);
+        let plenty = avail().is_none_or(|a| a >= need);
+        if plenty || timed_out || cur == 0 || (cur < WANTED_AT_ONCE && wanted()) {
+            self.working.fetch_add(1, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+
+    /// Waits until [`Self::try_admit`] grants a slot, sleeping outside the gate mutex.
+    fn wait_with(&self, reserve_bytes: u64, mut avail: impl FnMut() -> Option<u64>, timeout: std::time::Duration, wanted: &Wanted) {
+        let start = std::time::Instant::now();
+        while !self.try_admit(reserve_bytes, &mut avail, start.elapsed() >= timeout, wanted) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn release(&self) {
+        self.working.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+static MEMORY_GATE: MemoryGate = MemoryGate::new();
 
 /// A compile let in by `wait_for_memory`, until it is dropped.
 pub struct MemorySlot;
 
 impl Drop for MemorySlot {
     fn drop(&mut self) {
-        WORKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        MEMORY_GATE.release();
     }
+}
+
+/// Available page-file commit bytes from Windows, or `None` if the query fails.
+fn avail_page_file() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
 }
 
 /// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
@@ -444,55 +584,55 @@ impl Drop for MemorySlot {
 /// of its threads waited for cold compiles, four of which stood in this queue, until its watchdog
 /// ended it.
 pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
-    use std::sync::atomic::Ordering;
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    let start = std::time::Instant::now();
-    loop {
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
-            WORKING.fetch_add(1, Ordering::AcqRel);
-            return MemorySlot;
-        }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            return MemorySlot;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    MEMORY_GATE.wait_with(RESERVE_GB.load(Ordering::Relaxed) << 30, avail_page_file, std::time::Duration::from_secs(60), wanted);
+    MemorySlot
 }
 
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
 /// on first use; callers wait for their job.
-fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+fn pool() -> &'static Arc<CompileQueue> {
+    static POOL: OnceLock<Arc<CompileQueue>> = OnceLock::new();
     POOL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let queue = Arc::new(CompileQueue::new());
         for k in 0..compile_threads() {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
-                let _slot = wait_for_memory(&job.wanted);
-                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
-                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
-                let _ = job.reply.send(r);
-            });
+            let worker_queue = queue.clone();
+            queue.workers.fetch_add(1, Ordering::Release);
+            if std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || {
+                let _worker = CompileWorker(worker_queue.clone());
+                loop {
+                    let job = worker_queue.take();
+                    let Job { src, entry, profile, extra, reply, wanted, queue_stall } = job;
+                    let _slot = wait_for_memory(&wanted);
+                    drop(queue_stall);
+                    let extra: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _stall = crate::stall::span(crate::stall::StallKind::DxcCompile);
+                        compile_here(&src, &entry, &profile, &extra)
+                    }))
+                        .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
+                    let _ = reply.send(r);
+                }
+            }).is_err() {
+                queue.workers.fetch_sub(1, Ordering::AcqRel);
+            }
         }
-        std::sync::Mutex::new(tx)
+        queue
     })
 }
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    let job = Job {
+        src: src.into(),
+        entry: entry.into(),
+        profile: profile.into(),
+        extra: extra.iter().map(|s| s.to_string()).collect(),
+        reply,
+        wanted: crate::hle::d3d12x::pso_async::wanted_here(),
+        queue_stall: crate::stall::span(crate::stall::StallKind::DxcQueue),
+    };
+    pool().push(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
@@ -505,15 +645,11 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // linear this way (`emit::linked_form`). Anything wrong with it: as one program, as before.
     if profile.starts_with("cs_") && linking() {
         if let Some((program, library)) = super::emit::linked_form(src, LINK_MIN_ACCESSES) {
-            match compile_linked(&program, &library, entry, profile, extra) {
-                Ok(dxil) => return Ok(dxil),
-                Err(e) => {
-                    // the same DXC fails the same way for the next program: stop trying
-                    if LINK_GATE.close() {
-                        crate::xlog_warn!("DXC: a program could not be linked with its memory accessors, compiled whole, and no more programs are linked: {e}");
-                    }
-                }
-            }
+            return compile_linked_or_fallback(
+                &LINK_GATE,
+                || compile_linked(&program, &library, entry, profile, extra),
+                || compile_whole(src, entry, profile, extra),
+            );
         }
     }
     compile_whole(src, entry, profile, extra)
@@ -544,6 +680,47 @@ impl LinkGate {
 
 static LINK_GATE: LinkGate = LinkGate::new();
 
+pub(crate) fn is_oom_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("0x8007000e") || lower.contains("e_outofmemory")
+}
+
+/// Try `linked()` while `gate` is open; transient OOM propagates without closing `gate` or
+/// falling back to the heavier `whole()`, while deterministic failures close `gate` and retry whole.
+fn compile_linked_or_fallback(
+    gate: &LinkGate,
+    linked: impl FnOnce() -> Result<Vec<u8>, String>,
+    whole: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    if !gate.open() {
+        return whole();
+    }
+    match linked() {
+        Ok(dxil) => Ok(dxil),
+        Err(e) if is_oom_error(&e) => Err(e),
+        Err(e) => {
+            // the same DXC fails the same way for the next program: stop trying
+            if gate.close() {
+                crate::xlog_warn!("DXC: a program could not be linked with its memory accessors, compiled whole, and no more programs are linked: {e}");
+            }
+            whole()
+        }
+    }
+}
+
+fn link_opt_args<'a>(src_len: usize, extra: &'a [&'a str]) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(extra.len() + 3);
+    if !extra.iter().any(|a| a.starts_with("-O") || *a == "-Od") {
+        if src_len > UNOPTIMISED_ABOVE {
+            args.extend(["-O0", "-opt-disable", "debug-nops"]);
+        } else if src_len > 1024 * 1024 {
+            args.push("-O1");
+        }
+    }
+    args.extend(extra.iter().copied());
+    args
+}
+
 /// `XCL_LINK_MEM=0`: every program is compiled whole (into the same cache: compare with
 /// another `XCL_DXIL_CACHE`).
 fn linking() -> bool {
@@ -568,6 +745,7 @@ fn kept_once<T: Clone>(map: &Mutex<Option<HashMap<String, Arc<Mutex<Option<T>>>>
 /// Compile `program` and `library` (its memory accessors, kept once compiled) as libraries and
 /// link them to `profile`.
 fn compile_linked(program: &str, library: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    let program_src_len = program.len();
     let model = profile.split_once('_').map_or("6_6", |(_, m)| m);
     let lib = format!("lib_{model}");
     let accessors = {
@@ -584,17 +762,20 @@ fn compile_linked(program: &str, library: &str, entry: &str, profile: &str, extr
         }
         Ok(p)
     };
+    let link_args_w: Vec<Vec<u16>> = link_opt_args(program_src_len, extra).into_iter().map(crate::util::wide).collect();
+    let link_ptrs: Vec<PCWSTR> = link_args_w.iter().map(|a| PCWSTR(a.as_ptr())).collect();
     unsafe {
         let linker = IDxcLinker::from_raw(instance(&CLSID_DxcLinker, &IDxcLinker::IID)?);
         let utils = IDxcUtils::from_raw(instance(&CLSID_DxcUtils, &IDxcUtils::IID)?);
         let names = [crate::util::wide("program"), crate::util::wide("accessors")];
         for (name, dxil) in names.iter().zip([&program, &*accessors]) {
-            let blob = utils.CreateBlob(dxil.as_ptr() as *const c_void, dxil.len() as u32, DXC_CP(0)).map_err(|e| format!("CreateBlob: {e}"))?;
+            let len = u32::try_from(dxil.len()).map_err(|_| "DXIL library larger than 4 GiB".to_string())?;
+            let blob = utils.CreateBlob(dxil.as_ptr() as *const c_void, len, DXC_CP(0)).map_err(|e| format!("CreateBlob: {e}"))?;
             linker.RegisterLibrary(PCWSTR(name.as_ptr()), &blob).map_err(|e| format!("RegisterLibrary: {e}"))?;
         }
         let (entry, profile) = (crate::util::wide(entry), crate::util::wide(profile));
         let r = linker
-            .Link(PCWSTR(entry.as_ptr()), PCWSTR(profile.as_ptr()), &names.each_ref().map(|n| PCWSTR(n.as_ptr())), None)
+            .Link(PCWSTR(entry.as_ptr()), PCWSTR(profile.as_ptr()), &names.each_ref().map(|n| PCWSTR(n.as_ptr())), (!link_ptrs.is_empty()).then_some(link_ptrs.as_slice()))
             .map_err(|e| format!("Link: {e}"))?;
         output(r.GetStatus(), r.GetErrorBuffer(), r.GetResult())
     }
@@ -691,7 +872,7 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
     h
 }
 
-fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
+pub(crate) fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
 }
 
@@ -839,7 +1020,9 @@ fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
     if handle.is_null() {
         return Err("DXIL cache: cannot create the cross-process mutex".into());
     }
+    let wait_stall = crate::stall::span(crate::stall::StallKind::LockContention);
     let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    drop(wait_stall);
     if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
         unsafe { CloseHandle(handle) };
         return Err(format!("DXIL cache: waiting for the cross-process mutex failed ({wait:#x})"));
@@ -848,7 +1031,11 @@ fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
 }
 
 fn cached_file(file: &Path) -> Option<Vec<u8>> {
-    if let Ok(b) = std::fs::read(&file) {
+    let read = {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::read(file)
+    };
+    if let Ok(b) = read {
         if valid_dxil_container(&b) {
             return Some(b);
         }
@@ -914,7 +1101,10 @@ fn is_cacheable_dxc_error(raw: &str) -> bool {
 }
 
 fn cached_error_file(file: &Path, key: u64, src_len: usize) -> Option<String> {
-    let b = std::fs::read(file).ok()?;
+    let b = {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::read(file)
+    }.ok()?;
     let rest = b.strip_prefix(ERR_MAGIC.as_slice())?;
     let (k_bytes, rest) = rest.split_first_chunk::<8>()?;
     let (len_bytes, rest) = rest.split_first_chunk::<8>()?;
@@ -944,7 +1134,16 @@ fn store_error_file(file: &Path, key: u64, src_len: usize, reason: &str) {
     b.extend_from_slice(&(reason.len() as u32).to_le_bytes());
     b.extend_from_slice(reason.as_bytes());
     let tmp = file.with_extension(format!("err.tmp{}", std::process::id()));
-    if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, file).is_err() {
+    let written = {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::write(&tmp, &b).is_ok()
+    };
+    let renamed = written && {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::rename(&tmp, file).is_ok()
+    };
+    if written && !renamed {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -993,6 +1192,7 @@ where
     // A corrupt target must be removed before the atomic rename on Windows;
     // rename does not replace an existing file there.
     if file.is_file() {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
         let _ = std::fs::remove_file(&file);
     }
     counters.compilations.fetch_add(1, Ordering::Relaxed);
@@ -1022,12 +1222,22 @@ where
         }
     };
     if err_file.is_file() {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
         let _ = std::fs::remove_file(&err_file);
     }
     if std::fs::create_dir_all(&dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &file).is_err() {
+        let written = {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::write(&tmp, &b).is_ok()
+        };
+        let renamed = written && {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::rename(&tmp, &file).is_ok()
+        };
+        if written && !renamed {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
             let _ = std::fs::remove_file(&tmp);
         }
     }
@@ -1618,5 +1828,179 @@ mod accessor_library_tests {
         assert!(gate.close());
         assert!(!gate.open());
         assert!(!gate.close());
+    }
+
+    #[test]
+    fn compile_linked_or_fallback_keeps_gate_open_on_oom() {
+        let gate = LinkGate::new();
+        for oom in ["dxc (0x8007000E): out of memory", "Link: HRESULT(0x8007000e)", "CreateBlob: E_OUTOFMEMORY"] {
+            let mut whole_ran = false;
+            let err = compile_linked_or_fallback(&gate, || Err(oom.into()), || { whole_ran = true; Ok(vec![1]) }).unwrap_err();
+            assert_eq!(err, oom);
+            assert!(gate.open() && !whole_ran, "OOM must keep LinkGate open and skip whole fallback: {oom}");
+        }
+        // Deterministic non-OOM failure closes the gate and falls back to whole; subsequent calls skip linked.
+        let mut whole_runs = 0usize;
+        let ok = compile_linked_or_fallback(&gate, || Err("dxc: unsupported WaveSize on library".into()), || { whole_runs += 1; Ok(vec![42]) }).unwrap();
+        assert_eq!((ok, gate.open(), whole_runs), (vec![42], false, 1));
+        let ok = compile_linked_or_fallback(&gate, || panic!("linked must not run once gate is closed"), || { whole_runs += 1; Ok(vec![99]) }).unwrap();
+        assert_eq!((ok, whole_runs), (vec![99], 2));
+    }
+
+    #[test]
+    fn link_opt_args_selects_tier_and_preserves_extra() {
+        assert_eq!(link_opt_args(1024 * 1024, &[]), Vec::<&str>::new());
+        assert_eq!(link_opt_args(1024 * 1024 + 1, &[]), vec!["-O1"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE, &[]), vec!["-O1"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &[]), vec!["-O0", "-opt-disable", "debug-nops"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &["-O2"]), vec!["-O2"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &["-Od"]), vec!["-Od"]);
+        assert_eq!(link_opt_args(512, &["-Gis"]), vec!["-Gis"]);
+        assert_eq!(link_opt_args(1024 * 1024 + 1, &["-Gis"]), vec!["-O1", "-Gis"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &["-Gis"]), vec!["-O0", "-opt-disable", "debug-nops", "-Gis"]);
+    }
+
+    #[test]
+    fn compile_linked_forwards_opt_and_extra_args_to_dxc_linker() {
+        if location().is_err() {
+            return super::super::runner::skip_test("no DXC");
+        }
+        let library = "RWByteAddressBuffer res : register(u0);\nexport uint helper_add(uint a, uint b) { return a + b; }\n";
+        let program = "RWByteAddressBuffer res : register(u0);\nuint helper_add(uint a, uint b);\n[shader(\"compute\")]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex) {\n    float x = asfloat(res.Load(gi * 4u));\n    float y = (x + 1.0) - 1.0;\n    res.Store(gi * 4u, helper_add(asuint(y), gi));\n}\n";
+        let run = |args: &[&str]| -> String {
+            let dxil = compile_linked(program, library, "main", "cs_6_6", args).unwrap_or_else(|e| panic!("args={args:?}: {e}"));
+            super::super::super::dxil::validate::validate(&dxil).unwrap_or_else(|e| panic!("validate args={args:?}: {e}"));
+            disassemble(&dxil).unwrap_or_else(|e| panic!("disasm args={args:?}: {e}"))
+        };
+        let d_def = run(&[]);
+        assert!(!d_def.contains("fadd "), "default link should optimize (x + 1) - 1 away:\n{d_def}");
+        let _ = run(&["-O1"]);
+        let d_o0 = run(&["-O0", "-opt-disable", "debug-nops"]);
+        assert!(d_o0.contains("fadd fast float") && d_o0.contains("mul i32 ") && !d_o0.contains("dx.op.nop"), "-O0 link must skip -O3 folding and debug-nops:\n{d_o0}");
+        let d_gis = run(&["-Gis"]);
+        assert!(d_gis.contains("fadd float ") && !d_gis.contains("fadd fast "), "-Gis must keep strict IEEE fadd:\n{d_gis}");
+        // Also check auto -O1 / -O0 when program.len() > 1 MiB (while library is small).
+        let big_prog = format!("{program}// {}\n", "a".repeat(1024 * 1024 + 16));
+        let dxil_big = compile_linked(&big_prog, library, "main", "cs_6_6", &[]).unwrap();
+        super::super::super::dxil::validate::validate(&dxil_big).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod memory_gate_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    #[test]
+    fn tight_commit_headroom_bounds_concurrent_admissions() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let avail_gb = 7u64 << 30; // fits working == 0 (6 GiB) and working == 1 (7 GiB), not 2 (8 GiB)
+        let threads = 16;
+        let barrier = Barrier::new(threads);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| false);
+                    barrier.wait();
+                    if gate.try_admit(
+                        reserve,
+                        || {
+                            std::thread::sleep(Duration::from_millis(2));
+                            Some(avail_gb)
+                        },
+                        false,
+                        &wanted,
+                    ) {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), 2, "burst admitted more compiles than commit headroom allows");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn wanted_burst_never_exceeds_wanted_at_once() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let low_avail = 1u64 << 30;
+        let threads = 16;
+        let barrier = Barrier::new(threads);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| {
+                        std::thread::sleep(Duration::from_millis(2));
+                        true
+                    });
+                    barrier.wait();
+                    if gate.try_admit(reserve, || Some(low_avail), false, &wanted) {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), WANTED_AT_ONCE, "wanted burst exceeded WANTED_AT_ONCE");
+        assert_eq!(gate.working.load(Ordering::SeqCst), WANTED_AT_ONCE);
+    }
+
+    #[test]
+    fn wait_for_memory_drains_concurrent_waiters_within_cap() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let low_avail = 1u64 << 30;
+        let threads = 12;
+        let barrier = Barrier::new(threads);
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| true);
+                    barrier.wait();
+                    gate.wait_with(reserve, || Some(low_avail), Duration::from_secs(60), &wanted);
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(cur, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(25));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    gate.release();
+                });
+            }
+        });
+        let peak = max_active.load(Ordering::SeqCst);
+        assert!(peak <= WANTED_AT_ONCE, "peak concurrent slots {peak} exceeded WANTED_AT_ONCE ({WANTED_AT_ONCE})");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn low_commit_unwanted_admits_only_one_progress_slot() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let low_avail = 1u64 << 30;
+        let threads = 8;
+        let barrier = Barrier::new(threads);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| false);
+                    barrier.wait();
+                    if gate.try_admit(reserve, || Some(low_avail), false, &wanted) {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), 1, "only one progress compile may run when commit is short and unwanted");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 1);
+        let wanted: Wanted = Box::new(|| false);
+        assert!(gate.try_admit(reserve, || Some(low_avail), true, &wanted), "timed-out waiter must still admit");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 2);
     }
 }

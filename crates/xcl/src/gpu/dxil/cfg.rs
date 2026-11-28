@@ -1,7 +1,7 @@
 //! Basic blocks of a decoded RDNA2 program, their edges and a reverse
 //! post-order (the emission order: every block after its dominators).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::gpu::rdna2::{self, Decoded};
 
@@ -58,35 +58,47 @@ impl Cfg {
             insts.push(d);
         }
         rdna2::resolve_far_jumps(&mut insts);
-        let index: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-        let mut leaders: BTreeSet<usize> = BTreeSet::from([0]);
+        let index_of = |pc: u64| insts.binary_search_by_key(&pc, |d| d.pc).ok();
+        let mut is_leader = vec![false; insts.len()];
+        if !is_leader.is_empty() {
+            is_leader[0] = true;
+        }
         let is_setpc = |d: &Decoded| setpc.is_some() && d.inst.name == "S_SETPC_B64" && d.far_target.is_none();
         let setpc_target = match setpc {
-            Some(Some(t)) => Some(*index.get(&t).ok_or_else(|| format!("GS start {t:#x} is not the start of an instruction"))?),
+            Some(Some(t)) => Some(index_of(t).ok_or_else(|| format!("GS start {t:#x} is not the start of an instruction"))?),
             _ => None,
         };
         if let Some(t) = setpc_target {
-            leaders.insert(t);
+            is_leader[t] = true;
         }
         for (i, d) in insts.iter().enumerate() {
             if is_setpc(d) {
-                leaders.insert(i + 1);
+                if i + 1 < is_leader.len() {
+                    is_leader[i + 1] = true;
+                }
                 continue;
             }
             if let Some(t) = rdna2::branch_target(d) {
-                let ti = *index.get(&t).ok_or_else(|| format!("+{:#x}: branch to {t:#x}, which is not the start of an instruction", d.pc))?;
-                leaders.insert(ti);
-                leaders.insert(i + 1);
+                let ti = index_of(t).ok_or_else(|| format!("+{:#x}: branch to {t:#x}, which is not the start of an instruction", d.pc))?;
+                is_leader[ti] = true;
+                if i + 1 < is_leader.len() {
+                    is_leader[i + 1] = true;
+                }
             } else if d.inst.flags & rdna2::F_TERMINATOR != 0 || is_end(d.inst.name) {
-                leaders.insert(i + 1);
+                if i + 1 < is_leader.len() {
+                    is_leader[i + 1] = true;
+                }
             }
         }
-        let starts: Vec<usize> = leaders.into_iter().filter(|&l| l < insts.len()).collect();
-        let block_of: BTreeMap<usize, usize> = starts.iter().enumerate().map(|(b, &i)| (i, b)).collect();
-        let mut blocks = Vec::new();
+        let starts: Vec<usize> = (0..insts.len()).filter(|&i| is_leader[i]).collect();
+        let mut block_of = vec![usize::MAX; insts.len()];
+        for (b, &i) in starts.iter().enumerate() {
+            block_of[i] = b;
+        }
+        let mut blocks = Vec::with_capacity(starts.len());
         for (b, &s) in starts.iter().enumerate() {
             let e = starts.get(b + 1).copied().unwrap_or(insts.len());
-            let mut list = Vec::new();
+            let mut list = Vec::with_capacity(e - s);
             let mut term = if e < insts.len() { Term::Jump(b + 1) } else { Term::End };
             for i in s..e {
                 let d = &insts[i];
@@ -96,13 +108,13 @@ impl Cfg {
                 }
                 if is_setpc(d) {
                     term = match setpc_target {
-                        Some(t) => Term::Jump(block_of[&t]),
+                        Some(t) => Term::Jump(block_of[t]),
                         None => Term::End,
                     };
                     break;
                 }
                 if let Some(t) = rdna2::branch_target(d) {
-                    let tb = block_of[&index[&t]];
+                    let tb = block_of[index_of(t).unwrap()];
                     let name = d.inst.name;
                     term = if name == "S_BRANCH" || d.far_target.is_some() {
                         Term::Jump(tb)
@@ -131,16 +143,13 @@ impl Cfg {
         // CFG; the console compiler emits loops entered in the middle): split nodes until
         // every retreating edge is a back edge to a dominator
         let (post, headers) = make_reducible(&mut blocks)?;
-        let succ = succ_of;
-        let reach: BTreeSet<usize> = post.iter().copied().collect();
         for &b in &post {
-            for t in succ(&blocks[b]) {
+            for t in succ_of(&blocks[b]) {
                 if !blocks[t].preds.contains(&b) {
                     blocks[t].preds.push(b);
                 }
             }
         }
-        let _ = reach;
         Ok(Cfg { insts, blocks, rpo: post, headers })
     }
 }
@@ -150,10 +159,20 @@ impl Cfg {
 /// it elsewhere. The reverse post-order and loop headers of the result; gives up past four
 /// times the original block count.
 fn make_reducible(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<usize>), String> {
+    let (post, headers, _) = make_reducible_inner(blocks)?;
+    Ok((post, headers))
+}
+
+fn make_reducible_inner(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<usize>, usize), String> {
     let limit = 4 * blocks.len() + 256;
+    let mut dom_passes = 0usize;
     loop {
         let (post, headers) = order(blocks);
-        let Some((_, t)) = irreducible_edge(blocks, &post) else { return Ok((post, headers)) };
+        if headers.is_empty() {
+            return Ok((post, headers, dom_passes));
+        }
+        dom_passes += 1;
+        let Some((_, t)) = irreducible_edge(blocks, &post) else { return Ok((post, headers, dom_passes)) };
         let n = blocks.len();
         let mut pos = vec![usize::MAX; n];
         for (i, &b) in post.iter().enumerate() {
@@ -171,8 +190,9 @@ fn make_reducible(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<us
             let mut stack = vec![from];
             seen[from] = true;
             while let Some(x) = stack.pop() {
-                let next = if fwd { succ_of(&blocks[x]) } else { preds[x].clone() };
-                for y in next {
+                let succs = succ_of(&blocks[x]);
+                let next: &[usize] = if fwd { succs.as_slice() } else { &preds[x] };
+                for &y in next {
                     if inside[y] && !seen[y] {
                         seen[y] = true;
                         stack.push(y);
@@ -224,11 +244,31 @@ fn make_reducible(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<us
     }
 }
 
-fn succ_of(b: &CfgBlock) -> Vec<usize> {
+#[derive(Clone, Copy)]
+struct Succs {
+    buf: [usize; 2],
+    len: usize,
+}
+
+impl Succs {
+    fn as_slice(&self) -> &[usize] {
+        &self.buf[..self.len]
+    }
+}
+
+impl IntoIterator for Succs {
+    type Item = usize;
+    type IntoIter = std::iter::Take<std::array::IntoIter<usize, 2>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.buf.into_iter().take(self.len)
+    }
+}
+
+fn succ_of(b: &CfgBlock) -> Succs {
     match b.term {
-        Term::Jump(t) => vec![t],
-        Term::Cond(_, t, f) => vec![t, f],
-        Term::End => vec![],
+        Term::Jump(t) => Succs { buf: [t, 0], len: 1 },
+        Term::Cond(_, t, f) => Succs { buf: [t, f], len: 2 },
+        Term::End => Succs { buf: [0, 0], len: 0 },
     }
 }
 
@@ -236,15 +276,16 @@ fn succ_of(b: &CfgBlock) -> Vec<usize> {
 /// retreating edges.
 fn order(blocks: &[CfgBlock]) -> (Vec<usize>, BTreeSet<usize>) {
     let n = blocks.len();
-    let succ = succ_of;
     let mut state = vec![0u8; n]; // 0 new, 1 on stack, 2 done
-    let mut post = Vec::new();
+    let mut post = Vec::with_capacity(n);
     let mut headers = BTreeSet::new();
     if n > 0 {
-        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n.min(64).max(1));
+        stack.push((0, 0));
         state[0] = 1;
         while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-            let s = succ(&blocks[b]);
+            let succs = succ_of(&blocks[b]);
+            let s = succs.as_slice();
             if *k < s.len() {
                 let t = s[*k];
                 *k += 1;
@@ -345,5 +386,80 @@ mod tests {
         assert_eq!(b.len(), 6);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers2.len(), 1);
+    }
+
+    #[test]
+    fn acyclic_cfg_skips_dominator_pass_and_matches_rpo_and_preds() {
+        let mut code = Vec::new();
+        code.extend(rdna2::encode("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 2)], None).unwrap());
+        code.extend(rdna2::encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        code.extend(rdna2::encode("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)], None).unwrap());
+        code.extend(rdna2::encode("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code.extend(rdna2::encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+
+        let mut cfg = Cfg::build(&code).unwrap();
+        assert_eq!(cfg.blocks.len(), 5);
+        assert_eq!(cfg.blocks[2].term, Term::Jump(3));
+        assert!(cfg.headers.is_empty());
+        assert_eq!(cfg.rpo, vec![0, 1, 2, 3]);
+        assert_eq!(cfg.blocks[0].preds, Vec::<usize>::new());
+        assert_eq!(cfg.blocks[1].preds, vec![0]);
+        assert_eq!(cfg.blocks[2].preds, vec![0]);
+        assert_eq!(cfg.blocks[3].preds, vec![1, 2]);
+        assert_eq!(cfg.blocks[4].preds, Vec::<usize>::new());
+        assert!(irreducible_edge(&cfg.blocks, &cfg.rpo).is_none());
+
+        let (rpo, headers, dom_passes) = make_reducible_inner(&mut cfg.blocks).unwrap();
+        assert_eq!(dom_passes, 0, "acyclic CFG must skip dominator pass");
+        assert!(headers.is_empty());
+        assert_eq!(rpo, cfg.rpo);
+    }
+
+    #[test]
+    fn succ_of_is_copy_and_covers_all_terminators() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<Succs>();
+        for (term, want) in [
+            (Term::End, &[][..]),
+            (Term::Jump(5), &[5][..]),
+            (Term::Cond(9, 2, 7), &[2, 7][..]),
+        ] {
+            let s = succ_of(&blk(term));
+            assert_eq!(s.as_slice(), want);
+            assert_eq!(s.into_iter().collect::<Vec<_>>(), want);
+        }
+    }
+
+    #[test]
+    fn empty_reducible_loop_irreducible_and_geometry_cfgs_match() {
+        let empty = Cfg::build(&[]).unwrap();
+        assert!(empty.insts.is_empty() && empty.blocks.is_empty() && empty.rpo.is_empty() && empty.headers.is_empty());
+
+        let mut red = vec![blk(Term::Jump(1)), blk(Term::Cond(0, 1, 2)), blk(Term::End)];
+        let (rpo, headers, dom_passes) = make_reducible_inner(&mut red).unwrap();
+        assert_eq!((dom_passes, rpo, headers), (1, vec![0, 1, 2], BTreeSet::from([1])));
+
+        let mut irred = vec![blk(Term::Cond(0, 3, 1)), blk(Term::Jump(2)), blk(Term::Jump(3)), blk(Term::Cond(0, 2, 4)), blk(Term::End)];
+        let (rpo, headers, dom_passes) = make_reducible_inner(&mut irred).unwrap();
+        assert!(dom_passes >= 2 && headers.len() == 1 && irreducible_edge(&irred, &rpo).is_none());
+
+        let mut gs = Vec::new();
+        gs.extend(rdna2::encode("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 0)], None).unwrap());
+        gs.extend(rdna2::encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        gs.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let with_gs = Cfg::build_geometry(&gs, Some(8)).unwrap();
+        assert_eq!(with_gs.blocks[0].term, Term::Jump(2));
+        assert_eq!((with_gs.blocks[2].pc, with_gs.rpo), (8, vec![0, 2]));
+        for start in [None, Some(0)] {
+            let ended = Cfg::build_geometry(&gs, start).unwrap();
+            assert_eq!((&ended.blocks[0].term, &ended.rpo), (&Term::End, &vec![0]));
+        }
+        assert!(Cfg::build_geometry(&gs, Some(2)).err().unwrap().contains("GS start"));
+
+        let bad_br = rdna2::encode("S_BRANCH", "ENC_SOPP", &[("SIMM16", 8)], None).unwrap();
+        assert!(Cfg::build(&bad_br).err().unwrap().contains("not the start of an instruction"));
+        let bad_cbr = rdna2::encode("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", (-1i16) as u16 as u64)], None).unwrap();
+        assert!(Cfg::build(&bad_cbr).err().unwrap().contains("conditional branch at the end of the code"));
     }
 }

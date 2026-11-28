@@ -209,6 +209,138 @@ fn compile_variant(code: &[u8], direct: bool, heap: bool, mem_windows: u32) -> V
     }
 }
 
+/// Direct-DXIL flat heap reads produce the same output as guarded heap reads for four windows
+/// and the largest supported heap. This includes inactive lanes, null and outside-UMA
+/// addresses, and a dwordx2 load ending at the raw view boundary. The one-window case is a
+/// root-UAV-only degenerate baseline (heap flags intentionally collapse to that form).
+/// Run native and explicitly split wave64 forms wherever the adapter supports them.
+#[test]
+fn gpu_heap_flat_reads_match_guarded_and_root_output() {
+    use crate::gpu::dxil::kernel::{translate, KernelOptions};
+
+    if let Err(err) = super::runner::adapter() {
+        println!("GPU unavailable – skipping ({err})");
+        super::runner::skip_test("no GPU");
+        return;
+    }
+    let mut wave_modes = Vec::new();
+    if super::runner::wave64_supported() == Ok(true) {
+        wave_modes.push(("native wave64", false));
+    }
+    if super::runner::wave32_supported() == Ok(true) {
+        wave_modes.push(("split wave64", true));
+    }
+    if wave_modes.is_empty() {
+        println!("GPU has neither native wave64 nor wave32 for split wave64 – skipping");
+        super::runner::skip_test("no wave64");
+        return;
+    }
+
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| crate::gpu::rdna2::encode(n, enc, f, None).unwrap();
+    let mut code = Vec::new();
+    code.extend(e("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 30), ("SBASE", 1), ("OFFSET", 0)]));
+    code.extend(e("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 31), ("SBASE", 2), ("OFFSET", 0)]));
+    code.extend(e("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 4), ("OFFSET", 4)]));
+    // Only lanes 33..63 execute the vector reads; inactive lanes retain their sentinels.
+    code.extend(e("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)]));
+    code.extend(e("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)]));
+    code.extend(e("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(e("GLOBAL_LOAD_DWORDX2", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 10), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+
+    const BYTES: usize = 1 << 20;
+    const OLD: u32 = 0x7777_7777;
+    for windows in [1usize, 4, crate::gpu::uma::MAX_HEAP_WINDOWS] {
+        let arena = crate::gpu::uma::Uma::with_windows(windows, BYTES).unwrap();
+        let bases: Vec<u64> = (0..windows).map(|k| arena.window(k).0 as u64).collect();
+        let base_hi = (bases[0] >> 32) as u32;
+        let target = windows - 1;
+        let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+        for (k, &base) in bases.iter().enumerate() {
+            *word(base + 0x40) = 0xA000 + k as u32;
+            for lane in 0..64u64 {
+                *word(base + 0x100 + 4 * lane) = (k as u32 + 1) * 1000 + lane as u32;
+            }
+            *word(base + BYTES as u64 - 8) = 0xD000 + k as u32;
+            *word(base + BYTES as u64 - 4) = 0xE000 + k as u32;
+        }
+
+        let mut st = super::runner::KernelState::default();
+        st.sgpr[2..4].copy_from_slice(&[0x40, base_hi + target as u32]);
+        st.sgpr[4..6].copy_from_slice(&[0x40, base_hi + windows as u32 + 1]);
+        st.sgpr[8..12].copy_from_slice(&[0x100, (base_hi + target as u32) & 0xFFFF, 0x400, 0]);
+        st.sgpr[12..16].copy_from_slice(&[0x100, (base_hi + target as u32) & 0xFFFF | 4 << 16, 64, 0]);
+        for (lane, r) in st.vgpr.iter_mut().enumerate() {
+            let lane = lane as u32;
+            r[0] = lane;
+            r[4] = if lane % 8 == 6 { 0 } else { 0x100 + 4 * lane };
+            r[5] = match lane % 8 {
+                6 => 0, // null
+                7 => base_hi + windows as u32 + 1, // outside UMA
+                _ => base_hi + lane % windows as u32,
+            };
+            r[6..10].fill(OLD);
+            // One window uses a root UAV (no descriptor bounds); heap forms use the
+            // straddling read to verify the descriptor-view boundary.
+            r[10] = BYTES as u32 - if windows == 1 { 8 } else { 4 };
+            r[11] = base_hi + target as u32;
+        }
+
+        for &(wave, split) in &wave_modes {
+            let run = |mem_windows, state: &super::runner::KernelState| {
+                let dxil = translate(&code, KernelOptions { wave64: true, split, mem_windows, sampler_base: 0 })
+                    .unwrap_or_else(|err| panic!("{wave}, {windows} windows ({mem_windows:#x}): {err}"));
+                super::runner::run_in_arena(&dxil, state, &arena)
+                    .unwrap_or_else(|err| panic!("{wave}, {windows} windows ({mem_windows:#x}): {err}"))
+            };
+            let output = if windows == 1 {
+                run(1, &st)
+            } else {
+                let guarded = run(windows as u32 | super::HEAP_WINDOWS, &st);
+                let flat = run(windows as u32 | super::HEAP_WINDOWS | super::HEAP_FLAT, &st);
+                assert_eq!(guarded.sgpr[..32], flat.sgpr[..32], "{wave}, {windows} heap windows: SGPR parity");
+                for lane in 0..64 {
+                    assert_eq!(guarded.vgpr[lane][..12], flat.vgpr[lane][..12], "{wave}, {windows} heap windows: lane {lane} parity");
+                }
+                flat
+            };
+            if windows == crate::gpu::uma::MAX_WINDOWS {
+                // Root UAVs have no view bounds, so use an in-view dwordx2 for this baseline.
+                let mut root_st = st.clone();
+                for r in &mut root_st.vgpr {
+                    r[10] = BYTES as u32 - 8;
+                }
+                let root = run(windows as u32, &root_st);
+                let guarded_root = run(windows as u32 | super::HEAP_WINDOWS, &root_st);
+                assert_eq!(guarded_root.sgpr[..32], root.sgpr[..32], "{wave}, {windows} windows: branchless root-UAV SGPR baseline");
+                for lane in 0..64 {
+                    assert_eq!(guarded_root.vgpr[lane][..12], root.vgpr[lane][..12], "{wave}, {windows} windows: branchless root-UAV lane {lane} baseline");
+                }
+            }
+
+            let outside = if windows == 1 { 0xA000 } else { 0 };
+            assert_eq!((output.sgpr[30], output.sgpr[31]), (0xA000 + target as u32, outside), "{wave}, {windows} windows: scalar valid/outside");
+            assert_eq!(output.sgpr[24..28], [1000 * windows as u32 + 1, 1000 * windows as u32 + 2, 1000 * windows as u32 + 3, 1000 * windows as u32 + 4], "{wave}, {windows} windows: scalar vector load");
+            for lane in 0..64u32 {
+                let v = &output.vgpr[lane as usize];
+                let active = lane > 32;
+                assert_eq!(v[7], if active { 1000 * windows as u32 + lane } else { OLD }, "{wave}, {windows} windows, lane {lane}: buffer load");
+                let global = match lane % 8 {
+                    6 => 0,
+                    // one root UAV has no window to check: an outside address wraps into it, as
+                    // the scalar load above
+                    7 if windows == 1 => 1000 + lane,
+                    7 => 0,
+                    _ => (lane % windows as u32 + 1) * 1000 + lane,
+                };
+                assert_eq!(v[6], if active { global } else { OLD }, "{wave}, {windows} windows, lane {lane}: null/outside global load");
+                let edge = if windows == 1 { [0xD000, 0xE000] } else { [0xE000 + target as u32, 0] };
+                assert_eq!(v[8..10], if active { edge } else { [OLD, OLD] }, "{wave}, {windows} windows, lane {lane}: end-of-view dwordx2");
+            }
+        }
+    }
+}
+
 /// Divergent per-lane window indexing (`NonUniformResourceIndex`): in a single wave, lanes hit
 /// window 0 (`l % 3 == 0`), window 1 (`l % 3 == 1`), and out-of-UMA (`l % 3 == 2`, aliasing w0
 /// under `& 3`) simultaneously on loads, stores, and atomics. HLSL and direct DXIL must match

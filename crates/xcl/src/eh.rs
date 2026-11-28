@@ -136,6 +136,8 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }
         crate::log::flush();
+        crate::hle::d3d12x::pso_async::flush_used_bounded(std::time::Duration::from_millis(100));
+        crate::hle::d3d12x::real::flush_indirect_split_records(std::time::Duration::from_millis(100));
     }
     let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
     orig(h, status)
@@ -245,12 +247,106 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Code-page protection is page-wide. Serialize these rare first-fault rewrites so two sites on
+/// one page cannot restore stale protection over each other.
+static CODE_REWRITE: Mutex<()> = Mutex::new(());
+/// A second thread may have faulted at a wait site before the first thread replaced it, then enter
+/// the handler after replacement. Recognize that stale exception and retry the now-native bytes.
+static REWRITTEN_WAITS: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
+
+fn rewritten_wait(at: usize, code: &[u8]) -> bool {
+    let _serial = CODE_REWRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sites = REWRITTEN_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(index) = sites.iter().position(|(site, _)| *site == at) else { return false };
+    if code.starts_with(&sites[index].1) {
+        true
+    } else {
+        sites.swap_remove(index);
+        false
+    }
+}
+
+fn remember_rewritten_wait(at: usize, replacement: &[u8]) {
+    let mut sites = REWRITTEN_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, bytes)) = sites.iter_mut().find(|(site, _)| *site == at) {
+        bytes.clear();
+        bytes.extend_from_slice(replacement);
+    } else {
+        sites.push((at, replacement.to_vec()));
+    }
+}
+
+#[cfg(test)]
+fn forget_rewritten_waits(start: usize, end: usize) {
+    let _serial = CODE_REWRITE.lock().unwrap_or_else(|e| e.into_inner());
+    REWRITTEN_WAITS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(site, _)| *site < start || *site >= end);
+}
+
+/// Atomically replace `expected` at `off` in an aligned instruction word. A failed compare is
+/// retried from the newly observed word so an adjacent rewrite is never overwritten or mistaken
+/// for success.
+fn replace_code_word(cell: &std::sync::atomic::AtomicU64, off: usize, expected: &[u8], new: &[u8]) -> bool {
+    replace_code_word_from(cell, off, expected, new, cell.load(Ordering::Acquire))
+}
+
+fn replace_code_word_from(cell: &std::sync::atomic::AtomicU64, off: usize, expected: &[u8], new: &[u8], mut was: u64) -> bool {
+    loop {
+        let mut bytes = was.to_le_bytes();
+        if bytes[off..off + new.len()] == *new {
+            return true;
+        }
+        if bytes[off..off + expected.len()] != *expected {
+            return false;
+        }
+        bytes[off..off + new.len()].copy_from_slice(new);
+        match cell.compare_exchange(was, u64::from_le_bytes(bytes), Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => was = now,
+        }
+    }
+}
+
+/// Rewrite one console-only instruction in place when it fits in an aligned 8-byte word. Threads
+/// executing it observe either the complete old instruction or the complete replacement.
+fn rewrite_code(at: usize, expected: &[u8], new: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let word = at & !7;
+    let off = at - word;
+    if expected.is_empty() || expected.len() != new.len() || off + new.len() > 8 {
+        return false;
+    }
+    let _serial = CODE_REWRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut old = 0u32;
+    unsafe {
+        if VirtualProtect(word as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        let cell = &*(word as *const std::sync::atomic::AtomicU64);
+        let replaced = replace_code_word(cell, off, expected, new);
+        // Publish while CODE_REWRITE is still held. A stale exception lookup takes the same lock
+        // first, so it cannot observe the replacement without its registry entry. The bytes have
+        // changed even if restoring protection or flushing the cache below reports failure.
+        if replaced {
+            remember_rewritten_wait(at, new);
+        }
+        let mut ignored = 0u32;
+        let restored = VirtualProtect(word as *const c_void, 8, old, &mut ignored) != 0;
+        let flushed = FlushInstructionCache(GetCurrentProcess(), word as *const c_void, 8) != 0;
+        replaced && restored && flushed
+    }
+}
+
 fn is_writable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     // a committed window of unified memory is read-write as a whole and is not asked about, as in
     // `gpu::shader::readable`: `VirtualQuery` walks a region to its end to size it, and a title's
     // memset there asked at every emulated CLZERO loop
     if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        return true;
+    }
+    if crate::hle::d3d12x::sparse::known_writable(va, bytes) {
         return true;
     }
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -321,6 +417,9 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
+        if rewritten_wait(rip, code) {
+            return -1;
+        }
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
@@ -347,9 +446,19 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
         }
-        ConsoleOnly::Monitorx => {}
+        ConsoleOnly::Monitorx => {
+            let mut expected = [0u8; 16];
+            expected[..len].copy_from_slice(&code[..len]);
+            let replacement = &[0x90; 16][..len];
+            rewrite_code(rip, &expected[..len], replacement);
+        }
         ConsoleOnly::Mwaitx => {
             std::hint::spin_loop();
+            let mut expected = [0u8; 16];
+            expected[..len].copy_from_slice(&code[..len]);
+            let mut replacement = [0x90u8; 16];
+            replacement[0] = 0xF3;
+            rewrite_code(rip, &expected[..len], &replacement[..len]);
         }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
@@ -999,6 +1108,111 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    #[test]
+    fn monitorx_and_mwaitx_are_rewritten_at_their_first_fault() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize };
+        assert_ne!(code, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "wait_rewrite.exe".into(), path: "wait_rewrite.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        for (offset, before, after) in [
+            (0x10usize, [0x0F, 0x01, 0xFA], [0x90, 0x90, 0x90]),
+            (0x20usize, [0x0F, 0x01, 0xFB], [0xF3, 0x90, 0x90]),
+        ] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(before.as_ptr(), (code + offset) as *mut u8, before.len());
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                ctx.Rip = (code + offset) as u64;
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, (code + offset + before.len()) as u64);
+                assert_eq!(std::slice::from_raw_parts((code + offset) as *const u8, before.len()), &after);
+                // A second exception may already be in flight with RIP at the old instruction.
+                // Retry the replacement at the same RIP instead of treating its NOPs as unknown.
+                ctx.Rip = (code + offset) as u64;
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, (code + offset) as u64);
+            }
+        }
+        forget_rewritten_waits(code, code + 0x1000);
+        modules::unregister_mapped(code);
+        unsafe { VirtualFree(code as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_lost_compare_reloads_and_preserves_an_adjacent_rewrite() {
+        use std::sync::atomic::AtomicU64;
+        let original = u64::from_le_bytes([0x0F, 0x01, 0xFA, 0xCC, 0x0F, 0x01, 0xFB, 0xCC]);
+        let cell = AtomicU64::new(original);
+        let stale = cell.load(Ordering::Acquire);
+        // The other site wins after our initial load, exactly the raw PR's lost-CAS window.
+        cell.store(u64::from_le_bytes([0x0F, 0x01, 0xFA, 0xCC, 0xF3, 0x90, 0x90, 0xCC]), Ordering::Release);
+        assert!(replace_code_word_from(&cell, 0, &[0x0F, 0x01, 0xFA], &[0x90; 3], stale));
+        assert_eq!(cell.load(Ordering::Acquire).to_le_bytes(), [0x90, 0x90, 0x90, 0xCC, 0xF3, 0x90, 0x90, 0xCC]);
+    }
+
+    #[test]
+    fn concurrent_adjacent_rewrites_preserve_bytes_and_page_protection() {
+        use std::sync::{Arc, Barrier};
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION,
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
+        };
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        assert_ne!(page, 0);
+        let first = [0x0F, 0x01, 0xFA];
+        let second = [0x0F, 0x01, 0xFB];
+        unsafe {
+            std::ptr::copy_nonoverlapping(first.as_ptr(), page as *mut u8, first.len());
+            std::ptr::copy_nonoverlapping(second.as_ptr(), (page + 4) as *mut u8, second.len());
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(page as *const c_void, 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+        }
+        // Enough simultaneous callers to force the raw PR's word-CAS and page-protection windows
+        // to overlap. Serialization makes every caller observe the completed adjacent update.
+        const THREADS: usize = 32;
+        let start = Arc::new(Barrier::new(THREADS + 1));
+        let mut workers = Vec::new();
+        for n in 0..THREADS {
+            let start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                if n & 1 == 0 {
+                    rewrite_code(page, &first, &[0x90; 3])
+                } else {
+                    rewrite_code(page + 4, &second, &[0xF3, 0x90, 0x90])
+                }
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            assert!(worker.join().unwrap());
+        }
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(page as *const u8, 3), &[0x90; 3]);
+            assert_eq!(std::slice::from_raw_parts((page + 4) as *const u8, 3), &[0xF3, 0x90, 0x90]);
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(page as *const c_void, &mut info, std::mem::size_of_val(&info)), 0);
+            assert_eq!(info.Protect, PAGE_EXECUTE_READ, "concurrent rewrites must restore RX, not stale RWX");
+            forget_rewritten_waits(page, page + 0x1000);
+            VirtualFree(page as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_rewrite_crossing_an_atomic_word_stays_emulated() {
+        let mut buf = [0xCCu8; 24];
+        let word = (buf.as_mut_ptr() as usize + 7) & !7;
+        let at = word + 6;
+        let before = [0x0F, 0x01, 0xFA];
+        unsafe { std::ptr::copy_nonoverlapping(before.as_ptr(), at as *mut u8, before.len()) };
+        assert!(!rewrite_code(at, &before, &[0x90; 3]));
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 3) }, &before);
     }
 
     /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and

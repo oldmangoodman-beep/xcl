@@ -2,11 +2,14 @@ use super::super::*;
 use super::*;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::thread;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_BUDGET: usize = 1024 * 1024;
@@ -109,11 +112,15 @@ struct TestQueue(*mut c_void);
 
 impl TestQueue {
     fn new(pool: Option<Arc<DecompressPool>>, hook: Option<TestHook>) -> Self {
+        Self::with_desc(64, &IID_QUEUE, pool, hook)
+    }
+
+    fn with_desc(capacity: u16, iid: &GUID, pool: Option<Arc<DecompressPool>>, hook: Option<TestHook>) -> Self {
         let mut desc = [0; 0x18];
-        desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+        desc[8..10].copy_from_slice(&capacity.to_le_bytes());
         let mut raw = null_mut();
         assert_eq!(
-            unsafe { factory_create_queue(null_mut(), desc.as_ptr(), &IID_QUEUE, &mut raw) },
+            unsafe { factory_create_queue(null_mut(), desc.as_ptr(), iid, &mut raw) },
             S_OK
         );
         let queue = Self(raw);
@@ -135,6 +142,14 @@ impl TestQueue {
 
     fn status(&self, status: &TestStatus, slot: u32) {
         unsafe { queue_enqueue_status(self.0, status.0, slot) };
+    }
+
+    fn enqueue_set_event(&self, event: &OwnedHandle) {
+        unsafe {
+            let vtable = *(self.0 as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, HANDLE) = std::mem::transmute(*vtable.add(12));
+            enqueue(self.0, event.as_raw_handle());
+        }
     }
 
     fn submit(&self) {
@@ -260,6 +275,89 @@ fn await_later_preparation(events: &mpsc::Receiver<TestEvent>) {
             _ => {}
         }
     }
+}
+
+fn completion_event() -> OwnedHandle {
+    let event = unsafe { CreateEventW(null_mut(), 1, 0, null_mut()) };
+    assert!(!event.is_null());
+    unsafe { OwnedHandle::from_raw_handle(event) }
+}
+
+#[test]
+fn completion_event_auto_submits_a_half_full_sequential_queue() {
+    with_deadline(|| {
+        let payload = vec![0x7b; 48 * 1024];
+        let file = TestFile::compressed(&[&payload]);
+        let mut output = vec![0x5d; payload.len()];
+        let queue = TestQueue::with_desc(6, &IID_QUEUE_X1, None, None);
+        let status = TestStatus::new(1);
+        let event = completion_event();
+        unsafe { queue.enqueue(&file.request(0, output.as_mut_ptr() as usize, 1)) };
+        queue.status(&status, 0);
+        assert_eq!(unsafe { WaitForSingleObject(event.as_raw_handle(), 0) }, WAIT_TIMEOUT);
+        queue.enqueue_set_event(&event);
+
+        assert_eq!(unsafe { WaitForSingleObject(event.as_raw_handle(), 2_000) }, WAIT_OBJECT_0);
+        assert_eq!(status.result(0), S_OK);
+        assert_eq!(output, payload);
+    });
+}
+
+#[test]
+fn completion_event_waits_for_parallel_retirement_and_keeps_its_handle() {
+    with_deadline(|| {
+        let payload = vec![0x4d; 48 * 1024];
+        let file = TestFile::compressed(&[&payload]);
+        let mut output = vec![0; payload.len()];
+        let mut failed = vec![0x72; payload.len()];
+        let pool = test_pool(2, TEST_BUDGET);
+        let (gate, milestones, release) = gated_hook(TestEvent::BeforeDecode(1));
+        let last_retired = Arc::new(AtomicU64::new(0));
+        let retired = Arc::clone(&last_retired);
+        let hook = Arc::new(move |event| {
+            if let TestEvent::Retired(seq) = event {
+                retired.store(seq, Ordering::Release);
+            }
+            gate(event);
+        });
+        let queue = TestQueue::with_desc(64, &IID_QUEUE_X1, Some(pool), Some(hook));
+        let status = TestStatus::new(1);
+        let event = completion_event();
+        let observer = event.try_clone().unwrap();
+
+        let mut short = file.request(0, failed.as_mut_ptr() as usize, 2);
+        short[0x30..0x34].copy_from_slice(&(file.chunks[0].1 + 1).to_le_bytes());
+        unsafe {
+            queue.enqueue(&file.request(0, output.as_mut_ptr() as usize, 1));
+            queue.enqueue(&short);
+        }
+        queue.enqueue_set_event(&event);
+        queue.status(&status, 0);
+        queue.submit();
+
+        assert_eq!(receive(&milestones), TestEvent::BeforeDecode(1));
+        let early_wait = unsafe { WaitForSingleObject(observer.as_raw_handle(), 0) };
+        drop(event);
+        release.send(()).unwrap();
+        assert_eq!(early_wait, WAIT_TIMEOUT);
+        assert_eq!(unsafe { WaitForSingleObject(observer.as_raw_handle(), 2_000) }, WAIT_OBJECT_0);
+        assert_eq!(last_retired.load(Ordering::Acquire), 2);
+        assert_eq!(status.wait(0), E_END_OF_FILE);
+        assert_eq!(output, payload);
+        assert!(failed.iter().all(|&byte| byte == 0x72));
+    });
+}
+
+#[test]
+fn completion_event_close_discards_the_pending_marker() {
+    let queue = TestQueue::with_desc(64, &IID_QUEUE_X1, None, None);
+    let event = completion_event();
+    queue.enqueue_set_event(&event);
+    assert_eq!(queue.inner().pending.lock().unwrap().entries.len(), 1);
+    unsafe { queue_close(queue.0) };
+
+    assert!(queue.inner().pending.lock().unwrap().entries.is_empty());
+    assert_eq!(unsafe { WaitForSingleObject(event.as_raw_handle(), 0) }, WAIT_TIMEOUT);
 }
 
 #[test]

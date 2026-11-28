@@ -16,13 +16,12 @@
 //! address) are not seen; the title's own GPU work on the texture goes to the PC texture.
 //!
 //! A copy starts and ends in the state the title's submitted work left the texture in: its
-//! transitions of these textures are noted per PC command list as they are recorded
-//! (`note_transitions`) and applied, in submission order, when the list is submitted
-//! (`submitted`) – per subresource once a transition names one.
+//! transitions of these textures are captured in each physical command-list segment's immutable
+//! submission effects and applied in submission order – per subresource once one is named.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
@@ -38,11 +37,35 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address its bytes are read from, layout, states) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+/// (device, address its bytes are read from, layout, states, registration generation) of an upload
+type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, u64);
+
+/// One incarnation of a title command queue. The raw address alone can be reused after release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WriterQueueId {
+    pub(super) raw: usize,
+    pub(super) generation: u64,
+}
+
+/// A GPU write captured while a physical command-list segment is recorded. Its registration
+/// generation prevents a late/replayed segment from marking a new object at a reused address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GpuWrite {
+    pub(super) res: usize,
+    pub(super) generation: u64,
+    pub(super) subresource: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuWriter {
+    epoch: u64,
+    queue: WriterQueueId,
+}
 
 struct Entry {
     device: usize,
+    /// PC allocation size of a committed resource (zero for placed resources and test entries)
+    committed_bytes: u64,
     /// the title's address of the texture
     va: usize,
     /// where its bytes are read and its CPU writes watched: `va`, or – for a texture in a GPU
@@ -61,12 +84,18 @@ struct Entry {
     /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
     /// then on and no longer uploaded
     gpu_written: bool,
+    /// Last submitted GPU writer: one for the whole resource while uniform, otherwise one per
+    /// subresource in D3D12 order. Empty until a tracked write is submitted.
+    gpu_writers: Vec<Option<GpuWriter>>,
+    /// CPU memory is the source of this texture and must be watched/uploaded. False for a
+    /// GPU-owned UAV/render target retained only for future coherency readback.
+    cpu_backed: bool,
     /// backed by shared `vram::Pages` tiles (overlapping placements share video memory)
     placed: bool,
     /// tiles were unmapped after a different-range placement superseded this texture
     unmapped: bool,
-    /// monotonic registration order (newest wins when uncovering shadowed textures)
-    seq: u64,
+    /// monotonic registration generation (newest wins when uncovering shadowed textures)
+    generation: u64,
 }
 
 /// textures waiting for their first upload
@@ -86,7 +115,7 @@ struct Table {
     shadowed_by_va: BTreeMap<(usize, usize), usize>,
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
-    next_seq: u64,
+    next_generation: u64,
 }
 
 impl Table {
@@ -97,7 +126,7 @@ impl Table {
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
-            next_seq: 0,
+            next_generation: 0,
         }
     }
 
@@ -219,8 +248,8 @@ impl Table {
                 }
             }
         }
-        self.next_seq += 1;
-        entry.seq = self.next_seq;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        entry.generation = self.next_generation;
         if entry.pending {
             pending_delta += 1;
         }
@@ -247,7 +276,7 @@ impl Table {
         let mut cands: Vec<(u64, usize, usize, usize)> = self
             .shadowed_overlaps(va, end)
             .into_iter()
-            .filter_map(|(sva, sres, send)| self.shadowed.get(&sres).map(|e| (e.seq, sres, sva, send)))
+            .filter_map(|(sva, sres, send)| self.shadowed.get(&sres).map(|e| (e.generation, sres, sva, send)))
             .collect();
         cands.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         let mut to_remap = Vec::new();
@@ -282,6 +311,11 @@ impl Table {
         by_res.get_mut(&res).or_else(|| shadowed.get_mut(&res))
     }
 
+    fn committed_bytes_for(&self, device: usize) -> (usize, u64) {
+        self.by_res.values().chain(self.shadowed.values()).filter(|e| e.device == device && !e.placed)
+            .fold((0usize, 0u64), |(n, bytes), e| (n.saturating_add(1), bytes.saturating_add(e.committed_bytes)))
+    }
+
     fn overlapping(&self, va: usize, len: usize) -> Vec<(usize, usize)> {
         self.active_overlaps(va, va.saturating_add(len)).into_iter().take(4).map(|(ova, ores, _)| (ores, ova)).collect()
     }
@@ -311,15 +345,43 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CPU_TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct WatchRanges {
+    ranges: Vec<(usize, usize)>,
+    wanted_bytes: usize,
+    excess_bytes: usize,
+}
+
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<WatchRanges>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
-    (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
+    (TEXTURES_LEN.load(Ordering::Relaxed), UPLOADS.load(Ordering::Relaxed))
+}
+
+/// Sampled textures tracked for CPU coherency on `device` that use committed resources: count and
+/// their PC allocation bytes. This deliberately excludes untracked render/depth/UAV fallbacks.
+/// Shadowed resources remain live and are included once until the title releases them.
+pub(super) fn committed_bytes_for(device: usize) -> (usize, u64) {
+    TEXTURES.lock().unwrap().committed_bytes_for(device)
+}
+
+unsafe fn committed_allocation_bytes(device: *mut c_void, resource: *mut c_void, placed: bool) -> u64 {
+    if placed || !super::memory_report::enabled() { return 0 }
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return 0 };
+    let Some(res) = ID3D12Resource::from_raw_borrowed(&resource) else { return 0 };
+    let bytes = dev.GetResourceAllocationInfo(0, &[res.GetDesc()]).SizeInBytes;
+    if bytes == u64::MAX { 0 } else { bytes }
+}
+
+fn update_lengths(t: &Table) {
+    TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+    CPU_TEXTURES_LEN.store(t.by_res.values().filter(|e| e.cpu_backed).count(), Ordering::Relaxed);
 }
 
 /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
@@ -376,8 +438,10 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         }
     }
     let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
+    let placed = super::vram::is_placed_texture(res as usize);
     let e = Entry {
         device: device as usize,
+        committed_bytes: committed_allocation_bytes(device, res, placed),
         va,
         src,
         in_gpu_view,
@@ -385,15 +449,97 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         states: vec![state],
         pending: true,
         gpu_written: false,
-        placed: super::vram::is_placed_texture(res as usize),
+        gpu_writers: Vec::new(),
+        cpu_backed: true,
+        placed,
         unmapped: false,
-        seq: 0,
+        generation: 0,
     };
     let to_unmap = {
         let mut t = TEXTURES.lock().unwrap();
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_lengths(&t);
+        clone_resources(&unmap_ptrs)
+    };
+    for r in &to_unmap {
+        super::vram::unmap_superseded(r);
+    }
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
+/// Validate and retain the console layout of a GPU-owned UAV/render target. Depth/stencil,
+/// MSAA, format-promoted resources, and multiple texel planes are deliberately unsupported:
+/// their PC bytes cannot be tiled back into the console layout without conversion/metadata.
+fn gpu_owned_layout(desc: &[u8; 0x38], pc: &D3D12_RESOURCE_DESC) -> Result<xg::Texture, String> {
+    let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+    let flags = u(0x30);
+    if flags & 2 != 0 || flags & 5 == 0 {
+        return Err("not a supported colour render target / UAV".into());
+    }
+    if (pc.Flags.0 as u32) & 5 == 0 {
+        return Err("not GPU-writable on the PC".into());
+    }
+    if u(0x24) != 1 || pc.SampleDesc.Count != 1 {
+        return Err("a multisampled texture".into());
+    }
+    if u(0x20) != pc.Format.0 as u32 {
+        return Err("a console format promoted on the PC".into());
+    }
+    if u(0) != pc.Dimension.0 as u32 || u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()) != pc.Width || u(0x18) != pc.Height {
+        return Err("a PC resource shape different from its console layout".into());
+    }
+    let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    let surfaces = tex.planes.iter().filter(|p| matches!(&p.kind, xg::PlaneKind::Surface(_))).count();
+    let s = tex.texels().filter(|_| surfaces == 1).ok_or("not exactly one supported texel plane")?;
+    let layers = if s.depth > 0 { s.depth } else { s.array };
+    if s.chain.levels.is_empty()
+        || pc.MipLevels as usize != s.chain.levels.len()
+        || pc.DepthOrArraySize as u32 != layers
+        || tex.size() == 0
+        || usize::try_from(tex.size()).is_err()
+    {
+        return Err("console and PC subresources differ".into());
+    }
+    Ok(tex)
+}
+
+/// Register metadata for a successfully created GPU-owned placement. No COM reference is kept;
+/// the resource's final Release removes this generation before its raw address can be reused.
+pub(super) unsafe fn register_gpu_owned(
+    device: *mut c_void,
+    res: *mut c_void,
+    va: usize,
+    desc: &[u8; 0x38],
+    state: D3D12_RESOURCE_STATES,
+) -> Result<(), String> {
+    let resource = ID3D12Resource::from_raw_borrowed(&res).ok_or("no resource")?;
+    let tex = gpu_owned_layout(desc, &resource.GetDesc())?;
+    let size = usize::try_from(tex.size()).map_err(|_| "texture size does not fit the title address space")?;
+    va.checked_add(size).ok_or("texture address range overflows")?;
+    let src = mirror_source(va);
+    let e = Entry {
+        device: device as usize,
+        committed_bytes: 0,
+        va,
+        src,
+        in_gpu_view: crate::hle::kernelx::mirrors::source(va).is_some(),
+        tex: Arc::new(tex),
+        states: vec![state],
+        pending: false,
+        gpu_written: true,
+        gpu_writers: Vec::new(),
+        cpu_backed: false,
+        placed: true,
+        unmapped: false,
+        generation: 0,
+    };
+    let to_unmap = {
+        let mut t = TEXTURES.lock().unwrap();
+        let (delta, unmap_ptrs) = t.insert(res as usize, e);
+        adjust_pending(delta);
+        update_lengths(&t);
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
@@ -442,7 +588,7 @@ fn recheck_gpu_view_sources() {
 /// `e`'s source again (a texture in a GPU view): when it changed, `e` reads the new one and is
 /// uploaded at the next submit. Whether it changed.
 fn recheck_source(e: &mut Entry) -> bool {
-    if !e.in_gpu_view {
+    if !e.cpu_backed || !e.in_gpu_view {
         return false;
     }
     let src = mirror_source(e.va);
@@ -457,13 +603,9 @@ fn recheck_source(e: &mut Entry) -> bool {
     true
 }
 
-/// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
-/// holds what the GPU wrote; here the CPU's view of it is stale, so it is not uploaded again
-/// (a CPU write elsewhere on its pages – a neighbour, an allocator's header – would upload the
-/// stale view over the copy: Fortnite's font atlas is zeros in memory, its glyphs are copied in
-/// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
-/// that copies.
-pub fn note_gpu_write(res: usize) {
+/// Prepare a recorded GPU write and capture the current registration generation. Lazy level
+/// mappings must exist before submission; provenance itself is published only after submission.
+pub(super) fn capture_gpu_write(res: usize, subresource: u32) -> Option<GpuWrite> {
     if super::vram::level_pages() {
         // (a texture whose levels get their pages one by one: all of them before the GPU's write)
         let p = res as *mut c_void;
@@ -473,23 +615,65 @@ pub fn note_gpu_write(res: usize) {
             }
         }
     }
-    let mut marked = false;
+    let t = TEXTURES.lock().unwrap();
+    let e = t.by_res.get(&res).or_else(|| t.shadowed.get(&res))?;
+    Some(GpuWrite { res, generation: e.generation, subresource })
+}
+
+/// Publish writes from command-list segments that the native submission gate accepted. On the
+/// console their memory now belongs to the GPU result, so its stale CPU view is not uploaded.
+#[cfg(test)]
+pub(super) fn publish_gpu_writes(queue: WriterQueueId, writes: &[GpuWrite]) {
+    publish_submission_effects(Some(queue), writes, &[]);
+}
+
+/// Atomically publish a submitted chunk's GPU writers and ordered state transitions.
+pub(super) fn publish_submission_effects(queue: Option<WriterQueueId>, writes: &[GpuWrite], transitions: &[Transition]) {
+    if writes.is_empty() && transitions.is_empty() {
+        return;
+    }
+    let mut newly_written = Vec::new();
     {
         let mut t = TEXTURES.lock().unwrap();
-        if let Some(e) = t.get_mut(res) {
-            if !e.gpu_written {
-                e.gpu_written = true;
-                GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
-                marked = true;
+        if let Some(queue) = queue {
+            for &write in writes {
+                let Some(e) = t.get_mut(write.res).filter(|e| e.generation == write.generation) else { continue };
+                let n = subresource_count(&e.tex);
+                if write.subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && !(n <= 1 && write.subresource == 0) && write.subresource as usize >= n {
+                    continue;
+                }
+                let epoch = NEXT_GPU_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+                let writer = GpuWriter { epoch, queue };
+                apply_gpu_writer(&mut e.gpu_writers, n, write.subresource, writer);
+                if !e.gpu_written {
+                    e.gpu_written = true;
+                    GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                    newly_written.push(write.res);
+                }
             }
         }
+        for &transition in transitions {
+            let Some(e) = t.get_mut(transition.res).filter(|e| e.generation == transition.generation) else { continue };
+            let n = subresource_count(&e.tex);
+            if transition.subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+                && !(n <= 1 && transition.subresource == 0)
+                && transition.subresource as usize >= n
+            {
+                continue;
+            }
+            apply_transition(&mut e.states, n, transition.subresource, transition.after);
+        }
     }
-    if marked {
-        STREAM_RECHECK.lock().unwrap().remove(&res);
+    if !newly_written.is_empty() {
+        let mut recheck = STREAM_RECHECK.lock().unwrap();
+        for res in newly_written {
+            recheck.remove(&res);
+        }
     }
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static NEXT_GPU_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
@@ -524,7 +708,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
             unmap_ptrs.extend(u3);
         }
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_lengths(&t);
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
@@ -543,7 +727,7 @@ pub fn forget(res: usize) {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_lengths(&t);
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
@@ -566,67 +750,58 @@ pub fn address(res: usize) -> Option<usize> {
     t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.va)
 }
 
-/// (texture, subresource or ALL_SUBRESOURCES, state after) of a transition the title recorded
-type Transition = (usize, u32, D3D12_RESOURCE_STATES);
-
-/// PC command list → the transitions of textures kept in step it recorded since it was made or
-/// last reset, in order. They apply when the list is submitted – each time: a closed list may
-/// run again.
-static LIST_NOTES: Mutex<BTreeMap<usize, Vec<Transition>>> = Mutex::new(BTreeMap::new());
+/// A recorded transition of a tracked texture. The registration generation keeps a captured
+/// command-list effect from applying to a new resource at a reused COM address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Transition {
+    pub(super) res: usize,
+    pub(super) generation: u64,
+    pub(super) subresource: u32,
+    pub(super) after: D3D12_RESOURCE_STATES,
+}
 
 /// Whether any texture is kept in step (callers skip collecting transitions otherwise).
 pub fn any() -> bool {
     TEXTURES_LEN.load(Ordering::Relaxed) != 0
 }
 
-/// The title recorded `transitions` on PC list `list`: those of textures kept in step are noted
-/// for when the list is submitted.
-pub fn note_transitions(list: usize, transitions: &[Transition]) {
+/// Capture the transitions of textures currently kept in step while a physical segment records.
+pub(super) fn capture_transitions(transitions: &[(usize, u32, D3D12_RESOURCE_STATES)]) -> Vec<Transition> {
     if !any() || transitions.is_empty() {
-        return;
+        return Vec::new();
     }
-    let kept: Vec<Transition> = {
-        let t = TEXTURES.lock().unwrap();
-        transitions.iter().filter(|(r, _, _)| t.by_res.contains_key(r) || t.shadowed.contains_key(r)).copied().collect()
-    };
-    if !kept.is_empty() {
-        LIST_NOTES.lock().unwrap().entry(list).or_default().extend(kept);
-    }
-}
-
-/// PC list `list` starts a new recording (made, reset, released): its noted transitions go.
-pub fn list_reset(list: usize) {
-    let mut g = LIST_NOTES.lock().unwrap();
-    if !g.is_empty() {
-        g.remove(&list);
-    }
-}
-
-/// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
-/// states their transitions leave them in.
-pub fn submitted(lists: &[*mut c_void]) {
-    let notes: Vec<Transition> = {
-        let g = LIST_NOTES.lock().unwrap();
-        if g.is_empty() {
-            return;
-        }
-        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect()
-    };
-    if notes.is_empty() {
-        return;
-    }
-    let mut t = TEXTURES.lock().unwrap();
-    for (res, sub, after) in notes {
-        if let Some(e) = t.get_mut(res) {
-            let n = subresource_count(&e.tex);
-            apply_transition(&mut e.states, n, sub, after);
-        }
-    }
+    let t = TEXTURES.lock().unwrap();
+    transitions
+        .iter()
+        .filter_map(|&(res, subresource, after)| {
+            let e = t.by_res.get(&res).or_else(|| t.shadowed.get(&res))?;
+            Some(Transition { res, generation: e.generation, subresource, after })
+        })
+        .collect()
 }
 
 /// Subresources of a texture kept in step (as `subresources` makes them).
 fn subresource_count(tex: &xg::Texture) -> usize {
     tex.texels().map_or(1, |s| s.array as usize * s.chain.levels.len())
+}
+
+/// Apply one writer to all subresources or one known subresource. The representation mirrors
+/// `states`: one value while uniform, one per subresource while they differ.
+fn apply_gpu_writer(writers: &mut Vec<Option<GpuWriter>>, n: usize, sub: u32, writer: GpuWriter) {
+    if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || (n <= 1 && sub == 0) {
+        *writers = vec![Some(writer)];
+        return;
+    }
+    let k = sub as usize;
+    if writers.is_empty() {
+        *writers = vec![None; n];
+    } else if writers.len() != n {
+        *writers = vec![writers[0]; n];
+    }
+    writers[k] = Some(writer);
+    if writers.iter().all(|&w| w == Some(writer)) {
+        writers.truncate(1);
+    }
 }
 
 /// `states` (one for all `n` subresources, or one each) after a transition of subresource `sub`
@@ -659,7 +834,35 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
+fn watched_texture_span(src: usize, bytes: u64) -> Option<(usize, usize)> {
+    let bytes = usize::try_from(bytes).ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    let end = src.checked_add(bytes)?.checked_add(0xFFF)? & !0xFFF;
+    Some((src & !0xFFF, end))
+}
+
+#[inline(always)]
+fn texture_needs_upload(
+    cpu_backed: bool,
+    pending: bool,
+    gpu_written: bool,
+    dirty_overlap: impl FnOnce() -> bool,
+) -> bool {
+    if !cpu_backed {
+        return false;
+    }
+    if pending {
+        return true;
+    }
+    if gpu_written {
+        return false;
+    }
+    dirty_overlap()
+}
+
+fn cached_watch_ranges(u: &crate::gpu::uma::Uma, measure: bool) -> Arc<WatchRanges> {
     let key = (
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
@@ -677,9 +880,20 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES
+        .lock()
+        .unwrap()
+        .by_res
+        .values()
+        .filter(|e| e.cpu_backed)
+        .filter_map(|e| watched_texture_span(e.src, e.tex.size()))
+        .collect();
     wanted.extend(super::sparse::mapped_ranges());
-    let computed = Arc::new(watch_ranges(&regions, wanted));
+    let exact = measure.then(|| plan_watch_ranges(&regions, wanted.clone(), usize::MAX));
+    let ranges = watch_ranges(&regions, wanted);
+    let wanted_bytes = exact.as_ref().map_or(0, |exact| exact.iter().fold(0usize, |bytes, &(_, n)| bytes.saturating_add(n)));
+    let scanned_bytes = ranges.iter().fold(0usize, |bytes, &(_, n)| bytes.saturating_add(n));
+    let computed = Arc::new(WatchRanges { ranges, wanted_bytes, excess_bytes: scanned_bytes.saturating_sub(wanted_bytes) });
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -699,45 +913,97 @@ pub(super) fn is_own_work() -> bool {
 
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
 /// uploaded again.
-pub(super) unsafe fn refresh(queue: *mut c_void) {
+pub(super) unsafe fn refresh(queue: *mut c_void) -> super::sparse::PreparationOutcome {
     // the uploads' own ExecuteCommandLists come back here
     if BUSY.with(|b| b.get()) {
-        return;
+        return super::sparse::PreparationOutcome::Ready;
     }
+    let measure = super::memory_report::enabled();
+    let wait_t0 = measure.then(std::time::Instant::now);
     let _refresh = REFRESH.lock().unwrap();
-    own_work(|| refresh_once(queue));
+    let active_t0 = measure.then(std::time::Instant::now);
+    let mut look = measure.then(super::sparse::LookSample::default);
+    let outcome = own_work(|| refresh_once(queue, look.as_mut()));
+    if let (Some(wait_t0), Some(active_t0), Some(look)) = (wait_t0, active_t0, look) {
+        super::sparse::note_look(look, active_t0.elapsed(), active_t0.duration_since(wait_t0));
+    }
+    outcome
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
 /// (`page`: their size). A full `buf` goes on after the last page it reported: starting again at
 /// `base` walked the pages already reset each time (4 GiB with every page written: 105 ms a
 /// look, 47 ms going on).
-unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
-    let end = base + size;
+#[derive(Default)]
+struct WatchMeasurement {
+    calls: u64,
+    elapsed_ns: u64,
+}
+
+unsafe fn take_written(
+    base: usize,
+    size: usize,
+    buf: &mut [*mut c_void],
+    dirty: &mut Vec<usize>,
+    page: &mut u32,
+    mut measurement: Option<&mut WatchMeasurement>,
+) -> bool {
+    let Some(end) = base.checked_add(size) else { return false };
     let mut at = base;
     while at < end {
         let mut n = buf.len();
-        if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
-            break;
+        let started = measurement.as_ref().map(|_| std::time::Instant::now());
+        let result = GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page);
+        if let Some(m) = measurement.as_mut() {
+            m.calls += 1;
+            m.elapsed_ns = m.elapsed_ns.saturating_add(started.unwrap().elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        if result != 0 {
+            return false;
         }
         dirty.extend(buf[..n].iter().map(|&p| p as usize));
         if n == 0 || n < buf.len() {
             break;
         }
-        at = buf[n - 1] as usize + *page as usize;
+        let Some(next) = (buf[n - 1] as usize).checked_add(*page as usize) else { return false };
+        at = next;
+    }
+    true
+}
+
+fn note_watch_measurement(plan: &WatchRanges, measurement: &WatchMeasurement) {
+    static TOTALS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    let values = [
+        1,
+        plan.wanted_bytes as u64,
+        plan.excess_bytes as u64,
+        plan.ranges.len() as u64,
+        measurement.calls,
+        measurement.elapsed_ns,
+    ];
+    let mut totals = [0u64; 6];
+    for (i, value) in values.into_iter().enumerate() {
+        totals[i] = TOTALS[i].fetch_add(value, Ordering::Relaxed).saturating_add(value);
+    }
+    if totals[0].is_power_of_two() {
+        crate::xlog_info!(
+            "write-watch trace: {} looks, {} MB wanted + {} MB gaps, {} planned / {} actual calls, {} us in GetWriteWatch",
+            totals[0], totals[1] >> 20, totals[2] >> 20, totals[3], totals[4], totals[5] / 1000
+        );
     }
 }
 
-unsafe fn refresh_once(queue: *mut c_void) {
-    let Some(u) = crate::gpu::uma::get() else { return };
+unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::LookSample>) -> super::sparse::PreparationOutcome {
+    let Some(u) = crate::gpu::uma::get() else { return super::sparse::PreparationOutcome::Ready };
     let sparse = u.has_sparse();
-    if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
-        return;
+    if !sparse && CPU_TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
+        return super::sparse::PreparationOutcome::Ready;
     }
     recheck_gpu_view_sources();
-    let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
-    let ranges = cached_watch_ranges(u);
+    let ranges = cached_watch_ranges(u, look.is_some());
+    let watch_t0 = look.is_some().then(std::time::Instant::now);
+    let mut measurement = look.is_some().then(WatchMeasurement::default);
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -746,14 +1012,25 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            for &(base, size) in &ranges.ranges {
+                take_written(base, size, &mut buf, &mut dirty, &mut page, measurement.as_mut());
             }
         });
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    if let Some(measurement) = &measurement {
+        note_watch_measurement(&ranges, measurement);
+    }
+    if let (Some(sample), Some(watch_t0)) = (look.as_deref_mut(), watch_t0) {
+        super::sparse::note_watch(
+            sample,
+            watch_t0.elapsed(),
+            dirty_len,
+            ranges.ranges.iter().fold(0usize, |bytes, range| bytes.saturating_add(range.1)),
+            ranges.ranges.len(),
+        );
+    }
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -771,7 +1048,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             };
             let (mut with, mut without) = (0, 0);
             let mut shown = 0;
-            for e in t.by_res.values() {
+            for e in t.by_res.values().filter(|e| e.cpu_backed) {
                 let c = content(e);
                 if c > 0 { with += 1 } else { without += 1 }
                 if c > 0 && shown < 4 {
@@ -784,49 +1061,185 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        DIRTY_BUF.with(|dcell| {
+        let outcome = DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
-            super::sparse::before_execute(q, &dirty, page as usize);
-            super::vram::before_execute(q);
+            let mut outcome = super::sparse::PreparationOutcome::RetryRequired;
+            for _ in 0..3 {
+                outcome = super::sparse::before_execute(q, &dirty, page as usize, look.as_deref_mut());
+                if outcome != super::sparse::PreparationOutcome::RetryRequired {
+                    break;
+                }
+                super::real::stop_if_device_removed();
+                std::thread::yield_now();
+            }
+            outcome
         });
+        if outcome != super::sparse::PreparationOutcome::Ready {
+            return outcome;
+        }
+        super::vram::before_execute(q);
     }
     let recheck_frame = {
         let (p, b) = super::present::counters();
         p.max(b)
     };
-    recheck_streamed_unwatched(&ranges, recheck_frame);
+    recheck_streamed_unwatched(&ranges.ranges, recheck_frame);
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
-        return;
+        return super::sparse::PreparationOutcome::Ready;
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+    let measure_selection = look.is_some();
+    let (todo, selection_measurement): (Vec<(ID3D12Resource, Upload)>, _) = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
+        let wait_started = measure_selection.then(std::time::Instant::now);
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
+        let locked_at = wait_started.map(|_| std::time::Instant::now());
+        let (mut visited, mut dirty_tests, mut matches, mut retained) = (0usize, 0usize, 0usize, 0usize);
+        let mut todo = Vec::new();
+        for (&res, e) in &mut t.by_res {
+            if measure_selection {
+                visited += 1;
+            }
+            if measure_selection && e.cpu_backed && !e.pending && !e.gpu_written {
+                dirty_tests += 1;
+            }
+            let selected = texture_needs_upload(
+                e.cpu_backed,
+                e.pending,
+                e.gpu_written,
+                || {
+                    let i = dirty.partition_point(|&p| p + page as usize <= e.src);
+                    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                },
+            );
+            if !selected {
+                continue;
+            }
+            if measure_selection {
+                matches += 1;
+            }
+            if e.pending {
+                e.pending = false;
+                PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+            let p = res as *mut c_void;
+            if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
+                todo.push((r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), e.generation)));
+                if measure_selection {
+                    retained += 1;
                 }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
-                }
-                let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
-            })
-            .collect()
+            }
+        }
+        drop(t);
+        let finished_at = locked_at.map(|_| std::time::Instant::now());
+        let measurement = wait_started.zip(locked_at).zip(finished_at).map(|((started, locked), finished)| {
+            (locked.duration_since(started), finished.duration_since(locked), visited, dirty_tests, matches, retained)
+        });
+        (todo, measurement)
     });
-    seed_stream_recheck(&todo, &ranges, recheck_frame);
-    upload_all(todo);
+    if let (Some(sample), Some((wait, hold, visited, dirty_tests, matches, retained))) = (look.as_deref_mut(), selection_measurement) {
+        super::sparse::note_texture_selection(sample, wait, hold, visited, dirty_tests, matches, retained);
+    }
+    seed_stream_recheck(&todo, &ranges.ranges, recheck_frame);
+    upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
+    super::sparse::PreparationOutcome::Ready
+}
+
+#[cfg(feature = "texture-selection-bench")]
+#[derive(Clone, Copy)]
+pub enum TextureSelectionScenario {
+    Empty,
+    SparsePending,
+    AllPending,
+    AllGpuWritten,
+    OneDirty,
+    SparseDirty,
+    DenseDirty,
+    MixedAliases,
+}
+
+#[cfg(feature = "texture-selection-bench")]
+struct TextureSelectionBenchEntry {
+    src: usize,
+    size: usize,
+    cpu_backed: bool,
+    pending: bool,
+    gpu_written: bool,
+}
+
+/// CPU-only model of the exact selection predicate and table lock. It deliberately excludes COM
+/// retention and uploads: the benchmark separates scan/convoy cost from those Windows operations.
+#[cfg(feature = "texture-selection-bench")]
+pub struct TextureSelectionBench {
+    entries: Mutex<BTreeMap<usize, TextureSelectionBenchEntry>>,
+    dirty: Vec<usize>,
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "texture-selection-bench")]
+impl TextureSelectionBench {
+    const PAGE: usize = 0x1000;
+
+    pub fn new(count: usize, scenario: TextureSelectionScenario) -> Self {
+        let base = 0x1000_0000usize;
+        let mut entries = BTreeMap::new();
+        let mut pending = 0;
+        for i in 0..count {
+            let aliased = matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 16 == 1;
+            let alias_group = i - aliased as usize;
+            let src = base + alias_group * 2 * Self::PAGE;
+            let cpu_backed = !matches!(scenario, TextureSelectionScenario::MixedAliases) || i % 8 != 4;
+            let is_pending = matches!(scenario, TextureSelectionScenario::AllPending)
+                || matches!(scenario, TextureSelectionScenario::SparsePending) && i % 64 == 0
+                || matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 127 == 0;
+            let gpu_written = matches!(scenario, TextureSelectionScenario::AllGpuWritten)
+                || matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 11 == 0;
+            pending += is_pending as usize;
+            entries.insert(i + 1, TextureSelectionBenchEntry {
+                src,
+                size: Self::PAGE + (alias_group % 3) * Self::PAGE,
+                cpu_backed,
+                pending: is_pending,
+                gpu_written,
+            });
+        }
+        let pages = match scenario {
+            TextureSelectionScenario::Empty | TextureSelectionScenario::SparsePending | TextureSelectionScenario::AllPending => 0,
+            TextureSelectionScenario::OneDirty => 1,
+            TextureSelectionScenario::AllGpuWritten | TextureSelectionScenario::SparseDirty | TextureSelectionScenario::MixedAliases => 64,
+            TextureSelectionScenario::DenseDirty => 4096,
+        };
+        let stride = if matches!(scenario, TextureSelectionScenario::DenseDirty) { 1 } else { 31 };
+        let mut dirty: Vec<_> = (0..pages).map(|i| base + i * stride * Self::PAGE).collect();
+        dirty.sort_unstable();
+        Self { entries: Mutex::new(entries), dirty, pending: std::sync::atomic::AtomicUsize::new(pending) }
+    }
+
+    #[inline(never)]
+    pub fn scan(&self) -> (usize, usize) {
+        if self.dirty.is_empty() && self.pending.load(Ordering::Relaxed) == 0 {
+            return (0, 0);
+        }
+        let entries = self.entries.lock().unwrap();
+        let mut matches = 0usize;
+        let mut checksum = 0usize;
+        for (&resource, entry) in entries.iter() {
+            if texture_needs_upload(
+                entry.cpu_backed,
+                entry.pending,
+                entry.gpu_written,
+                || {
+                    let i = self.dirty.partition_point(|&p| p + Self::PAGE <= entry.src);
+                    self.dirty.get(i).is_some_and(|&p| p < entry.src + entry.size)
+                },
+            ) {
+                matches += 1;
+                checksum ^= resource;
+            }
+        }
+        (matches, checksum)
+    }
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -943,7 +1356,7 @@ unsafe fn seed_stream_recheck(todo: &[(ID3D12Resource, Upload)], watched: &[(usi
         return;
     }
     let mut seeded = Vec::new();
-    for (r, (_, src, tex, _)) in todo {
+    for (r, (_, src, tex, _, _)) in todo {
         let size = tex.size() as usize;
         if size == 0 || range_is_fully_watched(*src, size, watched) {
             continue;
@@ -1086,8 +1499,146 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
             && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
 }
 
+struct QueueUploads {
+    fence: ID3D12Fence,
+    value: u64,
+    in_flight: std::collections::VecDeque<(u64, texture::InFlight)>,
+    bytes: u64,
+}
+
+unsafe impl Send for QueueUploads {}
+
+type QueueUploadState = Arc<Mutex<Option<QueueUploads>>>;
+
+/// Queue-local serialization for upload retirement. The registry is held only long enough to
+/// acquire a strong state lease; driver calls and waits on one title queue do not block another.
+static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploadState>> = Mutex::new(BTreeMap::new());
+
+fn queue_upload_state(key: usize) -> QueueUploadState {
+    Arc::clone(
+        ON_QUEUE
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None))),
+    )
+}
+
+/// Drop completed uploads cached for a retired title queue after releasing the cache lock.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let gone = ON_QUEUE.lock().unwrap().remove(&id.raw());
+    drop(gone);
+}
+
+const IN_FLIGHT_BYTES: u64 = 512 << 20;
+
+unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
+    let q = title?;
+    if !super::present::queue_accepts_internal_work(q.as_raw() as usize) {
+        return None;
+    }
+    if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return None;
+    }
+    let mut qd: Option<ID3D12Device> = None;
+    q.GetDevice(&mut qd).ok()?;
+    (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
+}
+
+unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) -> Vec<texture::InFlight> {
+    let mut retired = Vec::new();
+    let done = q.fence.GetCompletedValue();
+    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+        retired.push(f);
+    }
+    while q.bytes > cap {
+        let Some(&(v, _)) = q.in_flight.front() else { break };
+        if crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err() {
+            break;
+        }
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+        retired.push(f);
+    }
+    retired
+}
+
+unsafe fn submit_on_title_queue(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    batch: &[texture::UploadBatchItem],
+    zero_mips: &[Vec<bool>],
+) -> Result<Vec<(usize, String)>, String> {
+    // The textures' tile mappings made since the title queue last waited for them (a texture
+    // made on another thread after `refresh_once`'s wait, or its levels mapped just now by
+    // `map_levels_with_texels`): a copy into a tile still unmapped is a copy-engine page fault
+    // on NVIDIA (`DmaPageFaultWrite`), as the upload queue's own path already waits for.
+    super::vram::before_execute(queue);
+    let (failed, f) = texture::submit_batch_with_zero_mips(dev, queue, batch, zero_mips)?;
+    let Some(f) = f else { return Ok(failed) };
+    let key = queue.as_raw() as usize;
+    let state = queue_upload_state(key);
+    let mut slot = state.lock().unwrap();
+    if slot.is_none() {
+        match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+            Ok(fence) => {
+                *slot = Some(QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+            }
+            Err(e) => {
+                drop(slot);
+                texture::drop_after_wait(f, texture::wait(dev, queue))?;
+                return Err(e.to_string());
+            }
+        }
+    }
+    let q = slot.as_mut().unwrap();
+    q.value += 1;
+    if let Err(e) = super::real::native_queue_signal(queue, &q.fence, q.value) {
+        q.value -= 1;
+        drop(slot);
+        texture::drop_after_wait(f, texture::wait(dev, queue))?;
+        return Err(e.to_string());
+    }
+    q.bytes += f.bytes;
+    let v = q.value;
+    q.in_flight.push_back((v, f));
+    let retired = reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    drop(slot);
+    drop(retired);
+    Ok(failed)
+}
+
+/// A preparation worker failed before this exact batch could be submitted. A texture still at the
+/// captured registration generation is made pending again; a replacement, removal, GPU writer, or
+/// non-CPU-backed entry owns its own state and must not be changed by the stale work item.
+fn requeue_failed_preparation(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, u64)]) {
+    let keys: Vec<_> = picked.iter().map(|(resource, _, _, _, generation)| (resource.as_raw() as usize, *generation)).collect();
+    let mut table = TEXTURES.lock().unwrap();
+    let added = requeue_generations(&mut table, &keys);
+    if !added.is_empty() {
+        PENDING.fetch_add(added.len(), Ordering::Relaxed);
+    }
+    drop(table);
+    let mut content = LAST_CONTENT.lock().unwrap();
+    for resource in added { content.remove(&resource); }
+}
+
+fn requeue_generations(table: &mut Table, keys: &[(usize, u64)]) -> Vec<usize> {
+    let mut added = Vec::new();
+    for &(resource, generation) in keys {
+        let Some(entry) = table.by_res.get_mut(&resource) else { continue };
+        if entry.generation == generation && entry.cpu_backed && !entry.gpu_written && !entry.pending {
+            entry.pending = true;
+            added.push(resource);
+        }
+    }
+    added
+}
+
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1099,11 +1650,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
+        while let Some((_, (dev, _, tex, _, _))) = todo.peek() {
             if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            let (r, (dev, va, tex, states, generation)) = todo.next().unwrap();
             // The same bytes as at this texture's last upload: nothing to do. The write watch is
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
@@ -1120,25 +1671,43 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             device = dev;
             bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
+            picked.push((r, va, tex, states, generation));
         }
         if picked.is_empty() {
             continue;
         }
-        let subs = subresources_of_all(&picked, bytes);
+        let Some(subs) = subresources_of_all(&picked, bytes) else {
+            requeue_failed_preparation(&picked);
+            warn("a texture preparation worker stopped; the batch will be retried");
+            continue;
+        };
         let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
+        let mut zero_mips = Vec::new();
+        let level_pages = super::vram::level_pages();
+        for ((r, va, _, states, _), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
-            if super::vram::level_pages() {
+            if level_pages {
                 // (the queue waits for these mappings before the copies: `vram::before_execute` below)
-                map_levels_with_texels(&r, &subs);
+                zero_mips.push(map_levels_with_texels(&r, &subs));
             }
             batch.push((r, subs, states));
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        if let Some(tq) = title_queue_for(dev, title) {
+            match own_work(|| submit_on_title_queue(dev, &tq, &batch, &zero_mips)) {
+                Ok(failed) => {
+                    for (_, e) in failed {
+                        warn(&e);
+                    }
+                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => warn(&e),
+            }
+            continue;
+        }
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
@@ -1148,7 +1717,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         };
         match own_work(|| {
             super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
+            texture::upload_batch_with_zero_mips(dev, &queue, &batch, &zero_mips)
         }) {
             Ok(failed) => {
                 for (_, e) in failed {
@@ -1163,17 +1732,18 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
 
 /// (`vram::level_pages`) Before an upload of title texture `r`: its levels with texels in `subs`
 /// (its subresources as they go up) get their video memory pages if they have none - a texture
-/// placed with lazy levels; any other: nothing to do. A level of zeros has no texels: a streamed
-/// texture's larger levels before the title has memory behind them (read as zeros,
-/// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
-/// to tiles that are not mapped, which drops it (tiled resources tier 2).
-unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
+/// placed with lazy levels. Return a mask of zero levels so their copies can share staging.
+/// A level of zeros needs no new pages. Its copy still clears any existing tiles, including a
+/// previously streamed level or tiles mapped for other levels in the same packed tail.
+unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Vec<bool> {
     if !super::vram::has_lazy_levels(r.as_raw() as usize) {
-        return;
+        return Vec::new();
     }
     // (one slice: its subresources are its levels)
-    let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
+    let zero: Vec<bool> = subs.iter().map(|s| all_zero(&s.data)).collect();
+    let present: Vec<u32> = zero.iter().enumerate().filter_map(|(i, &zero)| (!zero).then_some(i as u32)).collect();
     super::vram::map_levels(r, Some(&present));
+    zero
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
@@ -1260,7 +1830,8 @@ pub unsafe fn probe_gpu_content(res: usize) {
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
         list.Close().map_err(|e| e.to_string())?;
-        queue.ExecuteCommandLists(&[Some(list.cast().map_err(|e| e.to_string())?)]);
+        let list = list.cast().map_err(|e| e.to_string())?;
+        super::real::native_queue_execute(&queue, &list);
         texture::wait(dev, &queue)?;
         let mut p: *mut c_void = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut p)).map_err(|e| e.to_string())?;
@@ -1308,11 +1879,75 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 }
 
 /// Ranges closer than this are scanned as one. A write-watch call costs ~3.5 µs however little it
-/// covers, while one call over 2 GiB of committed pages takes ~1.3 ms (measured on Windows 11): a
-/// retail game's intro video had its submitting thread at 42 % in GetWriteWatch with a 1 MiB gap
-/// (thousands of calls before each submit over its mapped sparse tiles). The pages of a gap are
-/// reported as written too; the uploads keep to what they track.
-const WATCH_GAP: usize = 64 << 20;
+/// covers, while 2 GiB of committed pages took 0.8–1.3 ms on Windows 11: an extra call breaks even
+/// with scanning roughly 5–9 MiB of gap. Eight MiB still joins the 1 MiB-spaced sparse ranges that
+/// otherwise made thousands of calls per submit, without scanning up to 64 MiB of unrelated pages
+/// between ranges. Gap pages may be reported too; uploads still keep to the ranges they track.
+const WATCH_GAP: usize = 8 << 20;
+
+#[derive(Clone, Copy)]
+struct WatchSpan {
+    region: usize,
+    start: usize,
+    end: usize,
+}
+
+/// Clip `wanted` to exact overlap/adjacent spans in the disjoint allocations `regions`, then bridge
+/// the smallest gaps toward `target_calls`. This is best effort: allocations are never bridged, so
+/// the result has at least one call per touched allocation. Invalid or overflowing allocations are
+/// ignored. Production keeps using `watch_ranges` until a Windows measurement establishes a target.
+fn plan_watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>, target_calls: usize) -> Vec<(usize, usize)> {
+    wanted.sort_unstable();
+    let mut normalized = Vec::<(usize, usize)>::new();
+    for (start, end) in wanted {
+        if start >= end {
+            continue;
+        }
+        match normalized.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => normalized.push((start, end)),
+        }
+    }
+    let mut exact = Vec::<WatchSpan>::new();
+    for (region, &(base, size)) in regions.iter().enumerate() {
+        let Some(end) = base.checked_add(size).filter(|&end| end > base) else { continue };
+        let first = normalized.partition_point(|&(_, b)| b <= base);
+        for &(a, b) in normalized[first..].iter().take_while(|&&(a, _)| a < end) {
+            let (start, stop) = (a.max(base), b.min(end));
+            if start >= stop {
+                continue;
+            }
+            match exact.last_mut() {
+                Some(last) if last.region == region && start <= last.end => last.end = last.end.max(stop),
+                _ => exact.push(WatchSpan { region, start, end: stop }),
+            }
+        }
+    }
+    if exact.len() > target_calls {
+        let mut gaps: Vec<(usize, usize, usize)> = exact
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair[0].region == pair[1].region)
+            .map(|(i, pair)| (pair[1].start - pair[0].end, pair[0].start, i))
+            .collect();
+        gaps.sort_unstable();
+        let bridge_count = gaps.len().min(exact.len() - target_calls);
+        let mut bridge = vec![false; exact.len().saturating_sub(1)];
+        for &(_, _, i) in &gaps[..bridge_count] {
+            bridge[i] = true;
+        }
+        let mut coalesced = Vec::<WatchSpan>::new();
+        for (i, span) in exact.into_iter().enumerate() {
+            match coalesced.last_mut() {
+                Some(last) if bridge[i - 1] => last.end = span.end,
+                _ => coalesced.push(span),
+            }
+        }
+        exact = coalesced;
+    }
+    exact.sort_unstable_by_key(|s| (s.start, s.end));
+    exact.into_iter().map(|s| (s.start, s.end - s.start)).collect()
+}
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -1438,16 +2073,94 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
 const PARALLEL_BYTES: usize = 1 << 20;
 
+struct DetileJob {
+    index: usize,
+    va: usize,
+    tex: Arc<xg::Texture>,
+    done: std::sync::mpsc::Sender<(usize, Option<Vec<Subresource>>)>,
+}
+
+struct DetilePool {
+    jobs: std::sync::mpsc::Sender<DetileJob>,
+    workers: usize,
+}
+
+fn detile_pool() -> &'static DetilePool {
+    static POOL: std::sync::OnceLock<DetilePool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let wanted = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8);
+        let (jobs, receive) = std::sync::mpsc::channel::<DetileJob>();
+        let receive = Arc::new(Mutex::new(receive));
+        let mut workers = 0;
+        for k in 0..wanted {
+            let receive = Arc::clone(&receive);
+            let made = std::thread::Builder::new().name(format!("xcl-detile-{k}")).spawn(move || loop {
+                let job = {
+                    let receive = receive.lock().unwrap_or_else(|e| e.into_inner());
+                    receive.recv()
+                };
+                let Ok(job) = job else { break };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    subresources(job.va, &job.tex)
+                }))
+                .ok();
+                let _ = job.done.send((job.index, result));
+            });
+            if made.is_ok() {
+                workers += 1;
+            }
+        }
+        DetilePool { jobs, workers }
+    })
+}
+
 /// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
-/// when the batch is big. They were read and detiled one after another in the title's own
-/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
-    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
-    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
-    subresources_on(&picked, threads)
+/// when the batch is big. Process-lifetime workers avoid creating and joining up to eight OS
+/// threads in every title submit. None means a worker or its queue stopped; the caller retries the
+/// exact registration generation rather than uploading an incomplete texture.
+unsafe fn subresources_of_all(
+    picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, u64)],
+    bytes: usize,
+) -> Option<Vec<Vec<Subresource>>> {
+    let work: Vec<_> = picked.iter().map(|(_, va, tex, _, _)| (*va, Arc::clone(tex))).collect();
+    pooled_subresources(&work, bytes)
+}
+
+unsafe fn pooled_subresources(picked: &[(usize, Arc<xg::Texture>)], bytes: usize) -> Option<Vec<Vec<Subresource>>> {
+    if bytes < PARALLEL_BYTES || picked.len() <= 1 {
+        return Some(picked.iter().map(|(va, tex)| subresources(*va, tex)).collect());
+    }
+    let pool = detile_pool();
+    if pool.workers == 0 {
+        return None;
+    }
+    let (done, results) = std::sync::mpsc::channel();
+    for (index, (va, tex)) in picked.iter().enumerate() {
+        if pool.jobs.send(DetileJob { index, va: *va, tex: Arc::clone(tex), done: done.clone() }).is_err() {
+            return None;
+        }
+    }
+    drop(done);
+    ordered_subresources(picked.len(), results)
+}
+
+fn ordered_subresources(
+    count: usize,
+    results: impl IntoIterator<Item = (usize, Option<Vec<Subresource>>)>,
+) -> Option<Vec<Vec<Subresource>>> {
+    let mut out: Vec<Option<Vec<Subresource>>> = (0..count).map(|_| None).collect();
+    let mut failed = false;
+    for (index, result) in results {
+        match (out.get_mut(index), result) {
+            (Some(slot), Some(result)) if slot.is_none() => *slot = Some(result),
+            _ => failed = true,
+        }
+    }
+    (!failed).then(|| out.into_iter().collect()).flatten()
 }
 
 /// `subresources` of each (address, texture), in order, on up to `threads` threads.
+#[cfg(test)]
 unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
     let threads = threads.min(picked.len());
     if threads <= 1 {
@@ -1534,10 +2247,846 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     out
 }
 
+/// The bounded part of a mapped D3D12 readback buffer which holds one subresource.
+/// `width`, `height`, and `depth` are texels (not format blocks); `size` bounds all reads.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Stage 3 seam; queue/readback activation is a later change.
+pub(super) struct ReadbackFootprint {
+    pub offset: usize,
+    pub size: usize,
+    pub row_pitch: usize,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub format: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Stage 3 seam; queue/readback activation is a later change.
+pub(super) enum ReverseLayoutError {
+    UnsupportedLayout,
+    Format,
+    Subresource,
+    Dimensions,
+    RowPitch,
+    Footprint,
+    Destination,
+}
+
+/// Put one exact PC readback footprint back into its XG-tiled subresource. This is deliberately
+/// pure: callers own both byte slices, and no resource, queue, title address, or COM object is
+/// touched. Metadata planes and format conversions are not reconstructible and fail closed.
+#[allow(dead_code)] // Stage 3 seam; queue/readback activation is a later change.
+pub(super) fn reverse_layout_subresource(
+    tex: &xg::Texture,
+    format: u32,
+    subresource: u32,
+    footprint: ReadbackFootprint,
+    readback: &[u8],
+    console: &mut [u8],
+) -> Result<(), ReverseLayoutError> {
+    if tex.main != 0 || tex.planes.len() != 1 {
+        return Err(ReverseLayoutError::UnsupportedLayout);
+    }
+    let (surface, plane_offset) = tex.plane_surface(0).ok_or(ReverseLayoutError::UnsupportedLayout)?;
+    let (elem_log2, side) = xg::element(format).ok_or(ReverseLayoutError::Format)?;
+    if footprint.format != format || surface.bpe != 1u32 << elem_log2 || surface.side != side {
+        return Err(ReverseLayoutError::Format);
+    }
+    let mips = surface.chain.levels.len();
+    let (mip, slice) = if surface.depth > 0 {
+        let mip = usize::try_from(subresource).map_err(|_| ReverseLayoutError::Subresource)?;
+        if mip >= mips {
+            return Err(ReverseLayoutError::Subresource);
+        }
+        (mip, None)
+    } else {
+        let total = mips.checked_mul(surface.array as usize).ok_or(ReverseLayoutError::Subresource)?;
+        let sub = usize::try_from(subresource).map_err(|_| ReverseLayoutError::Subresource)?;
+        if sub >= total {
+            return Err(ReverseLayoutError::Subresource);
+        }
+        (sub % mips, Some(sub / mips))
+    };
+    let level = &surface.chain.levels[mip];
+    let width = (surface.width >> mip).max(1);
+    let height = (surface.height >> mip).max(1);
+    let depth = if surface.depth > 0 { (surface.depth >> mip).max(1) } else { 1 };
+    if footprint.width != width || footprint.height != height || footprint.depth != depth {
+        return Err(ReverseLayoutError::Dimensions);
+    }
+    let row_bytes = level.width.checked_mul(surface.bpe as usize).ok_or(ReverseLayoutError::Footprint)?;
+    if level.width != (width as usize).div_ceil(side as usize)
+        || level.height != (height as usize).div_ceil(side as usize)
+        || level.depth != depth as usize
+    {
+        return Err(ReverseLayoutError::UnsupportedLayout);
+    }
+    if footprint.row_pitch < row_bytes || footprint.row_pitch % 256 != 0 || footprint.offset % 512 != 0 {
+        return Err(ReverseLayoutError::RowPitch);
+    }
+    let slice_pitch = footprint.row_pitch.checked_mul(level.height).ok_or(ReverseLayoutError::Footprint)?;
+    let last_slice = slice_pitch.checked_mul(level.depth.saturating_sub(1)).ok_or(ReverseLayoutError::Footprint)?;
+    let last_row = footprint.row_pitch.checked_mul(level.height.saturating_sub(1)).ok_or(ReverseLayoutError::Footprint)?;
+    let used = last_slice.checked_add(last_row).and_then(|n| n.checked_add(row_bytes)).ok_or(ReverseLayoutError::Footprint)?;
+    let footprint_end = footprint.offset.checked_add(footprint.size).ok_or(ReverseLayoutError::Footprint)?;
+    if used > footprint.size || footprint_end > readback.len() {
+        return Err(ReverseLayoutError::Footprint);
+    }
+    let console_size = usize::try_from(tex.size()).map_err(|_| ReverseLayoutError::Destination)?;
+    if console.len() < console_size {
+        return Err(ReverseLayoutError::Destination);
+    }
+    let linear_size = row_bytes
+        .checked_mul(level.height)
+        .and_then(|n| n.checked_mul(level.depth))
+        .ok_or(ReverseLayoutError::Footprint)?;
+    let mut linear = Vec::new();
+    linear.try_reserve_exact(linear_size).map_err(|_| ReverseLayoutError::Footprint)?;
+    linear.resize(linear_size, 0);
+    for z in 0..level.depth {
+        for y in 0..level.height {
+            let from = footprint.offset + z * slice_pitch + y * footprint.row_pitch;
+            let to = (z * level.height + y) * row_bytes;
+            linear[to..to + row_bytes].copy_from_slice(&readback[from..from + row_bytes]);
+        }
+    }
+    let plane_at = usize::try_from(plane_offset).map_err(|_| ReverseLayoutError::Destination)?;
+    if let Some(slice) = slice {
+        let at = plane_at
+            .checked_add(slice.checked_mul(surface.chain.slice_bytes).ok_or(ReverseLayoutError::Destination)?)
+            .ok_or(ReverseLayoutError::Destination)?;
+        let end = at.checked_add(surface.chain.slice_bytes).ok_or(ReverseLayoutError::Destination)?;
+        let dst = console.get_mut(at..end).ok_or(ReverseLayoutError::Destination)?;
+        surface.chain.tile_level(dst, mip, slice, &linear);
+    } else {
+        let bytes = usize::try_from(surface.size()).map_err(|_| ReverseLayoutError::Destination)?;
+        let end = plane_at.checked_add(bytes).ok_or(ReverseLayoutError::Destination)?;
+        let dst = console.get_mut(plane_at..end).ok_or(ReverseLayoutError::Destination)?;
+        surface.chain.tile_volume(dst, mip, &linear);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(super) struct DownloadSubresource {
+    pub subresource: u32,
+    pub state: D3D12_RESOURCE_STATES,
+    pub footprint: ReadbackFootprint,
+}
+
+/// Validate driver footprints against the immutable XG layout and explicit tracked states.
+/// The driver may add only the required D3D row/placement alignment, never enlarge the work.
+fn validate_download_layout(
+    tex: &xg::Texture,
+    desc: &D3D12_RESOURCE_DESC,
+    format: u32,
+    selected: &[(u32, D3D12_RESOURCE_STATES)],
+    driver: &[(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)],
+) -> Result<(Vec<DownloadSubresource>, usize), String> {
+    let surface = tex.texels().ok_or("no texel surface")?;
+    let (elem_log2, side) = xg::element(format).ok_or("unsupported texture format")?;
+    if tex.main != 0
+        || tex.planes.len() != 1
+        || surface.bpe != 1u32 << elem_log2
+        || surface.side != side
+        || desc.Dimension.0 as u32 != tex.dimension()
+        || desc.SampleDesc.Count != 1
+        || desc.SampleDesc.Quality != 0
+        || desc.Format.0 as u32 != format
+    {
+        return Err("unsupported metadata, samples, or format conversion".into());
+    }
+    let mips = surface.chain.levels.len();
+    let layers = if surface.depth > 0 { surface.depth } else { surface.array };
+    if desc.Width != surface.width as u64
+        || desc.Height != surface.height
+        || desc.DepthOrArraySize as u32 != layers
+        || desc.MipLevels as usize != mips
+        || selected.is_empty()
+        || selected.len() != driver.len()
+    {
+        return Err("resource shape or selection differs from the retained layout".into());
+    }
+    let subresources = if surface.depth > 0 { mips } else { mips.checked_mul(surface.array as usize).ok_or("subresource count overflow")? };
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(subresources).map_err(|_| "cannot allocate download selection")?;
+    seen.resize(subresources, false);
+    let mut out = Vec::new();
+    out.try_reserve_exact(selected.len()).map_err(|_| "cannot allocate download layout")?;
+    let mut total = 0usize;
+    for (&(subresource, state), &(placed, rows, driver_row_bytes)) in selected.iter().zip(driver) {
+        if state.0 < 0 {
+            return Err("invalid tracked resource state".into());
+        }
+        let sub = subresource as usize;
+        let (mip, depth) = if surface.depth > 0 {
+            if sub >= mips { return Err("subresource out of range".into()) }
+            (sub, (surface.depth >> sub).max(1))
+        } else {
+            let count = mips.checked_mul(surface.array as usize).ok_or("subresource count overflow")?;
+            if sub >= count { return Err("subresource out of range".into()) }
+            (sub % mips, 1)
+        };
+        if std::mem::replace(&mut seen[sub], true) { return Err("duplicate subresource".into()) }
+        let level = &surface.chain.levels[mip];
+        let width = (surface.width >> mip).max(1);
+        let height = (surface.height >> mip).max(1);
+        let row_bytes = level.width.checked_mul(surface.bpe as usize).ok_or("row size overflow")?;
+        let expected_pitch = row_bytes.checked_next_multiple_of(256).ok_or("row pitch overflow")?;
+        let expected_offset = total.checked_next_multiple_of(512).ok_or("footprint offset overflow")?;
+        if placed.Offset != expected_offset as u64
+            || placed.Footprint.Format.0 as u32 != format
+            || placed.Footprint.Width != width
+            || placed.Footprint.Height != height
+            || placed.Footprint.Depth != depth
+            || placed.Footprint.RowPitch as usize != expected_pitch
+            || rows as usize != level.height
+            || driver_row_bytes != row_bytes as u64
+            || level.depth != depth as usize
+        {
+            return Err("driver footprint differs from the exact subresource".into());
+        }
+        let slice_pitch = expected_pitch.checked_mul(level.height).ok_or("slice pitch overflow")?;
+        let used = slice_pitch
+            .checked_mul(level.depth.saturating_sub(1))
+            .and_then(|n| n.checked_add(expected_pitch.checked_mul(level.height.saturating_sub(1))?))
+            .and_then(|n| n.checked_add(row_bytes))
+            .ok_or("footprint size overflow")?;
+        total = expected_offset.checked_add(used).ok_or("download size overflow")?;
+        out.push(DownloadSubresource {
+            subresource,
+            state,
+            footprint: ReadbackFootprint { offset: expected_offset, size: used, row_pitch: expected_pitch, width, height, depth, format },
+        });
+    }
+    Ok((out, total))
+}
+
+struct DownloadObjects {
+    _source: ID3D12Resource,
+    readback: ID3D12Resource,
+    _allocator: ID3D12CommandAllocator,
+    list: ID3D12CommandList,
+    _queue: ID3D12CommandQueue,
+    _fence_hold: ID3D12Fence,
+}
+
+/// A closed command list and every object it may reference. The caller must hold its state/order
+/// serialization from the supplied state snapshot until `submit` inserts this list immediately
+/// after the writers represented by that snapshot; otherwise the recorded barriers are stale.
+#[allow(dead_code)]
+pub(super) struct TextureDownloadPlan {
+    device: ID3D12Device,
+    queue_type: D3D12_COMMAND_LIST_TYPE,
+    tex: Arc<xg::Texture>,
+    source: ID3D12Resource,
+    readback: ID3D12Resource,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12CommandList,
+    fence: ID3D12Fence,
+    footprints: Vec<DownloadSubresource>,
+    bytes: usize,
+}
+
+#[allow(dead_code)]
+pub(super) struct SubmittedDownload {
+    pub ticket: PendingDownload,
+    /// `Some` means Execute had no reportable result and the following Signal failed. The ticket
+    /// can never be mapped and deliberately retains/leaks its objects rather than releasing them.
+    pub signal_error: Option<String>,
+}
+
+#[allow(dead_code)]
+pub(super) struct PendingDownload {
+    tex: Arc<xg::Texture>,
+    objects: Option<DownloadObjects>,
+    fence: ID3D12Fence,
+    fence_value: Option<u64>,
+    footprints: Vec<DownloadSubresource>,
+    bytes: usize,
+}
+
+impl Drop for PendingDownload {
+    fn drop(&mut self) {
+        let done = self.fence_value.is_some_and(|v| {
+            let got = unsafe { super::real::native_fence_completed(&self.fence) };
+            got != u64::MAX && got >= v
+        });
+        if !done {
+            if let Some(objects) = self.objects.take() {
+                std::mem::forget(objects);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl PendingDownload {
+    pub fn is_complete(&self) -> bool {
+        self.fence_value.is_some_and(|v| {
+            let got = unsafe { super::real::native_fence_completed(&self.fence) };
+            got != u64::MAX && got >= v
+        })
+    }
+
+    /// Copy the mapped readback only after the submission fence is observed. No wait is done.
+    pub unsafe fn readback_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        if !self.is_complete() {
+            return Ok(None);
+        }
+        let objects = self.objects.as_ref().ok_or("download objects unavailable")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(self.bytes).map_err(|_| "cannot allocate completed texture download")?;
+        let mut p = std::ptr::null_mut();
+        objects
+            .readback
+            .Map(0, Some(&D3D12_RANGE { Begin: 0, End: self.bytes }), Some(&mut p))
+            .map_err(|e| e.to_string())?;
+        if p.is_null() {
+            objects.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            return Err("readback Map returned no address".into());
+        }
+        bytes.extend_from_slice(std::slice::from_raw_parts(p as *const u8, self.bytes));
+        objects.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        Ok(Some(bytes))
+    }
+
+    pub fn footprints(&self) -> &[DownloadSubresource] { &self.footprints }
+    pub fn layout(&self) -> &xg::Texture { &self.tex }
+
+    fn arm(&self, event: windows::Win32::Foundation::HANDLE) {
+        if let Some(value) = self.fence_value { unsafe { let _ = self.fence.SetEventOnCompletion(value, event); } }
+    }
+}
+
+#[allow(dead_code)]
+impl TextureDownloadPlan {
+    /// Execute the already-closed list at the caller's serialized queue position. Ownership is
+    /// transferred to the pending ticket before Execute because ExecuteCommandLists has no status.
+    pub unsafe fn submit(self, queue: &ID3D12CommandQueue) -> Result<SubmittedDownload, String> {
+        let mut queue_device: Option<ID3D12Device> = None;
+        queue.GetDevice(&mut queue_device).map_err(|e| e.to_string())?;
+        if queue.GetDesc().Type != self.queue_type
+            || queue_device.as_ref().is_none_or(|d| d.as_raw() != self.device.as_raw())
+        {
+            return Err("texture download queue type or source device differs from its plan".into());
+        }
+        let mut pending = PendingDownload {
+            tex: self.tex,
+            objects: Some(DownloadObjects {
+                _source: self.source,
+                readback: self.readback,
+                _allocator: self.allocator,
+                list: self.list,
+                _queue: queue.clone(),
+                _fence_hold: self.fence.clone(),
+            }),
+            fence: self.fence,
+            fence_value: None,
+            footprints: self.footprints,
+            bytes: self.bytes,
+        };
+        let list = pending.objects.as_ref().unwrap().list.clone();
+        super::real::native_queue_execute(queue, &list);
+        let signal_error = match super::real::native_queue_signal(queue, &pending.fence, 1) {
+            Ok(()) => { pending.fence_value = Some(1); None }
+            Err(e) => Some(e.to_string()),
+        };
+        Ok(SubmittedDownload { ticket: pending, signal_error })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DownloadWrite { subresource: u32, state: D3D12_RESOURCE_STATES, writer: GpuWriter }
+
+pub(super) struct ReadyDownload { res: usize, generation: u64, target: usize, format: u32, writes: Vec<DownloadWrite>, ticket: PendingDownload }
+
+struct FenceDownloads { fence: ID3D12Fence, value: u64, downloads: Vec<Option<ReadyDownload>> }
+
+#[derive(Default)]
+struct FenceDownloadState {
+    batches: Vec<FenceDownloads>,
+    /// A detached fence is being published outside this mutex. Its mirrored completion must
+    /// remain hidden until the owner restores any work which could not be published.
+    processing: BTreeSet<usize>,
+    /// Ties which have claimed a fence but have not installed their batch yet. Native polling,
+    /// event arming, and reservation bookkeeping stay outside this mutex during that interval.
+    tying: BTreeMap<usize, usize>,
+}
+
+impl FenceDownloadState {
+    /// Register an installer. True means this is the first pending work for this fence and must
+    /// ensure that a safe baseline exists. Production fences are AddRef-retained for the process
+    /// lifetime, so their raw addresses cannot be reused while this state matters.
+    fn begin_tie(&mut self, fence: usize) -> bool {
+        let initialize_safe = !self.processing.contains(&fence)
+            && !self.tying.contains_key(&fence)
+            && !self.batches.iter().any(|batch| batch.fence.as_raw() as usize == fence);
+        *self.tying.entry(fence).or_insert(0) += 1;
+        initialize_safe
+    }
+
+    fn finish_tie(&mut self, fence: usize) {
+        let count = self.tying.get_mut(&fence).expect("finishing an unregistered texture download tie");
+        *count -= 1;
+        if *count == 0 { self.tying.remove(&fence); }
+    }
+
+    fn tie_in_progress(&self, fence: usize) -> bool {
+        self.tying.contains_key(&fence)
+    }
+
+    fn begin_processing(&mut self, fence: usize) -> bool {
+        !self.tie_in_progress(fence) && self.processing.insert(fence)
+    }
+
+    fn any_pending(&self) -> bool {
+        !self.batches.is_empty() || !self.processing.is_empty() || !self.tying.is_empty()
+    }
+}
+
+static FENCE_DOWNLOADS: Mutex<FenceDownloadState> = Mutex::new(FenceDownloadState {
+    batches: Vec::new(),
+    processing: BTreeSet::new(),
+    tying: BTreeMap::new(),
+});
+static DOWNLOADS_PENDING: AtomicBool = AtomicBool::new(false);
+static SCHEDULED_DOWNLOADS: Mutex<BTreeSet<(usize, u64, u64, u32, u64)>> = Mutex::new(BTreeSet::new());
+static SAFE_FENCE_VALUES: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+fn ensure_safe_baseline(values: &mut BTreeMap<usize, u64>, fence: usize) {
+    values.entry(fence).or_insert(0);
+}
+
+fn note_safe_value(values: &mut BTreeMap<usize, u64>, fence: usize, value: u64) {
+    values.entry(fence).and_modify(|safe| *safe = (*safe).max(value)).or_insert(value);
+}
+
+fn writer_at(entry: &Entry, subresource: usize) -> Option<GpuWriter> {
+    match entry.gpu_writers.as_slice() {
+        [] => None, [writer] => *writer, writers => writers.get(subresource).copied().flatten(),
+    }
+}
+
+fn download_writes(res: usize, entry: &Entry, queue: WriterQueueId) -> Vec<DownloadWrite> {
+    let n = subresource_count(&entry.tex);
+    let scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    (0..n).filter_map(|subresource| {
+        let writer = writer_at(entry, subresource)?;
+        (writer.queue == queue && !scheduled.contains(&(res, entry.generation, writer.queue.generation, subresource as u32, writer.epoch)))
+            .then(|| DownloadWrite { subresource: subresource as u32, state: if entry.states.len() == n { entry.states[subresource] } else { entry.states[0] }, writer })
+    }).collect()
+}
+
+struct DownloadSnapshot { res: usize, generation: u64, target: usize, format: u32, tex: Arc<xg::Texture>, device: ID3D12Device, source: ID3D12Resource, writes: Vec<DownloadWrite>, plan: Option<TextureDownloadPlan> }
+
+pub(super) struct PreparedDownloads { id: WriterQueueId, snapshots: Vec<DownloadSnapshot> }
+
+pub(super) enum SubmitDownloadsError { Stale, Failed(String) }
+
+fn download_current(entry: &Entry, generation: u64, target: usize, writes: &[DownloadWrite]) -> bool {
+    entry.generation == generation && entry.src == target && writes.iter().all(|w| writer_at(entry, w.subresource as usize) == Some(w.writer))
+}
+
+/// Build readback lists outside the queue turn. The state is validated again at insertion.
+/// Writes owned by another queue are left for a signal on that exact queue.
+pub(super) unsafe fn prepare_downloads(queue: *mut c_void) -> PreparedDownloads {
+    let id = super::list_x::queue_identity(queue as usize).unwrap_or(WriterQueueId { raw: queue as usize, generation: 0 });
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return PreparedDownloads { id, snapshots: Vec::new() } };
+    let queue_type = q.GetDesc().Type;
+    if !download_queue_type_supported(queue_type) { return PreparedDownloads { id, snapshots: Vec::new() } }
+    let candidates: Vec<DownloadSnapshot> = {
+        let table = TEXTURES.lock().unwrap();
+        table.by_res.iter().filter_map(|(&res, entry)| {
+            let writes = download_writes(res, entry, id);
+            if writes.is_empty() { return None }
+            let source = ID3D12Resource::from_raw_borrowed(&(res as *mut c_void))?.clone();
+            let device = ID3D12Device::from_raw_borrowed(&(entry.device as *mut c_void))?.clone();
+            Some(DownloadSnapshot { res, generation: entry.generation, target: entry.src, format: source.GetDesc().Format.0 as u32,
+                tex: Arc::clone(&entry.tex), device, source, writes, plan: None })
+        }).collect()
+    };
+    let mut snapshots = Vec::new();
+    for mut snapshot in candidates {
+        let selected: Vec<_> = snapshot.writes.iter().map(|w| (w.subresource, w.state)).collect();
+        let Ok(plan) = prepare_texture_download(&snapshot.device, &snapshot.source, queue_type, Arc::clone(&snapshot.tex), snapshot.format, &selected) else { continue };
+        snapshot.plan = Some(plan);
+        snapshots.push(snapshot);
+    }
+    PreparedDownloads { id, snapshots }
+}
+
+/// Validate and insert prepared lists while the caller owns `queue`'s turn. A stale snapshot
+/// submits nothing, so the caller can rebuild outside the turn and retry.
+pub(super) unsafe fn submit_prepared_downloads(queue: *mut c_void, prepared: PreparedDownloads) -> Result<Vec<ReadyDownload>, SubmitDownloadsError> {
+    if prepared.snapshots.is_empty() { return Ok(Vec::new()) }
+    if super::list_x::queue_identity(queue as usize) != Some(prepared.id) { return Err(SubmitDownloadsError::Stale) }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return Ok(Vec::new()) };
+    let table = TEXTURES.lock().unwrap();
+    let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    let valid = prepared.snapshots.iter().all(|snapshot| {
+        table.by_res.get(&snapshot.res).is_some_and(|entry| {
+            entry.generation == snapshot.generation
+                && entry.src == snapshot.target
+                && snapshot.writes.iter().all(|w| {
+                    !scheduled.contains(&(snapshot.res, snapshot.generation, w.writer.queue.generation, w.subresource, w.writer.epoch))
+                        &&
+                    writer_at(entry, w.subresource as usize) == Some(w.writer)
+                        && (if entry.states.len() == subresource_count(&entry.tex) {
+                            entry.states[w.subresource as usize]
+                        } else {
+                            entry.states[0]
+                        }) == w.state
+                })
+        })
+    });
+    if !valid { return Err(SubmitDownloadsError::Stale) }
+    let keys: Vec<_> = prepared.snapshots.iter().flat_map(|snapshot| snapshot.writes.iter().map(|write| {
+        (snapshot.res, snapshot.generation, write.writer.queue.generation, write.subresource, write.writer.epoch)
+    })).collect();
+    for &key in &keys { scheduled.insert(key); }
+    drop(scheduled);
+    drop(table);
+    let mut ready = Vec::new();
+    for snapshot in prepared.snapshots {
+        let submitted = match snapshot.plan.unwrap().submit(q) {
+            Ok(submitted) => submitted,
+            Err(error) => { rollback_reservations(&keys); return Err(SubmitDownloadsError::Failed(error)) }
+        };
+        if let Some(error) = submitted.signal_error { rollback_reservations(&keys); return Err(SubmitDownloadsError::Failed(format!("texture download completion signal failed: {error}"))) }
+        ready.push(ReadyDownload { res: snapshot.res, generation: snapshot.generation, target: snapshot.target, format: snapshot.format, writes: snapshot.writes, ticket: submitted.ticket });
+    }
+    Ok(ready)
+}
+
+fn rollback_reservations(keys: &[(usize, u64, u64, u32, u64)]) {
+    let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    for key in keys { scheduled.remove(key); }
+}
+
+/// Tie already-submitted readbacks to the title fence queued immediately after them.
+pub(super) unsafe fn tie_downloads(fence: *mut c_void, value: u64, downloads: Vec<ReadyDownload>) {
+    if downloads.is_empty() { return }
+    let Some(fence) = ID3D12Fence::from_raw_borrowed(&fence).cloned() else { return };
+    let key = fence.as_raw() as usize;
+    {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        if state.begin_tie(key) {
+            ensure_safe_baseline(&mut SAFE_FENCE_VALUES.lock().unwrap(), key);
+        }
+        DOWNLOADS_PENDING.store(true, Ordering::Release);
+    }
+    let event = super::fence_x::wake_event();
+    for download in &downloads { download.ticket.arm(event); }
+    {
+        let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+        for download in &downloads { for write in &download.writes {
+            scheduled.insert((download.res, download.generation, write.writer.queue.generation, write.subresource, write.writer.epoch));
+        } }
+    }
+    {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        state.batches.push(FenceDownloads { fence: fence.clone(), value, downloads: downloads.into_iter().map(Some).collect() });
+        state.finish_tie(key);
+        DOWNLOADS_PENDING.store(true, Ordering::Release);
+    }
+    let _ = fence.SetEventOnCompletion(value, event);
+}
+
+fn publish_download(download: &ReadyDownload) -> Result<bool, String> {
+    let Some(readback) = (unsafe { download.ticket.readback_bytes()? }) else { return Ok(false) };
+    let size = usize::try_from(download.ticket.layout().size()).map_err(|_| "texture download destination is too large")?;
+    let current = unsafe { with_title_bytes(download.target, size, <[u8]>::to_vec) };
+    let mut console = Vec::new();
+    console.try_reserve_exact(size).map_err(|_| "cannot allocate texture download destination")?;
+    console.extend_from_slice(&current);
+    for (write, footprint) in download.writes.iter().zip(download.ticket.footprints()) {
+        reverse_layout_subresource(download.ticket.layout(), download.format, write.subresource, footprint.footprint, &readback, &mut console)
+            .map_err(|e| format!("cannot reverse texture download layout: {e:?}"))?;
+    }
+    let mut table = TEXTURES.lock().unwrap();
+    let Some(entry) = table.by_res.get_mut(&download.res) else { return Ok(true) };
+    if !download_current(entry, download.generation, download.target, &download.writes) { return Ok(true) }
+    if !unsafe { write_changed_pages(download.target, &current, &console) } { return Ok(false) }
+    let n = subresource_count(&entry.tex);
+    if entry.gpu_writers.len() != n {
+        entry.gpu_writers = vec![entry.gpu_writers.first().copied().flatten(); n];
+    }
+    for write in &download.writes {
+        let slot = &mut entry.gpu_writers[write.subresource as usize];
+        if *slot == Some(write.writer) { *slot = None; }
+    }
+    if entry.gpu_writers.iter().all(Option::is_none) {
+        entry.gpu_writers.clear();
+        entry.gpu_written = false;
+    }
+    Ok(true)
+}
+
+/// Write changed 4 KiB pages without faulting if the title concurrently unmaps one. Every
+/// changed page must be committed and writable; otherwise its fence remains hidden and retries.
+unsafe fn write_changed_pages(at: usize, old: &[u8], new: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if old.len() != new.len() { return false }
+    let mut offset = 0;
+    while offset < new.len() {
+        let end = (((at + offset) & !4095) + 4096).saturating_sub(at).min(new.len());
+        if old[offset..end] == new[offset..end] { offset = end; continue }
+        let address = at + offset;
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(address as *const c_void, &mut info, std::mem::size_of_val(&info)) == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & 0xCC == 0
+            || info.Protect & PAGE_GUARD != 0
+            || (info.BaseAddress as usize).saturating_add(info.RegionSize) < at + end
+        {
+            return false;
+        }
+        let mut written = 0;
+        if WriteProcessMemory(GetCurrentProcess(), address as *const c_void, new[offset..end].as_ptr() as *const c_void, end - offset, &mut written) == 0
+            || written != end - offset {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
+fn unschedule(download: &ReadyDownload) {
+    unschedule_writes(download.res, download.generation, &download.writes);
+}
+
+fn unschedule_writes(res: usize, generation: u64, writes: &[DownloadWrite]) {
+    let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    for write in writes { scheduled.remove(&(res, generation, write.writer.queue.generation, write.subresource, write.writer.epoch)); }
+}
+
+fn batch_ready(blocked: &mut bool, target: u64, completed: u64) -> bool {
+    if *blocked || target > completed { *blocked = true; false } else { true }
+}
+
+fn take_matching<T>(values: &mut Vec<T>, mut matches: impl FnMut(&T) -> bool) -> Vec<T> {
+    let mut taken = Vec::new();
+    let mut kept = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        if matches(&value) { taken.push(value) } else { kept.push(value) }
+    }
+    *values = kept;
+    taken
+}
+
+/// Put detached older work before work tied to the same fence while it was being processed.
+fn restore_before_matching<T>(values: &mut Vec<T>, mut older: Vec<T>, matches: impl FnMut(&T) -> bool) {
+    older.extend(take_matching(values, matches));
+    values.extend(older);
+}
+
+fn matching_through<T>(values: &[T], completed: u64, mut target: impl FnMut(&T) -> Option<u64>) -> bool {
+    values.iter().any(|value| target(value).is_some_and(|target| target <= completed))
+}
+
+/// Apply every completed download through `value`. False withholds the title's mirrored fence
+/// value until a transiently unavailable readback or destination can be retried.
+pub(super) fn complete_fence_downloads(fence: usize, value: u64) -> bool {
+    if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return true }
+    let mut batches = {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        if !state.begin_processing(fence) {
+            return false;
+        }
+        let batches = take_matching(&mut state.batches, |batch| batch.fence.as_raw() as usize == fence);
+        if batches.is_empty() {
+            state.processing.remove(&fence);
+            note_safe_value(&mut SAFE_FENCE_VALUES.lock().unwrap(), fence, value);
+            return true;
+        }
+        batches
+    };
+    let mut ok = true;
+    let mut blocked = false;
+    for batch in &mut batches {
+        if !batch_ready(&mut blocked, batch.value, value) { ok &= batch.value > value; continue }
+        for download in &mut batch.downloads {
+            let Some(ready) = download.as_ref() else { continue };
+            match publish_download(ready) {
+                Ok(true) => {
+                    unschedule(ready);
+                    *download = None;
+                }
+                Ok(false) => {
+                    ok = false;
+                    blocked = true;
+                }
+                Err(error) => {
+                    crate::xlog_warn!("D3D12.X: {error}; holding title fence {fence:#x} at {value:#x}");
+                    ok = false;
+                    blocked = true;
+                }
+            }
+        }
+        blocked |= batch.downloads.iter().any(Option::is_some);
+    }
+    batches.retain(|batch| batch.downloads.iter().any(Option::is_some));
+    {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        // A tie which arrived while this fence was detached was not in `batches`. If the caller's
+        // completed value already covers it, this pass cannot expose that value until another pass
+        // publishes the arrival. Check while holding the same lock which accepts new ties.
+        ok &= !matching_through(&state.batches, value, |batch| {
+            (batch.fence.as_raw() as usize == fence).then_some(batch.value)
+        });
+        ok &= !state.tie_in_progress(fence);
+        restore_before_matching(&mut state.batches, batches, |batch| batch.fence.as_raw() as usize == fence);
+        state.processing.remove(&fence);
+        if ok {
+            note_safe_value(&mut SAFE_FENCE_VALUES.lock().unwrap(), fence, value);
+        }
+        DOWNLOADS_PENDING.store(state.any_pending(), Ordering::Release);
+    }
+    ok
+}
+
+pub(super) fn safe_fence_value(fence: usize, native: u64) -> u64 {
+    if !DOWNLOADS_PENDING.load(Ordering::Acquire) {
+        note_safe_value(&mut SAFE_FENCE_VALUES.lock().unwrap(), fence, native);
+        return native;
+    }
+    if native != u64::MAX && complete_fence_downloads(fence, native) {
+        native
+    } else {
+        SAFE_FENCE_VALUES.lock().unwrap().get(&fence).copied().unwrap_or(0)
+    }
+}
+
+/// Poll pending title fences even when a title never requested a completed-value mirror.
+pub(super) fn poll_fence_downloads() {
+    if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return }
+    let pending: Vec<_> = {
+        let state = FENCE_DOWNLOADS.lock().unwrap();
+        state.batches.iter().map(|batch| batch.fence.clone()).collect()
+    };
+    for fence in pending {
+        let value = unsafe { super::real::native_fence_completed(&fence) };
+        if value != u64::MAX {
+            let _ = complete_fence_downloads(fence.as_raw() as usize, value);
+        }
+    }
+}
+
+fn download_queue_type_supported(ty: D3D12_COMMAND_LIST_TYPE) -> bool {
+    matches!(ty, D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)
+}
+
+/// Build but do not submit a download. Preparation performs no global lookup or queue operation.
+#[allow(dead_code)]
+pub(super) unsafe fn prepare_texture_download(
+    dev: &ID3D12Device,
+    source: &ID3D12Resource,
+    queue_type: D3D12_COMMAND_LIST_TYPE,
+    tex: Arc<xg::Texture>,
+    format: u32,
+    selected: &[(u32, D3D12_RESOURCE_STATES)],
+) -> Result<TextureDownloadPlan, String> {
+    if !download_queue_type_supported(queue_type) {
+        return Err("texture download requires a direct or compute queue".into());
+    }
+    let mut source_device: Option<ID3D12Device> = None;
+    source.GetDevice(&mut source_device).map_err(|e| e.to_string())?;
+    if source_device.as_ref().is_none_or(|d| d.as_raw() != dev.as_raw()) {
+        return Err("texture download source belongs to another device".into());
+    }
+    let desc = source.GetDesc();
+    let mut queried = Vec::new();
+    queried.try_reserve_exact(selected.len()).map_err(|_| "cannot allocate driver footprints")?;
+    let mut base = 0u64;
+    for &(subresource, _) in selected {
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut row_bytes, mut ignored_total) = (0u32, 0u64, 0u64);
+        dev.GetCopyableFootprints(&desc, subresource, 1, base, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut ignored_total));
+        queried.push((fp, rows, row_bytes));
+        let pitch = fp.Footprint.RowPitch as u64;
+        let slice_pitch = pitch.checked_mul(rows as u64).ok_or("driver footprint overflow")?;
+        base = fp.Offset
+            .checked_add(slice_pitch.checked_mul(fp.Footprint.Depth.saturating_sub(1) as u64).ok_or("driver footprint overflow")?)
+            .and_then(|n| n.checked_add(pitch.checked_mul(rows.saturating_sub(1) as u64)?))
+            .and_then(|n| n.checked_add(row_bytes))
+            .ok_or("driver footprint overflow")?;
+    }
+    let (footprints, bytes) = validate_download_layout(&tex, &desc, format, selected, &queried)?;
+    let allocator = dev.CreateCommandAllocator(queue_type).map_err(|e| e.to_string())?;
+    let graphics: ID3D12GraphicsCommandList = dev.CreateCommandList(0, queue_type, &allocator, None).map_err(|e| e.to_string())?;
+    let mut readback = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        },
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        None,
+        &mut readback,
+    ).map_err(|e| e.to_string())?;
+    let readback = readback.ok_or("no readback resource")?;
+    let barrier = |subresource, before, after| D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+            pResource: std::mem::transmute_copy(source), Subresource: subresource, StateBefore: before, StateAfter: after,
+        }) },
+    };
+    for sub in &footprints {
+        if sub.state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            graphics.ResourceBarrier(&[barrier(sub.subresource, sub.state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        }
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: sub.footprint.offset as u64,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32), Width: sub.footprint.width, Height: sub.footprint.height, Depth: sub.footprint.depth, RowPitch: sub.footprint.row_pitch as u32 },
+        } } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(source), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub.subresource } };
+        graphics.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        if sub.state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            graphics.ResourceBarrier(&[barrier(sub.subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, sub.state)]);
+        }
+    }
+    graphics.Close().map_err(|e| e.to_string())?;
+    let list: ID3D12CommandList = graphics.cast().map_err(|e| e.to_string())?;
+    let fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| e.to_string())?;
+    Ok(TextureDownloadPlan { device: dev.clone(), queue_type, tex, source: source.clone(), readback, allocator, list, fence, footprints, bytes })
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DirectQueueUploads(usize);
+
+    impl DirectQueueUploads {
+        fn new(queue: &ID3D12CommandQueue) -> Self {
+            let key = queue.as_raw() as usize;
+            let stale = ON_QUEUE.lock().unwrap().remove(&key);
+            drop(stale);
+            Self(key)
+        }
+    }
+
+    impl Drop for DirectQueueUploads {
+        fn drop(&mut self) {
+            let state = ON_QUEUE.lock().unwrap().remove(&self.0);
+            drop(state);
+        }
+    }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.
@@ -1566,6 +3115,190 @@ mod tests {
         assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
+    }
+
+    unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
+        own_work(|| {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0;
+            dev.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+            let mut readback = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback,
+            ).unwrap();
+            let readback: ID3D12Resource = readback.unwrap();
+            let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let barrier = |before, after| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(texture), Subresource: 0, StateBefore: before, StateAfter: after }) },
+                ..Default::default()
+            };
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, dev, None, 5_000).unwrap();
+            let mut data = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let mut out = Vec::with_capacity(64 * 64);
+            for y in 0..64 {
+                out.extend_from_slice(std::slice::from_raw_parts((data as *const u8).add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize), 64));
+            }
+            readback.Unmap(0, None);
+            out
+        })
+    }
+
+    #[test]
+    fn gpu_uploads_on_the_title_queue_run_before_its_later_work_and_are_released() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let compute: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            assert!(title_queue_for(dev, Some(&queue)).is_some());
+            assert!(title_queue_for(dev, Some(&compute)).is_none());
+            assert!(title_queue_for(dev, None).is_none());
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = queue.as_raw() as usize;
+            let _queue_uploads = DirectQueueUploads::new(&queue);
+            let upload = |value: u8| {
+                let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![value; 64 * 64] }];
+                own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])], &[])).unwrap();
+            };
+            for value in [0x21, 0xC4] {
+                upload(value);
+                assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "the title queue's next work sees the upload");
+            }
+            upload(0x5E);
+            {
+                let state = ON_QUEUE.lock().unwrap().get(&key).unwrap().clone();
+                let mut slot = state.lock().unwrap();
+                let q = slot.as_mut().unwrap();
+                assert_eq!(q.value, 3);
+                let retired = reclaim(dev, q, 0, 10_000);
+                assert!(q.in_flight.is_empty() && q.bytes == 0, "over the cap the oldest uploads are waited for and released");
+                assert!(q.fence.GetCompletedValue() >= 3);
+                drop(slot);
+                drop(retired);
+            }
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x5E; 64 * 64]);
+        }
+    }
+
+    /// An upload on the title's queue waits there for the texture page mappings made before it,
+    /// as one on XCL's upload queue does: without the wait its copy can run into tiles whose
+    /// mapping has not run yet (a copy-engine write page fault on NVIDIA).
+    #[test]
+    fn gpu_a_title_queue_upload_waits_for_the_page_mappings_before_it() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(mapped) = super::super::vram::note_mapping_for_test(dev) else {
+                crate::gpu::recomp::runner::skip_test("no texture pages on this device");
+                return;
+            };
+            let key = queue.as_raw() as usize;
+            assert!(super::super::vram::waited_for_test(raw_device as usize, key) < mapped);
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x3C; 64 * 64] }];
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])], &[])).unwrap();
+            assert_eq!(
+                super::super::vram::waited_for_test(raw_device as usize, key),
+                mapped,
+                "the title queue's upload must wait for the page mappings made before it"
+            );
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x3C; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
+    #[test]
+    fn gpu_an_upload_still_running_is_kept_when_its_wait_times_out() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = queue.as_raw() as usize;
+            let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x77; 64 * 64] }];
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])], &[])).unwrap();
+            {
+                let state = ON_QUEUE.lock().unwrap().get(&key).unwrap().clone();
+                let mut slot = state.lock().unwrap();
+                let q = slot.as_mut().unwrap();
+                let retired = reclaim(dev, q, 0, 50);
+                assert_eq!(q.in_flight.len(), 1, "a batch the GPU has not run stays in flight when its wait times out");
+                assert!(q.bytes > 0);
+                drop(slot);
+                drop(retired);
+            }
+            gate.Signal(1).unwrap();
+            {
+                let state = ON_QUEUE.lock().unwrap().get(&key).unwrap().clone();
+                let mut slot = state.lock().unwrap();
+                let q = slot.as_mut().unwrap();
+                let retired = reclaim(dev, q, 0, 10_000);
+                assert!(q.in_flight.is_empty() && q.bytes == 0);
+                drop(slot);
+                drop(retired);
+            }
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x77; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
@@ -1616,49 +3349,11 @@ mod tests {
             assert!(kernelx::in_graphics_reservation(at), "fallback must be write-watched");
             reservation
         }
-        unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
-            own_work(|| {
-                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-                let mut total = 0;
-                dev.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
-                let mut readback = None;
-                dev.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
-                    D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback,
-                ).unwrap();
-                let readback: ID3D12Resource = readback.unwrap();
-                let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
-                let barrier = |before, after| D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(texture), Subresource: 0, StateBefore: before, StateAfter: after }) },
-                    ..Default::default()
-                };
-                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
-                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
-                list.Close().unwrap();
-                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-                queue.Signal(&fence, 1).unwrap();
-                crate::gpu::fence::wait(&fence, 1, dev, None, 5_000).unwrap();
-                let mut data = std::ptr::null_mut();
-                readback.Map(0, None, Some(&mut data)).unwrap();
-                let mut out = Vec::with_capacity(64 * 64);
-                for y in 0..64 {
-                    out.extend_from_slice(std::slice::from_raw_parts((data as *const u8).add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize), 64));
-                }
-                readback.Unmap(0, None);
-                out
-            })
-        }
         unsafe {
             let raw_device = super::super::real::device_raw();
             let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let _queue_uploads = DirectQueueUploads::new(&queue);
             let cpu = reserve(mem::PAGE_READWRITE);
             let gpu = reserve(0x801);
             let (src, va) = (cpu.0 + OFFSET, gpu.0 + OFFSET);
@@ -1734,7 +3429,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+            let mut e = Entry { device: 0, committed_bytes: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -1770,19 +3465,72 @@ mod tests {
             assert!(base != 0);
             let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
             let (mut dirty, mut page) = (Vec::new(), 0u32);
-            take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+            take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page, None);
             for written in [(0..PAGES).filter(|i| i % 7 != 3).collect::<Vec<_>>(), (0..128).map(|i| i * 5).collect()] {
                 let want: Vec<usize> = written.iter().map(|i| base + i * PAGE).collect();
                 for &a in &want {
                     (a as *mut u8).write_volatile(1);
                 }
                 dirty.clear();
-                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page, None);
                 assert_eq!(page as usize, PAGE);
                 assert_eq!(dirty, want, "{} pages written", want.len());
                 dirty.clear();
-                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page, None);
                 assert!(dirty.is_empty(), "the look reset what it reported");
+            }
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual Windows GetWriteWatch timing"]
+    fn benchmark_write_watch_calls_against_gap_bytes() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 0x1000;
+        const SIZE: usize = 49 << 20;
+        fn distribution(mut samples: Vec<u64>) -> (u64, u64, u64) {
+            samples.sort_unstable();
+            (samples[0], samples[samples.len() / 2], samples[samples.len() - 1])
+        }
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
+            let (mut dirty, mut page) = (Vec::with_capacity(64), 0u32);
+            assert!(take_written(base, SIZE, &mut buf, &mut dirty, &mut page, None));
+            for gap_mb in [4usize, 6, 8, 10, 16] {
+                let gap = gap_mb << 20;
+                let spans: Vec<usize> = (0..4).map(|i| base + i * (PAGE + gap)).collect();
+                let mut samples: [Vec<u64>; 4] = std::array::from_fn(|_| Vec::new());
+                for trial in 0..9 {
+                    let order = if trial % 2 == 0 { [false, true] } else { [true, false] };
+                    for merged in order {
+                        for written in [false, true] {
+                            dirty.clear();
+                            assert!(take_written(base, SIZE, &mut buf, &mut dirty, &mut page, None));
+                            dirty.clear();
+                            if written {
+                                for &at in &spans { (at as *mut u8).write_volatile(1) }
+                            }
+                            let mut measurement = WatchMeasurement::default();
+                            if merged {
+                                assert!(take_written(spans[0], spans[3] + PAGE - spans[0], &mut buf, &mut dirty, &mut page, Some(&mut measurement)));
+                                assert_eq!(measurement.calls, 1);
+                            } else {
+                                for &at in &spans {
+                                    assert!(take_written(at, PAGE, &mut buf, &mut dirty, &mut page, Some(&mut measurement)));
+                                }
+                                assert_eq!(measurement.calls, spans.len() as u64);
+                            }
+                            dirty.sort_unstable();
+                            assert_eq!(dirty, if written { spans.clone() } else { Vec::new() });
+                            samples[(merged as usize) * 2 + written as usize].push(measurement.elapsed_ns);
+                        }
+                    }
+                }
+                println!("gap {gap_mb} MiB ns min/median/max: separate clean {:?}, dirty {:?}; merged clean {:?}, dirty {:?}", distribution(samples[0].clone()), distribution(samples[1].clone()), distribution(samples[2].clone()), distribution(samples[3].clone()));
             }
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
@@ -1791,6 +3539,44 @@ mod tests {
     const SRV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0);
     const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn gpu_owned_metadata_accepts_exact_colour_layouts_only() {
+        let desc = console_desc(3, 64, 64, 2, 3, 28, 0x105);
+        let with_flags = |mut d: [u8; 0x38], flags: u32| {
+            d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            d
+        };
+        let pc = |d: &[u8; 0x38]| unsafe {
+            std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(d).as_ptr() as *const D3D12_RESOURCE_DESC)
+        };
+
+        let uav = with_flags(desc, 4);
+        let tex = gpu_owned_layout(&uav, &pc(&uav)).expect("single-plane UAV layout");
+        assert_eq!(subresource_count(&tex), 6);
+
+        let rt = with_flags(console_desc(3, 128, 128, 1, 1, 28, 0x105), 1);
+        let tex = gpu_owned_layout(&rt, &pc(&rt)).expect("render target with non-texel CMASK metadata");
+        assert_eq!(tex.planes.len(), 2);
+        assert_eq!(subresource_count(&tex), 1);
+
+        let depth = with_flags(desc, 2);
+        assert!(gpu_owned_layout(&depth, &pc(&depth)).is_err());
+        let msaa = {
+            let mut d = with_flags(desc, 1);
+            d[0x24..0x28].copy_from_slice(&4u32.to_le_bytes());
+            d
+        };
+        assert!(gpu_owned_layout(&msaa, &pc(&msaa)).is_err());
+        let promoted = with_flags(console_desc(3, 64, 64, 1, 1, 67, 0x105), 1);
+        assert_ne!(u32::from_le_bytes(promoted[0x20..0x24].try_into().unwrap()), pc(&promoted).Format.0 as u32);
+        assert!(gpu_owned_layout(&promoted, &pc(&promoted)).is_err());
+        let planar = with_flags(console_desc(3, 64, 64, 1, 1, 45, 0x105), 1);
+        assert!(gpu_owned_layout(&planar, &pc(&planar)).is_err());
+        let mut wrong_shape = pc(&uav);
+        wrong_shape.MipLevels -= 1;
+        assert!(gpu_owned_layout(&uav, &wrong_shape).is_err());
+    }
 
     /// One state while every subresource has it, one each while they differ.
     #[test]
@@ -1813,6 +3599,159 @@ mod tests {
         assert_eq!(one, vec![D3D12_RESOURCE_STATE_COPY_SOURCE]);
     }
 
+    #[test]
+    fn submitted_gpu_writes_keep_generation_queue_epoch_and_subresource() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 2, 3, 28, 0x105)).unwrap());
+        let res = 0x7E57_1000_1000usize;
+        let entry = |tex: &Arc<xg::Texture>| Entry {
+            device: 0,
+            committed_bytes: 0,
+            va: 0x7E57_1000_0000,
+            src: 0x7E57_1000_0000,
+            in_gpu_view: false,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
+            placed: false,
+            unmapped: false,
+            generation: 0,
+        };
+        let generation = {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(res, entry(&tex));
+            t.by_res[&res].generation
+        };
+        let first = GpuWrite { res, generation, subresource: 2 };
+        let q1 = WriterQueueId { raw: 0x1000, generation: 7 };
+        publish_gpu_writes(q1, &[first]);
+        let first_epoch = {
+            let t = TEXTURES.lock().unwrap();
+            let e = &t.by_res[&res];
+            assert!(e.gpu_written);
+            assert_eq!(e.gpu_writers.len(), 6);
+            assert!(e.gpu_writers.iter().enumerate().all(|(i, w)| (i == 2) == w.is_some()));
+            let w = e.gpu_writers[2].unwrap();
+            assert_eq!(w.queue, q1);
+            w.epoch
+        };
+
+        let q2 = WriterQueueId { raw: 0x2000, generation: 9 };
+        publish_gpu_writes(q2, &[GpuWrite { res, generation, subresource: 4 }]);
+        {
+            let t = TEXTURES.lock().unwrap();
+            let e = &t.by_res[&res];
+            assert_eq!(e.gpu_writers[2].unwrap().queue, q1);
+            let last = e.gpu_writers[4].unwrap();
+            assert_eq!(last.queue, q2);
+            assert!(last.epoch > first_epoch);
+            let q1_writes = download_writes(res, e, q1);
+            let q2_writes = download_writes(res, e, q2);
+            assert_eq!(q1_writes.iter().map(|w| w.subresource).collect::<Vec<_>>(), [2]);
+            assert_eq!(q2_writes.iter().map(|w| w.subresource).collect::<Vec<_>>(), [4]);
+            let key = (res, generation, q1.generation, 2, first_epoch);
+            SCHEDULED_DOWNLOADS.lock().unwrap().insert(key);
+            assert!(download_writes(res, e, q1).is_empty(), "an in-flight epoch is not downloaded twice");
+            SCHEDULED_DOWNLOADS.lock().unwrap().remove(&key);
+        }
+
+        let stale = download_writes(res, &TEXTURES.lock().unwrap().by_res[&res], q1);
+        let key = (res, generation, q1.generation, 2, first_epoch);
+        SCHEDULED_DOWNLOADS.lock().unwrap().insert(key);
+        publish_gpu_writes(q2, &[GpuWrite { res, generation, subresource: 2 }]);
+        assert!(!download_current(&TEXTURES.lock().unwrap().by_res[&res], generation, 0x7E57_1000_0000, &stale));
+        unschedule_writes(res, generation, &stale);
+        assert!(!SCHEDULED_DOWNLOADS.lock().unwrap().contains(&key));
+
+        // Reusing the resource address creates another registration generation: a captured
+        // effect from the old object must not mark it.
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.remove(res);
+            t.insert(res, entry(&tex));
+            assert_ne!(t.by_res[&res].generation, generation);
+        }
+        publish_gpu_writes(q1, &[first]);
+        assert!(!TEXTURES.lock().unwrap().by_res[&res].gpu_written);
+        TEXTURES.lock().unwrap().remove(res);
+    }
+
+    #[test]
+    fn fence_download_batches_preserve_insertion_order() {
+        let mut blocked = false;
+        assert!(!batch_ready(&mut blocked, 20, 10));
+        assert!(!batch_ready(&mut blocked, 5, 10), "later eligible batch passed an earlier one");
+        blocked = true;
+        assert!(!batch_ready(&mut blocked, 10, 10), "later batch passed an incomplete one");
+    }
+
+    #[test]
+    fn detached_fence_batches_return_before_concurrent_arrivals() {
+        let mut batches = vec![(1, "old-a"), (2, "other-a"), (1, "old-b")];
+        let mut detached = take_matching(&mut batches, |batch| batch.0 == 1);
+        assert_eq!(detached, [(1, "old-a"), (1, "old-b")]);
+        assert_eq!(batches, [(2, "other-a")]);
+
+        // The first old batch completed while detached; two newer batches were tied meanwhile.
+        detached.remove(0);
+        batches.extend([(1, "new-a"), (2, "other-b"), (1, "new-b")]);
+        restore_before_matching(&mut batches, detached, |batch| batch.0 == 1);
+        assert_eq!(
+            batches.iter().filter(|batch| batch.0 == 1).map(|batch| batch.1).collect::<Vec<_>>(),
+            ["old-b", "new-a", "new-b"],
+            "an unresolved older download must keep later fence work hidden",
+        );
+        assert_eq!(
+            batches.iter().filter(|batch| batch.0 == 2).map(|batch| batch.1).collect::<Vec<_>>(),
+            ["other-a", "other-b"],
+            "processing one fence must preserve another fence's order",
+        );
+    }
+
+    #[test]
+    fn concurrent_arrival_through_completed_value_withholds_visibility() {
+        let arrivals = [(2, 4), (1, 11), (2, 7)];
+        let for_fence_one = |batch: &(usize, u64)| (batch.0 == 1).then_some(batch.1);
+        assert!(!matching_through(&arrivals, 10, for_fence_one), "a future arrival does not hide value 10");
+
+        let arrivals = [(2, 4), (1, 11), (1, 10)];
+        assert!(
+            matching_through(&arrivals, 10, for_fence_one),
+            "a concurrent arrival covered by value 10 must be published before value 10 is visible",
+        );
+    }
+
+    #[test]
+    fn in_progress_tie_withholds_fence_processing() {
+        let mut state = FenceDownloadState::default();
+        let mut safe = BTreeMap::from([(7, 99)]);
+        if state.begin_tie(7) { ensure_safe_baseline(&mut safe, 7); }
+        assert_eq!(safe[&7], 99, "first pending work preserves the last exposed completion");
+        if state.begin_tie(7) { note_safe_value(&mut safe, 7, 123); }
+        assert_eq!(safe[&7], 99, "another installer must not advance the safe baseline");
+        assert!(state.any_pending());
+        assert!(!state.begin_processing(7), "completion must not pass a partially installed tie");
+        state.finish_tie(7);
+        assert!(!state.begin_processing(7), "every installer must finish before completion starts");
+        state.finish_tie(7);
+        assert!(state.begin_processing(7));
+
+        assert!(FenceDownloadState::default().begin_tie(8));
+        ensure_safe_baseline(&mut safe, 8);
+        assert_eq!(safe[&8], 0, "a fence never exposed before starts from the conservative baseline");
+    }
+
+    #[test]
+    fn download_reservation_rollback_clears_every_key() {
+        let keys = [(0xBAD0, 1, 2, 3, 4), (0xBAD1, 5, 6, 7, 8)];
+        SCHEDULED_DOWNLOADS.lock().unwrap().extend(keys);
+        rollback_reservations(&keys);
+        assert!(keys.iter().all(|key| !SCHEDULED_DOWNLOADS.lock().unwrap().contains(key)));
+    }
+
     /// A texture kept in step: the title's transitions count once their list is submitted, in
     /// submission order, each time it is; a Reset forgets them; other resources are not noted.
     #[test]
@@ -1831,37 +3770,31 @@ mod tests {
         let tex = Arc::new(xg::Texture::new(&d).unwrap());
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
-        let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+        let (res, other) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, committed_bytes: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
-        let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
-
-        note_transitions(l1, &[(res, ALL, SRV), (other, ALL, D3D12_RESOURCE_STATE_RENDER_TARGET), (res, 4, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-        assert_eq!(LIST_NOTES.lock().unwrap().get(&l1).map(|v| v.len()), Some(2), "only the texture kept in step is noted");
+        let e1 = capture_transitions(&[(res, ALL, SRV), (other, ALL, D3D12_RESOURCE_STATE_RENDER_TARGET), (res, 4, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        assert_eq!(e1.len(), 2, "only the texture kept in step is captured");
         assert_eq!(states(), vec![D3D12_RESOURCE_STATE_COMMON], "recorded, not run yet");
-        note_transitions(l2, &[(res, 4, SRV), (res, 0, D3D12_RESOURCE_STATE_COPY_DEST)]);
-        submitted(&[p1]);
+        let e2 = capture_transitions(&[(res, 4, SRV), (res, 0, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        publish_submission_effects(None, &[], &e1);
         let mut want = vec![SRV; 6];
         want[4] = D3D12_RESOURCE_STATE_COPY_SOURCE;
         assert_eq!(states(), want);
-        submitted(&[p2]);
+        publish_submission_effects(None, &[], &e2);
         want[4] = SRV;
         want[0] = D3D12_RESOURCE_STATE_COPY_DEST;
         assert_eq!(states(), want);
         // l1 runs again (a closed list may): its transitions again, after l2's
-        submitted(&[p2, p1]);
+        publish_submission_effects(None, &[], &e2);
+        publish_submission_effects(None, &[], &e1);
         assert_eq!(states(), {
             let mut w = vec![SRV; 6];
             w[4] = D3D12_RESOURCE_STATE_COPY_SOURCE;
             w
         });
-        list_reset(l1);
-        list_reset(l2);
-        submitted(&[p1, p2]);
-        assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
         forget(res);
-        assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
     /// The title's bytes outside the coherent window are read as `read_committed` reads them (the
@@ -1923,13 +3856,161 @@ mod tests {
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
         // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000), (0x1800_0000, 0x1000)]);
         // a merged range over two regions: a piece in each, whatever order the regions come in
         let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
         assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
         // a region between two merged ranges, and one past them all
         let regions = [(0x2000_0000, 0x10_0000), (0x9000_0000, 0x1000)];
         assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)]), vec![(0x2008_0000, 0x1_0000)]);
+    }
+
+    #[test]
+    fn watch_ranges_merge_at_the_gap_limit_and_split_past_it() {
+        let base = 0x1000_0000usize;
+        let regions = [(base, 4 * WATCH_GAP)];
+        let first = (base, base + 0x1000);
+        let at_limit = (first.1 + WATCH_GAP, first.1 + WATCH_GAP + 0x1000);
+        assert_eq!(watch_ranges(&regions, vec![at_limit, first]), vec![(base, 2 * 0x1000 + WATCH_GAP)]);
+
+        let past_limit = (first.1 + WATCH_GAP + 1, first.1 + WATCH_GAP + 0x1001);
+        assert_eq!(watch_ranges(&regions, vec![past_limit, first]), vec![(base, 0x1000), (past_limit.0, 0x1000)]);
+    }
+
+    #[test]
+    fn watch_ranges_are_sorted_disjoint_in_region_and_cover_every_wanted_part() {
+        let regions = [(0x4000_0000usize, 0x100_0000usize), (0x1000_0000, 0x200_0000), (0x8000_0000, 0x20_0000)];
+        let wanted = vec![
+            (0x0FFF_F000, 0x1000_2000),
+            (0x1008_0000, 0x1008_1000),
+            (0x11FF_F000, 0x1200_1000),
+            (0x4000_8000, 0x4000_A000),
+            (0x40FF_F000, 0x4100_1000),
+            (0x8008_0000, 0x8008_1000),
+            (0xA000_0000, 0xA000_1000),
+        ];
+        let ranges = watch_ranges(&regions, wanted.clone());
+
+        assert!(ranges.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "ranges must be sorted and disjoint: {ranges:x?}");
+        for &(base, size) in &ranges {
+            let end = base + size;
+            assert!(size > 0 && regions.iter().any(|&(rbase, rsize)| rbase <= base && end <= rbase + rsize), "range {base:#x}..{end:#x} is outside one allocation");
+        }
+        for &(start, end) in &wanted {
+            for &(rbase, rsize) in &regions {
+                let (lo, hi) = (start.max(rbase), end.min(rbase + rsize));
+                if lo < hi {
+                    assert!(ranges.iter().any(|&(base, size)| base <= lo && hi <= base + size), "wanted part {lo:#x}..{hi:#x} is not covered");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn budgeted_watch_ranges_merge_exact_spans_by_smallest_gap() {
+        let regions = [(100, 100)];
+        let wanted = vec![(165, 175), (150, 160), (120, 130), (100, 110), (135, 145), (108, 120)];
+        assert_eq!(plan_watch_ranges(&regions, wanted.clone(), usize::MAX), vec![(100, 30), (135, 10), (150, 10), (165, 10)]);
+        assert_eq!(plan_watch_ranges(&regions, wanted.clone(), 3), vec![(100, 45), (150, 10), (165, 10)], "equal gaps choose the lower address");
+        assert_eq!(plan_watch_ranges(&regions, wanted.into_iter().rev().collect(), 2), vec![(100, 60), (165, 10)], "input order does not change the selected gaps");
+    }
+
+    #[test]
+    fn budgeted_watch_ranges_do_not_bridge_allocations_or_invalid_regions() {
+        let regions = [(100, 20), (120, 20), (usize::MAX - 4, 8), (200, 0)];
+        let wanted = vec![(105, 135), (usize::MAX - 3, usize::MAX), (200, 210)];
+        assert_eq!(plan_watch_ranges(&regions, wanted, 0), vec![(105, 15), (120, 15)], "zero target cannot merge two allocations");
+    }
+
+    #[test]
+    fn watched_texture_span_rejects_size_and_rounding_overflow() {
+        assert_eq!(watched_texture_span(0x1234, 1), Some((0x1000, 0x2000)));
+        assert_eq!(watched_texture_span(0x1234, 0), None);
+        assert_eq!(watched_texture_span(usize::MAX - 0xFFF, 0x1000), None);
+        assert_eq!(watched_texture_span(usize::MAX - 0x800, 1), None);
+    }
+
+    #[test]
+    fn texture_upload_selection_preserves_flag_and_page_boundaries() {
+        const PAGE: usize = 0x1000;
+        let dirty = [0x1000usize, 0x4000];
+        for cpu_backed in [false, true] {
+            for pending in [false, true] {
+                for gpu_written in [false, true] {
+                    let selected = texture_needs_upload(cpu_backed, pending, gpu_written, || {
+                        let i = dirty.partition_point(|&p| p + PAGE <= 0x1800);
+                        dirty.get(i).is_some_and(|&p| p < 0x1800 + PAGE)
+                    });
+                    assert_eq!(selected, cpu_backed && (pending || !gpu_written), "cpu {cpu_backed}, pending {pending}, GPU-written {gpu_written}");
+                }
+            }
+        }
+        let overlap = |src: usize, dirty: &[usize]| {
+            let i = dirty.partition_point(|&p| p + PAGE <= src);
+            dirty.get(i).is_some_and(|&p| p < src + PAGE)
+        };
+        assert!(!texture_needs_upload(true, false, false, || overlap(0x2000, &[0x1000])), "page end equals texture start");
+        assert!(!texture_needs_upload(true, false, false, || overlap(0x1000, &[0x2000])), "page start equals texture end");
+        assert!(texture_needs_upload(true, false, false, || overlap(0x1800, &[0x1000])), "half-open ranges overlap");
+    }
+
+    #[test]
+    fn texture_upload_selection_reads_dirty_overlap_only_when_needed() {
+        let calls = std::cell::Cell::new(0);
+        let selected = |cpu_backed, pending, gpu_written| {
+            texture_needs_upload(cpu_backed, pending, gpu_written, || {
+                calls.set(calls.get() + 1);
+                true
+            })
+        };
+        assert!(!selected(false, true, false));
+        assert!(selected(true, true, true));
+        assert!(!selected(true, false, true));
+        assert_eq!(calls.get(), 0, "an excluded or pending entry evaluated its dirty range");
+        assert!(selected(true, false, false));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[cfg(feature = "texture-selection-bench")]
+    #[test]
+    fn texture_selection_fixture_keeps_empty_gate_and_exact_aliases() {
+        assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::Empty).scan(), (0, 0));
+        assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::AllPending).scan().0, 128);
+        assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::AllGpuWritten).scan().0, 0);
+        let mixed = TextureSelectionBench::new(32, TextureSelectionScenario::MixedAliases);
+        {
+            let entries = mixed.entries.lock().unwrap();
+            assert_eq!((entries[&1].src, entries[&1].size), (entries[&2].src, entries[&2].size), "alias fixture ranges differ");
+        }
+        let entry = |src| TextureSelectionBenchEntry {
+            src,
+            size: TextureSelectionBench::PAGE,
+            cpu_backed: true,
+            pending: false,
+            gpu_written: false,
+        };
+        let aliases = TextureSelectionBench {
+            entries: Mutex::new(BTreeMap::from([(1, entry(0x1000)), (2, entry(0x1000))])),
+            dirty: vec![0x1000],
+            pending: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert_eq!(aliases.scan(), (2, 3), "exact-range aliases remain distinct candidates");
+    }
+
+    #[test]
+    fn budgeted_watch_ranges_cover_every_wanted_byte() {
+        let regions = [(20, 20), (80, 30), (45, 10)];
+        let wanted = vec![(10, 25), (24, 29), (35, 50), (52, 54), (70, 87), (90, 120)];
+        for budget in [usize::MAX, 4, 1] {
+            let planned = plan_watch_ranges(&regions, wanted.clone(), budget);
+            for &(base, size) in &regions {
+                for at in base..base + size {
+                    let wanted_here = wanted.iter().any(|&(a, b)| a <= at && at < b);
+                    let covered = planned.iter().any(|&(a, n)| a <= at && at < a + n);
+                    assert!(!wanted_here || covered, "{at} is missing with budget {budget}");
+                }
+            }
+        }
     }
 
     /// The textures of a batch detiled on several threads come back as on one: complete and in
@@ -1945,17 +4026,59 @@ mod tests {
             console_desc(3, 128, 32, 3, 2, 28, 0x105),
             console_desc(3, 64, 64, 1, 1, 28, 0x105),
         ];
-        let textures: Vec<xg::Texture> = descs.iter().map(|d| xg::Texture::new(d).unwrap()).collect();
+        let textures: Vec<Arc<xg::Texture>> = descs.iter().map(|d| Arc::new(xg::Texture::new(d).unwrap())).collect();
         // each texture's console memory: distinct bytes per texture
         let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
-        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, x)).collect();
+        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, &**x)).collect();
         unsafe {
             let one = subresources_on(&picked, 1);
             assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
             for threads in [2, 3, 8] {
                 assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
             }
+            let pooled: Vec<_> = picked.iter().zip(&textures).map(|(&(va, _), tex)| (va, Arc::clone(tex))).collect();
+            assert_eq!(pooled_subresources(&pooled, usize::MAX), Some(one), "persistent workers preserve order and content");
         }
+    }
+
+    #[test]
+    fn failed_preparation_requeues_only_the_exact_cpu_generation() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 4, 4, 1, 1, 28, 0x105)).unwrap());
+        let entry = |generation, gpu_written| Entry {
+            device: 0,
+            committed_bytes: 0,
+            va: 0x1000,
+            src: 0x1000,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
+            placed: false,
+            unmapped: false,
+            generation,
+        };
+        let mut table = Table::new();
+        table.by_res.insert(1, entry(7, false));
+        table.by_res.insert(2, entry(8, false));
+        table.by_res.insert(3, entry(9, true));
+
+        assert_eq!(requeue_generations(&mut table, &[(1, 7), (2, 7), (3, 9), (4, 1)]), [1]);
+        assert!(table.by_res[&1].pending);
+        assert!(!table.by_res[&2].pending, "a replacement generation owns its own pending state");
+        assert!(!table.by_res[&3].pending, "GPU-written content must not be overwritten by a retry");
+    }
+
+    #[test]
+    fn preparation_results_fail_closed_on_worker_loss() {
+        assert!(ordered_subresources(2, [(1, Some(Vec::new())), (0, Some(Vec::new()))]).is_some());
+        assert!(ordered_subresources(2, [(0, Some(Vec::new()))]).is_none(), "a missing worker result must fail the batch");
+        assert!(
+            ordered_subresources(2, [(0, Some(Vec::new())), (1, None)]).is_none(),
+            "a caught worker panic must fail the batch",
+        );
     }
 
     #[test]
@@ -1983,6 +4106,219 @@ mod tests {
         d
     }
 
+    #[test]
+    fn committed_sampled_bytes_follow_device_shadowing_and_release() {
+        const M: u64 = 1 << 20;
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let entry = |device, va, committed_bytes, placed| Entry {
+            device,
+            committed_bytes,
+            va,
+            src: va,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
+            placed,
+            unmapped: false,
+            generation: 0,
+        };
+        let mut table = Table::new();
+        table.insert(1, entry(7, 0x10_0000, 3 * M, false));
+        table.insert(2, entry(7, 0x10_2000, 2 * M, false)); // shadows 1, which remains live
+        table.insert(3, entry(7, 0x20_0000, 8 * M, true)); // shared pages, not committed
+        table.insert(4, entry(8, 0x30_0000, 11 * M, false));
+        assert_eq!(table.committed_bytes_for(7), (2, 5 * M));
+        assert_eq!(table.committed_bytes_for(8), (1, 11 * M));
+        assert!(table.remove(2).0);
+        assert_eq!(table.committed_bytes_for(7), (1, 3 * M), "the uncovered sampled texture is counted once");
+        assert!(table.remove(1).0);
+        assert_eq!(table.committed_bytes_for(7), (0, 0), "logical release removes the partial diagnostic owner");
+    }
+
+    fn readback_for(tex: &xg::Texture, format: u32, subresource: u32) -> (ReadbackFootprint, Vec<u8>, Vec<u8>) {
+        let s = tex.texels().unwrap();
+        let mips = s.chain.levels.len();
+        let mip = subresource as usize % mips;
+        let l = &s.chain.levels[mip];
+        let (w, h) = ((s.width >> mip).max(1), (s.height >> mip).max(1));
+        let depth = if s.depth > 0 { (s.depth >> mip).max(1) } else { 1 };
+        let row_bytes = l.width * s.bpe as usize;
+        let row_pitch = row_bytes.next_multiple_of(256);
+        let slice_pitch = row_pitch * l.height;
+        let size = slice_pitch * (l.depth - 1) + row_pitch * (l.height - 1) + row_bytes;
+        let mut readback = vec![0xE7; 512 + size + 31];
+        let mut linear = vec![0; row_bytes * l.height * l.depth];
+        for z in 0..l.depth {
+            for y in 0..l.height {
+                for x in 0..row_bytes {
+                    let v = (z * 71 + y * 17 + x * 3 + 5) as u8;
+                    readback[512 + z * slice_pitch + y * row_pitch + x] = v;
+                    linear[(z * l.height + y) * row_bytes + x] = v;
+                }
+            }
+        }
+        (ReadbackFootprint { offset: 512, size, row_pitch, width: w, height: h, depth, format }, readback, linear)
+    }
+
+    fn driver_download_layout(
+        tex: &xg::Texture,
+        format: u32,
+        selected: &[(u32, D3D12_RESOURCE_STATES)],
+    ) -> Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)> {
+        let s = tex.texels().unwrap();
+        let mips = s.chain.levels.len();
+        let mut end = 0usize;
+        selected
+            .iter()
+            .map(|&(sub, _)| {
+                let mip = if s.depth > 0 { sub as usize } else { sub as usize % mips };
+                let l = &s.chain.levels[mip];
+                let row_bytes = l.width * s.bpe as usize;
+                let pitch = row_bytes.next_multiple_of(256);
+                let offset = end.next_multiple_of(512);
+                end = offset + pitch * l.height * (l.depth - 1) + pitch * (l.height - 1) + row_bytes;
+                (
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: offset as u64,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                            Width: (s.width >> mip).max(1),
+                            Height: (s.height >> mip).max(1),
+                            Depth: if s.depth > 0 { (s.depth >> mip).max(1) } else { 1 },
+                            RowPitch: pitch as u32,
+                        },
+                    },
+                    l.height as u32,
+                    row_bytes as u64,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn download_plans_use_writer_capable_queue_types() {
+        assert!(download_queue_type_supported(D3D12_COMMAND_LIST_TYPE_DIRECT));
+        assert!(download_queue_type_supported(D3D12_COMMAND_LIST_TYPE_COMPUTE));
+        assert!(!download_queue_type_supported(D3D12_COMMAND_LIST_TYPE_COPY));
+    }
+
+    #[test]
+    fn download_layout_preserves_explicit_states_and_bounds_array_and_volume_footprints() {
+        let array_desc = console_desc(3, 17, 9, 2, 3, 28, 0x105);
+        let array = xg::Texture::new(&array_desc).unwrap();
+        let desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&array_desc).as_ptr() as *const _) };
+        let selected = [(0, D3D12_RESOURCE_STATE_COMMON), (5, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+        let driver = driver_download_layout(&array, 28, &selected);
+        let (layout, bytes) = validate_download_layout(&array, &desc, 28, &selected, &driver).unwrap();
+        assert_eq!(layout.iter().map(|s| (s.subresource, s.state)).collect::<Vec<_>>(), selected);
+        assert_eq!(bytes, layout.last().unwrap().footprint.offset + layout.last().unwrap().footprint.size);
+
+        let volume_desc = console_desc(4, 32, 16, 8, 4, 28, 0x105);
+        let volume = xg::Texture::new(&volume_desc).unwrap();
+        let desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&volume_desc).as_ptr() as *const _) };
+        let selected = [(0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), (2, D3D12_RESOURCE_STATE_COPY_SOURCE)];
+        let driver = driver_download_layout(&volume, 28, &selected);
+        let (layout, _) = validate_download_layout(&volume, &desc, 28, &selected, &driver).unwrap();
+        assert!(layout[1].footprint.offset >= layout[0].footprint.offset + layout[0].footprint.size);
+        assert_eq!((layout[1].footprint.width, layout[1].footprint.height, layout[1].footprint.depth), (8, 4, 2));
+    }
+
+    #[test]
+    fn download_layout_rejects_stale_or_driver_enlarged_selections() {
+        let bytes = console_desc(3, 16, 8, 2, 2, 28, 0x105);
+        let tex = xg::Texture::new(&bytes).unwrap();
+        let desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&bytes).as_ptr() as *const _) };
+        let selected = [(0, D3D12_RESOURCE_STATE_COMMON), (3, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+        let exact = driver_download_layout(&tex, 28, &selected);
+        let mut bad = exact.clone();
+        bad[1].0.Footprint.RowPitch += 256;
+        assert!(validate_download_layout(&tex, &desc, 28, &selected, &bad).is_err());
+        let mut bad = exact.clone();
+        bad[0].2 += 4;
+        assert!(validate_download_layout(&tex, &desc, 28, &selected, &bad).is_err());
+        let duplicate = [(0, D3D12_RESOURCE_STATE_COMMON), (0, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+        assert!(validate_download_layout(&tex, &desc, 28, &duplicate, &driver_download_layout(&tex, 28, &duplicate)).is_err());
+        let invalid_state = [(0, D3D12_RESOURCE_STATES(-1))];
+        assert!(validate_download_layout(&tex, &desc, 28, &invalid_state, &driver_download_layout(&tex, 28, &invalid_state)).is_err());
+        assert!(validate_download_layout(&tex, &desc, 28, &selected[..1], &exact).is_err());
+        let mut wrong_dimension = desc;
+        wrong_dimension.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        assert!(validate_download_layout(&tex, &wrong_dimension, 28, &selected, &exact).is_err());
+
+        let rgba = xg::Texture::new(&console_desc(3, 4, 4, 1, 1, 28, 0x105)).unwrap();
+        let bc = console_desc(3, 4, 4, 1, 1, 77, 0x105); // both rows are 16 bytes; block side differs
+        let bc_desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&bc).as_ptr() as *const _) };
+        let one = [(0, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+        assert!(validate_download_layout(&rgba, &bc_desc, 77, &one, &driver_download_layout(&rgba, 77, &one)).is_err());
+        let mut rt = console_desc(3, 16, 8, 1, 1, 28, 0x105);
+        rt[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+        let rt = xg::Texture::new(&rt).unwrap();
+        assert!(validate_download_layout(&rt, &desc, 28, &one, &driver_download_layout(&rt, 28, &one)).is_err());
+    }
+
+    #[test]
+    fn reverse_layout_tiles_an_edge_array_mip_without_touching_guards() {
+        let tex = xg::Texture::new(&console_desc(3, 17, 9, 2, 3, 28, 0x105)).unwrap();
+        let sub = 5; // array slice 1, mip 2
+        let (fp, readback, linear) = readback_for(&tex, 28, sub);
+        let size = tex.size() as usize;
+        let mut console = vec![0xCD; size + 37];
+        reverse_layout_subresource(&tex, 28, sub, fp, &readback, &mut console).unwrap();
+
+        let s = tex.texels().unwrap();
+        let slice = &console[s.chain.slice_bytes..2 * s.chain.slice_bytes];
+        assert_eq!(s.chain.detile_level(slice, 2, 1), linear);
+        assert!(console[size..].iter().all(|&b| b == 0xCD), "destination guard changed");
+        assert!(readback[..512].iter().all(|&b| b == 0xE7));
+        assert!(readback[512 + fp.size..].iter().all(|&b| b == 0xE7));
+    }
+
+    #[test]
+    fn reverse_layout_handles_volume_depth_and_block_geometry() {
+        let volume = xg::Texture::new(&console_desc(4, 32, 16, 8, 4, 28, 0x105)).unwrap();
+        let (fp, readback, linear) = readback_for(&volume, 28, 2);
+        assert_eq!((fp.width, fp.height, fp.depth), (8, 4, 2));
+        let mut console = vec![0u8; volume.size() as usize];
+        reverse_layout_subresource(&volume, 28, 2, fp, &readback, &mut console).unwrap();
+        assert_eq!(volume.texels().unwrap().chain.detile_volume(&console, 2), linear);
+
+        let blocks = xg::Texture::new(&console_desc(3, 10, 9, 1, 1, 71, 0x105)).unwrap();
+        let (fp, readback, linear) = readback_for(&blocks, 71, 0);
+        assert_eq!((fp.width, fp.height, fp.depth), (10, 9, 1));
+        assert_eq!(blocks.texels().unwrap().chain.levels[0].width, 3);
+        let mut console = vec![0u8; blocks.size() as usize];
+        reverse_layout_subresource(&blocks, 71, 0, fp, &readback, &mut console).unwrap();
+        assert_eq!(blocks.texels().unwrap().chain.detile_level(&console, 0, 0), linear);
+    }
+
+    #[test]
+    fn reverse_layout_rejects_metadata_malformed_footprints_and_truncation() {
+        let tex = xg::Texture::new(&console_desc(3, 16, 8, 1, 1, 28, 0x105)).unwrap();
+        let (fp, readback, _) = readback_for(&tex, 28, 0);
+        let mut console = vec![0u8; tex.size() as usize];
+        let call = |f: ReadbackFootprint, src: &[u8], dst: &mut [u8]| reverse_layout_subresource(&tex, 28, 0, f, src, dst);
+        assert_eq!(call(ReadbackFootprint { format: 87, ..fp }, &readback, &mut console), Err(ReverseLayoutError::Format));
+        assert_eq!(reverse_layout_subresource(&tex, 28, 1, fp, &readback, &mut console), Err(ReverseLayoutError::Subresource));
+        assert_eq!(call(ReadbackFootprint { width: 15, ..fp }, &readback, &mut console), Err(ReverseLayoutError::Dimensions));
+        assert_eq!(call(ReadbackFootprint { row_pitch: 255, ..fp }, &readback, &mut console), Err(ReverseLayoutError::RowPitch));
+        assert_eq!(call(ReadbackFootprint { offset: 1, ..fp }, &readback, &mut console), Err(ReverseLayoutError::RowPitch));
+        assert_eq!(call(ReadbackFootprint { size: fp.size - 1, ..fp }, &readback, &mut console), Err(ReverseLayoutError::Footprint));
+        assert_eq!(call(fp, &readback[..512 + fp.size - 1], &mut console), Err(ReverseLayoutError::Footprint));
+        assert_eq!(call(fp, &readback, &mut console[..tex.size() as usize - 1]), Err(ReverseLayoutError::Destination));
+        let overflow = ReadbackFootprint { offset: usize::MAX & !511, ..fp };
+        assert_eq!(call(overflow, &readback, &mut console), Err(ReverseLayoutError::Footprint));
+
+        let mut rt = console_desc(3, 16, 8, 1, 1, 28, 0x105);
+        rt[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+        let rt = xg::Texture::new(&rt).unwrap();
+        let mut rt_console = vec![0u8; rt.size() as usize];
+        assert_eq!(reverse_layout_subresource(&rt, 28, 0, fp, &readback, &mut rt_console), Err(ReverseLayoutError::UnsupportedLayout));
+    }
+
     /// Overlapping textures shadow earlier ones so dead placements never re-upload over shared
     /// `vram::Pages` tiles; different-range overlaps request unmapping while exact same-range
     /// overlaps stay mapped; releasing a newer placement reactivates uncovered older ones.
@@ -1993,6 +4329,7 @@ mod tests {
         assert_eq!((tex_16k.size(), tex_64k.size()), (0x4000, 0x1_0000));
         let entry = |va: usize, tex: &Arc<xg::Texture>, pending: bool, placed: bool| Entry {
             device: 0,
+            committed_bytes: 0,
             va,
             src: va,
             in_gpu_view: false,
@@ -2000,9 +4337,11 @@ mod tests {
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending,
             gpu_written: false,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
             placed,
             unmapped: false,
-            seq: 0,
+            generation: 0,
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.
@@ -2392,6 +4731,41 @@ mod tests {
     }
 
     #[test]
+    fn gpu_owned_alias_generations_restore_the_previous_address_owner() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let entry = |cpu_backed: bool| Entry {
+            device: 0,
+            committed_bytes: 0,
+            va: 0x20_0000,
+            src: 0x20_0000,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: !cpu_backed,
+            gpu_writers: Vec::new(),
+            cpu_backed,
+            placed: !cpu_backed,
+            unmapped: false,
+            generation: 0,
+        };
+        let mut t = Table::new();
+        t.insert(1, entry(true));
+        let cpu_generation = t.by_res[&1].generation;
+        t.insert(2, entry(false));
+        let first_gpu_generation = t.by_res[&2].generation;
+        assert!(t.shadowed.contains_key(&1));
+        t.insert(3, entry(false));
+        assert!(t.shadowed.contains_key(&2));
+        assert!(t.by_res[&3].generation > first_gpu_generation && first_gpu_generation > cpu_generation);
+
+        t.remove(3);
+        assert!(t.by_res.contains_key(&2), "the previous exact-range GPU alias returns");
+        t.remove(2);
+        assert!(t.by_res.get(&1).is_some_and(|e| e.cpu_backed && e.generation == cpu_generation));
+    }
+
+    #[test]
     fn stream_recheck_schedule_catches_late_writes_and_resets_milestones() {
         let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB RGBA8
         let tex = Arc::new(xg::Texture::new(&desc).expect("layout"));
@@ -2403,6 +4777,7 @@ mod tests {
 
         let e_stream = Entry {
             device: 0,
+            committed_bytes: 0,
             va,
             src: va,
             in_gpu_view: false,
@@ -2410,12 +4785,15 @@ mod tests {
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending: false,
             gpu_written: false,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
             placed: false,
             unmapped: false,
-            seq: 0,
+            generation: 0,
         };
         let e_gpu = Entry {
             device: 0,
+            committed_bytes: 0,
             va: va + size,
             src: va,
             in_gpu_view: false,
@@ -2423,9 +4801,11 @@ mod tests {
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending: false,
             gpu_written: true,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
             placed: false,
             unmapped: false,
-            seq: 0,
+            generation: 0,
         };
         {
             let mut t = TEXTURES.lock().unwrap();
@@ -2482,7 +4862,8 @@ mod tests {
     /// first upload, then pages for those levels only and their texels right, zeros where there
     /// are none. With memory under the largest level too, a texture placed there again (as a
     /// title does) takes that level's pages - the others are shared - and holds all of it. A
-    /// texture the GPU writes gets the pages of all its levels.
+    /// texture the GPU writes gets the pages of all its levels. A mapped level also clears when
+    /// the CPU's next upload sources zeros from shared staging.
     #[test]
     fn a_placed_texture_gets_the_pages_of_a_level_with_its_texels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
@@ -2605,9 +4986,27 @@ mod tests {
             }
             // what the GPU writes needs pages under all of the texture: the first one's mip 0 gets
             // the pages of its address, which hold what the second one's upload put there
-            note_gpu_write(small.as_raw() as usize);
+            let write = capture_gpu_write(small.as_raw() as usize, ALL).unwrap();
+            publish_gpu_writes(WriterQueueId { raw: queue.as_raw() as usize, generation: 1 }, &[write]);
             assert_eq!(dev_pages() - p0, (all as usize) << 16, "the same pages");
             assert!(read_sub(&small, 0) == want[0].data, "a GPU-written texture has pages under all its levels");
+            std::ptr::write_bytes((at + top) as *mut u8, 0, size - top);
+            let cpu = std::slice::from_raw_parts_mut(at as *mut u8, chain.slice_bytes);
+            chain.tile_level(cpu, 10, 0, &vec![0u8; want[10].data.len()]);
+            // The synthetic allocation here is not write-watched. Queue the normal batch update.
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                let e = t.by_res.get_mut(&(full.as_raw() as usize)).unwrap();
+                assert!(!e.pending, "the preceding refresh uploaded this texture");
+                e.pending = true;
+                adjust_pending(1);
+            }
+            refresh(queue.as_raw());
+            assert_eq!(dev_pages() - p0, (all as usize) << 16, "clearing a level keeps its backing");
+            assert!(read_sub(&full, 0).iter().all(|&b| b == 0), "the previously streamed level was cleared");
+            assert!(read_sub(&full, 10).iter().all(|&b| b == 0), "a small level sharing the zero span was cleared");
+            assert!(read_sub(&full, 1) == want[1].data, "a nonzero mip kept its texels");
+            assert!(read_sub(&full, 9) == want[9].data, "the small level's neighbour kept its texels");
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             drop((small, full));
             VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
@@ -2793,5 +5192,29 @@ mod tests {
             assert_ne!(m.Protect & PAGE_GUARD, 0, "the guard page is still a guard page");
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn title_queue_upload_states_are_leased_and_serialized_per_queue() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (first_key, second_key) = (0x7ffe_7100usize, 0x7ffe_7200usize);
+        ON_QUEUE.lock().unwrap().remove(&first_key);
+        ON_QUEUE.lock().unwrap().remove(&second_key);
+
+        let first = queue_upload_state(first_key);
+        let second = queue_upload_state(second_key);
+        let first_guard = first.lock().unwrap();
+        assert!(ON_QUEUE.try_lock().is_ok(), "one queue must not hold the upload registry");
+        assert!(second.try_lock().is_ok(), "one queue must not serialize another queue's uploads");
+
+        let removed = ON_QUEUE.lock().unwrap().remove(&first_key).unwrap();
+        assert!(Arc::ptr_eq(&first, &removed), "registry removal returns the leased generation");
+        let replacement = queue_upload_state(first_key);
+        assert!(!Arc::ptr_eq(&first, &replacement), "raw-address reuse gets a fresh queue-local state");
+
+        drop(first_guard);
+        drop(removed);
+        ON_QUEUE.lock().unwrap().remove(&first_key);
+        ON_QUEUE.lock().unwrap().remove(&second_key);
     }
 }

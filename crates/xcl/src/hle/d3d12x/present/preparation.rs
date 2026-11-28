@@ -25,7 +25,8 @@ struct Screen {
 
 impl Screen {
     fn release(&mut self) -> bool {
-        self.ready = !self.progress.cancel.load(Ordering::Relaxed);
+        self.ready = !self.progress.cancel.load(Ordering::Relaxed) &&
+            (!self.progress.corpus.load(Ordering::Acquire) || self.progress.check_corpus_complete().is_ok());
         self.ready
     }
 }
@@ -41,25 +42,44 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     std::env::remove_var("XCL_PREPARATION_PARENT");
     std::env::remove_var("XCL_PREPARATION_MENU");
     let root = &boot.game_root;
-    if boot.config.graphics.eq_ignore_ascii_case("null") ||
-        (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir()) {
-        return Ok(());
-    }
-    if left_out(std::env::var("XCL_PREPARE").ok().as_deref()) {
-        crate::xlog_info!("Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
+    let corpus = root.join(".xcl/pso-corpus").try_exists().map_err(|e| e.to_string())?;
+    if !corpus && std::env::var("XCL_PREPARE").is_ok_and(|v| v.trim() == "0") { return Ok(()); }
+    let history = crate::hle::d3d12x::gfx_records::path().try_exists().map_err(|e| e.to_string())?;
+    if !corpus && !history && (boot.config.graphics.eq_ignore_ascii_case("null") ||
+        (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir())) {
         return Ok(());
     }
     let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), ..Default::default() });
     let hwnd = if super::enabled() {
         *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });
         ACTIVE.store(true, Ordering::Release);
-        let hwnd = super::ensure_window().ok_or("Could not create the presentation window for shader preparation")?;
+        let Some(hwnd) = super::ensure_window() else {
+            ACTIVE.store(false, Ordering::Release);
+            *SCREEN.lock().unwrap() = None;
+            return Err("Could not create the presentation window for pipeline preparation".into());
+        };
         crate::xlog_info!("Shader preparation window {:#x}", hwnd.0 as usize);
         Some(hwnd)
     } else { None };
     let result = std::thread::scope(|scope| {
         let worker = scope.spawn(|| prepare_for_launch(root, &progress));
+        // (a line every 5 s: a log that stands still for long reads as a frozen process)
+        let (began, mut said) = (Instant::now(), Instant::now());
         while !worker.is_finished() {
+            if said.elapsed() >= Duration::from_secs(5) {
+                said = Instant::now();
+                let workers = progress.workers.load(Ordering::Relaxed);
+                let graphics = progress.graphics.load(Ordering::Relaxed);
+                let corpus = progress.corpus.load(Ordering::Acquire);
+                crate::xlog_info!(
+                    "Shader preparation: {} of {} {} {} after {} s",
+                    progress.done.load(Ordering::Relaxed),
+                    progress.total.load(Ordering::Relaxed),
+                    if corpus { "pipeline recipes" } else if graphics { "graphics pipelines" } else { "records" },
+                    if corpus { "confirmed by the graphics driver".into() } else if graphics { format!("processed by {workers} workers") } else if workers != 0 { format!("checked for pipelines by {workers} workers") } else { "processed".into() },
+                    began.elapsed().as_secs()
+                );
+            }
             if let Some(parent) = &parent {
                 if unsafe { WaitForSingleObject(parent.as_raw_handle(), 80) } == WAIT_OBJECT_0 {
                     // The launcher was stopped during preparation. Do not leave an orphan compile or start the title.
@@ -133,6 +153,38 @@ unsafe fn text(dc: HDC, rect: RECT, value: &str, size: i32, weight: i32, color: 
     DeleteObject(font);
 }
 
+/// A projected wireframe whose illuminated columns follow confirmed progress.
+unsafe fn draw_surface(dc: HDC, rect: RECT, pct: usize) {
+    use windows_sys::Win32::Foundation::POINT;
+    const COLS: i32 = 24;
+    const ROWS: i32 = 8;
+    let vertex = |col: i32, row: i32| {
+        let u = col as f64 / COLS as f64;
+        let v = row as f64 / ROWS as f64;
+        let hill = |x: f64, z: f64, height: f64| height * (-20.0*(u-x).powi(2) - 6.0*(v-z).powi(2)).exp();
+        let elevation = hill(0.35, 0.41, 0.53) + hill(0.68, 0.55, 0.34);
+        POINT { x: rect.left + ((rect.right-rect.left) as f64*(0.80*u + 0.19*(1.0-v))) as i32,
+                y: rect.top + ((rect.bottom-rect.top) as f64*(0.42 + 0.55*v - elevation)) as i32 }
+    };
+    let shadow = CreatePen(PS_SOLID, 1, 0x4d4734);
+    let lit = CreatePen(PS_SOLID, 1, 0x97cc86);
+    let base = CreateSolidBrush(0x28251b);
+    let old_pen = SelectObject(dc, shadow);
+    let old_brush = SelectObject(dc, base);
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            let points = [vertex(col,row),vertex(col+1,row),vertex(col+1,row+1),vertex(col,row+1)];
+            SelectObject(dc, if 100*(col+1) as usize <= COLS as usize*pct { lit } else { shadow });
+            Polygon(dc, points.as_ptr(), points.len() as i32);
+            MoveToEx(dc, points[0].x, points[0].y, std::ptr::null_mut());
+            LineTo(dc, points[2].x, points[2].y);
+        }
+    }
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(base); DeleteObject(shadow); DeleteObject(lit);
+}
+
 unsafe fn paint(hwnd: HWND, s: &mut Screen) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dest = BeginPaint(hwnd.0, &mut ps);
@@ -147,23 +199,37 @@ unsafe fn paint(hwnd: HWND, s: &mut Screen) {
         let scale = |px: i32| (px * GetDeviceCaps(dc, LOGPIXELSY as i32).max(96)) / 96;
         let width = scale(560).min((rc.right - scale(40)).max(1));
         let x = (rc.right - width) / 2;
-        let y = ((rc.bottom - scale(150)) / 2).max(0);
+        let art = if rc.bottom >= scale(300) && width >= scale(300) { scale(132) } else { 0 };
+        let top = ((rc.bottom - scale(150) - art) / 2).max(0);
+        let y = top + art;
         let row = |top, bottom| RECT { left: x, right: x+width, top: y+scale(top), bottom: y+scale(bottom) };
         let done = s.progress.done.load(Ordering::Relaxed);
         let total = s.progress.total.load(Ordering::Relaxed);
         let pct = percent(done, total, s.ready);
+        if art != 0 {
+            draw_surface(dc, RECT { left: x, right: x+width, top, bottom: y-scale(14) }, pct);
+        }
         let (quiet, last) = s.clock.sample(done, s.start.elapsed());
-        let heading = if s.progress.cancel.load(Ordering::Relaxed) { "Cancelling preparation" } else { "Preparing shaders" };
+        let workers = s.progress.workers.load(Ordering::Relaxed);
+        let graphics = workers != 0 && s.progress.graphics.load(Ordering::Relaxed);
+        let corpus = s.progress.corpus.load(Ordering::Acquire);
+        let heading = if s.progress.cancel.load(Ordering::Relaxed) { "Cancelling preparation" } else if s.ready { "Ready to launch" }
+            else if corpus { "Preparing pipeline cache" } else if graphics { "Building graphics pipelines" } else if workers != 0 { "Building pipelines" } else { "Preparing shaders" };
         let mut title = row(0,48);
         title.right -= scale(84);
         text(dc, title, heading, scale(31), 600, 0xf7f5f1, DT_LEFT);
         text(dc, row(0,48), &format!("{pct}%"), scale(27), 600, 0xdfd09a, DT_RIGHT);
-        let bar = row(65,72);
+        let bar = row(62,72);
         fill(dc, bar, 0x4b4038);
         fill(dc, RECT {right: x+(width as i64 * pct as i64/100) as i32, ..bar}, 0xbdb458);
-        let count = if total == 0 { "Reading shader records…".into() } else { format!("{done} of {total} records processed") };
+        let count = if corpus { format!("{done} of {total} pipeline recipes confirmed by the driver") }
+            else if total == 0 { "Reading shader records…".into() }
+            else if graphics { format!("{done} of {total} graphics pipelines processed by {workers} worker processes") }
+            else if workers != 0 { format!("{done} of {total} records checked by {workers} worker processes") }
+            else { format!("{done} of {total} records processed") };
         text(dc, row(87,112), &count, scale(17), 400, 0xe1dcd7, DT_LEFT);
-        let mut times = format!("No shader progress for {quiet} s");
+        let elapsed = s.start.elapsed().as_secs();
+        let mut times = format!("Elapsed {}:{:02}    ·    {quiet} s since last progress", elapsed / 60, elapsed % 60);
         if let Some(ago) = last { times.push_str(&format!("    ·    Last stall ended {ago} s ago")); }
         text(dc, row(117,145), &times, scale(14), 400, 0xb4aaa4, DT_LEFT);
         BitBlt(dest, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
@@ -198,22 +264,9 @@ fn percent(done: usize, total: usize, ready: bool) -> usize {
     if ready { 100 } else { done.saturating_mul(100).checked_div(total).unwrap_or(0).min(99) }
 }
 
-/// `XCL_PREPARE=0` (`value`): the title starts at once and builds what it uses as it goes,
-/// standing still for those builds, as before the preparation (the switch nvidia-dev has).
-fn left_out(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "0")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Only `XCL_PREPARE=0` leaves the preparation out; unset or any other value prepares.
-    #[test]
-    fn only_xcl_prepare_0_leaves_the_preparation_out() {
-        assert!(left_out(Some("0")) && left_out(Some(" 0 ")));
-        assert!(!left_out(None) && !left_out(Some("1")) && !left_out(Some("")) && !left_out(Some("no")));
-    }
 
     #[test]
     fn clock_advances_during_a_stall_and_remembers_recovery() {
@@ -235,6 +288,25 @@ mod tests {
         progress.cancel.store(true, Ordering::Relaxed);
         assert!(!screen.release());
         assert!(!screen.ready);
+    }
+
+    #[test]
+    fn corpus_handoff_requires_every_native_completion() {
+        let progress = Arc::new(LaunchPreparation::default());
+        let mut screen = Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false };
+        assert!(progress.check_corpus_complete().is_err());
+        progress.begin_corpus(0);
+        assert!(!screen.release());
+        progress.begin_corpus(3);
+        progress.complete_corpus(2).unwrap();
+        progress.complete_corpus(1).unwrap();
+        assert_eq!(progress.done.load(Ordering::Acquire), 2);
+        assert!(progress.complete_corpus(4).is_err());
+        assert!(!screen.release());
+        progress.complete_corpus(3).unwrap();
+        assert!(screen.release());
+        progress.cancel.store(true, Ordering::Release);
+        assert!(!screen.release());
     }
 
     #[test]

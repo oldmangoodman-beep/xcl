@@ -4,6 +4,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 /// Bump on any change to two-pass cache key fields or ABI root-signature layout to invalidate stale disk entries.
 const TWO_PASS_CACHE_SCHEMA: u32 = 2;
+/// Native extended graphics streams have a separate identity namespace from two-pass streams.
+const GRAPHICS_STREAM_CACHE_SCHEMA: u32 = 1;
 /// ABI root signature layout tag for two-pass pipelines (`graphics = true`: 6 root UAVs + directly indexed heaps + IA flag).
 const TWO_PASS_ABI_RS_TAG: u32 = 0x5253_0001;
 
@@ -176,7 +178,10 @@ unsafe fn hash_depth_stencil(h: &mut Fnv64, ty: u32, p: &[u8]) -> Option<()> {
 /// Canonical cache key `(hash, total_shader_bytes)` for a two-pass mesh/PS pipeline stream,
 /// hashing referenced shader bytecodes and normalized fixed-function state (never pointers or
 /// struct padding). Shader pointers in the stream must refer to live shader bytecode. Returns `None` if an unsupported, duplicate, or unknown subobject is active.
-pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], driver_id: u64, mem_windows: u32) -> Option<(u64, usize)> {
+unsafe fn stream_key(
+    stream: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSampler], schema: u32,
+    kind: u32, driver_id: u64, mem_windows: u32,
+) -> Option<(u64, usize)> {
     let mut subs = stream_subobjects(stream)?;
     let total = subs.iter().map(|(ty, payload)| {
         let (_, align) = super::super::null::subobject_payload(*ty).unwrap();
@@ -190,12 +195,12 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
         return None;
     }
     let mut h = Fnv64::new();
-    h.u32(TWO_PASS_CACHE_SCHEMA);
-    h.u32(1); // stream kind
+    h.u32(schema);
+    h.u32(kind);
     h.u32(TWO_PASS_ABI_RS_TAG);
     h.u32(mem_windows);
     h.u64(driver_id);
-    samplers_hash_into(&mut h, ps_samplers);
+    samplers_hash_into(&mut h, samplers);
     let mut shader_bytes = 0usize;
     for (ty, payload) in subs {
         match ty {
@@ -222,7 +227,14 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
             }
             1..=6 | 24 | 25 => {
                 let state = read_state::<D3D12_SHADER_BYTECODE>(payload)?;
-                if state.BytecodeLength == 0 && ty != 25 {
+                if state.BytecodeLength == 0 {
+                    if ty == 25 {
+                        return None;
+                    }
+                    if matches!(ty, 1..=5) && payload.iter().all(|&byte| byte == 0) {
+                        h.u32(ty);
+                        h.u64(0);
+                    }
                     continue;
                 }
                 let code = payload_shader(payload)?;
@@ -256,6 +268,16 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
     Some((h.finish(), shader_bytes))
 }
 
+pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], driver_id: u64, mem_windows: u32) -> Option<(u64, usize)> {
+    stream_key(stream, ps_samplers, TWO_PASS_CACHE_SCHEMA, 1, driver_id, mem_windows)
+}
+
+/// Canonical identity for a translated native graphics stream. The distinct schema/kind prevents
+/// its driver blobs from aliasing either legacy graphics descriptors or two-pass mesh streams.
+pub(super) unsafe fn graphics_stream_key(stream: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSampler], mem_windows: u32) -> Option<(u64, usize)> {
+    stream_key(stream, samplers, GRAPHICS_STREAM_CACHE_SCHEMA, 3, 0, mem_windows)
+}
+
 pub(super) fn two_pass_cs_key(cs: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSampler], driver_id: u64, mem_windows: u32) -> u64 {
     let mut h = Fnv64::new();
     h.u32(TWO_PASS_CACHE_SCHEMA);
@@ -274,6 +296,25 @@ mod tests {
     use super::*;
     use super::super::StreamOut;
     use std::ffi::c_void;
+
+    #[test]
+    fn inactive_shader_stages_keep_a_two_pass_driver_cache_key() {
+        let ms = [1u8, 2, 3, 4];
+        let key = |stages: &[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE]| {
+            let mut stream = StreamOut::default();
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+            for &stage in stages { stream.put(stage, &D3D12_SHADER_BYTECODE::default()); }
+            unsafe { two_pass_stream_key(&stream.0, &[], 7, 1) }
+        };
+        let ds = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS;
+        let hs = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS;
+        let gs = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
+        let tagged = key(&[ds, hs, gs]).unwrap();
+        assert_eq!(tagged.1, ms.len());
+        assert_eq!(Some(tagged), key(&[gs, ds, hs]));
+        assert_ne!(Some(tagged), key(&[]));
+        assert_eq!(key(&[ds, ds]), None);
+    }
 
     #[test]
     fn canonical_stream_key_distinguishes_state_samplers_and_driver() {
@@ -392,6 +433,29 @@ mod tests {
             let mut empty_ms = StreamOut::default();
             empty_ms.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &empty_shader);
             assert_eq!(two_pass_stream_key(&empty_ms.0, &[], 1, 4), None);
+        }
+    }
+
+    #[test]
+    fn graphics_stream_key_is_canonical_distinct_and_pointer_free() {
+        let vs = [1u8, 2, 3, 4];
+        let mut a = StreamOut::default();
+        a.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs);
+        a.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &7u32);
+        let mut b = StreamOut::default();
+        b.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &7u32);
+        b.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs);
+        unsafe {
+            let ga = graphics_stream_key(&a.0, &[], 1).unwrap();
+            assert_eq!(ga, graphics_stream_key(&b.0, &[], 1).unwrap());
+            assert_ne!(ga, two_pass_stream_key(&a.0, &[], 0, 1).unwrap());
+            assert_ne!(ga, graphics_stream_key(&a.0, &[([1, 2, 3, 4], false)], 1).unwrap());
+
+            let mut pointer = StreamOut(a.0.clone(), a.1);
+            pointer.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: 0x1234 as *const _, NumElements: 1,
+            });
+            assert_eq!(graphics_stream_key(&pointer.0, &[], 1), None);
         }
     }
 

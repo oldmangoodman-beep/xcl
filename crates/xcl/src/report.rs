@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::resolver::{self, Source};
 
+pub const STALL_SUMMARY_VERSION: u32 = 1;
+pub const PREPARATION_SUMMARY_VERSION: u32 = 3;
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct StubCall {
     pub dll: String,
@@ -40,6 +43,120 @@ pub struct VfsInfo {
     pub whiteouts: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StallAggregate {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub total_ns: u64,
+    #[serde(default)]
+    pub max_ns: u64,
+    /// Index N counts durations from 2^N through 2^(N+1)-1 nanoseconds; bucket zero
+    /// also contains zero-duration spans.
+    #[serde(default)]
+    pub histogram_log2_ns: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StallEvent {
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub started_ns: u64,
+    #[serde(default)]
+    pub duration_ns: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StallSummary {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub aggregates: Vec<StallAggregate>,
+    #[serde(default)]
+    pub slow_events: Vec<StallEvent>,
+}
+
+fn stall_kind_name(kind: crate::stall::StallKind) -> &'static str {
+    use crate::stall::StallKind;
+    match kind {
+        StallKind::ShaderTranslation => "shader_translation",
+        StallKind::DxcQueue => "dxc_queue",
+        StallKind::DxcCompile => "dxc_compile",
+        StallKind::PipelineQueueAdmission => "pipeline_queue_admission",
+        StallKind::PipelineQueueSpeculative => "pipeline_queue_speculative",
+        StallKind::PipelineQueueDemand => "pipeline_queue_demand",
+        StallKind::PipelineWait => "pipeline_wait",
+        StallKind::PipelineRestoreDemand => "pipeline_restore_demand",
+        StallKind::PipelineRestoreWait => "pipeline_restore_wait",
+        StallKind::PipelineRestoreReconcile => "pipeline_restore_reconcile",
+        StallKind::DriverCompileGate => "driver_compile_gate",
+        StallKind::DriverCompile => "driver_compile",
+        StallKind::SubmitPreparation => "submit_preparation",
+        StallKind::MemorySynchronization => "memory_synchronization",
+        StallKind::Residency => "residency",
+        StallKind::CacheIo => "cache_io",
+        StallKind::LockContention => "lock_contention",
+        StallKind::GpuWait => "gpu_wait",
+        StallKind::Present => "present",
+        StallKind::DirectStorage => "direct_storage",
+        StallKind::DetailDraw => "detail_draw",
+        StallKind::DetailDispatch => "detail_dispatch",
+        StallKind::DetailBind => "detail_bind",
+        StallKind::DetailViewDescriptor => "detail_view_descriptor",
+        StallKind::DetailBarrier => "detail_barrier",
+        StallKind::DetailCopy => "detail_copy",
+        StallKind::DetailListLifecycle => "detail_list_lifecycle",
+    }
+}
+
+impl From<crate::stall::Snapshot> for StallSummary {
+    fn from(snapshot: crate::stall::Snapshot) -> Self {
+        let slow_skip = snapshot.slow_spans.len().saturating_sub(crate::stall::SLOW_SPAN_CAPACITY);
+        Self {
+            version: STALL_SUMMARY_VERSION,
+            aggregates: snapshot
+                .aggregates
+                .into_iter()
+                .map(|a| StallAggregate {
+                    kind: stall_kind_name(a.kind).into(),
+                    count: a.count,
+                    total_ns: a.total_ns,
+                    max_ns: a.max_ns,
+                    histogram_log2_ns: a.histogram.into(),
+                })
+                .collect(),
+            slow_events: snapshot
+                .slow_spans
+                .into_iter()
+                .skip(slow_skip)
+                .map(|s| StallEvent {
+                    sequence: s.sequence,
+                    kind: stall_kind_name(s.kind).into(),
+                    started_ns: s.started_ns,
+                    duration_ns: s.duration_ns,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PreparationSummary {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub compute_build_coalescing: crate::hle::d3d12x::pso_async::ComputeCoalescingStats,
+    #[serde(default)]
+    pub ranked_preloads: crate::hle::d3d12x::pso_async::RankedPreloadStats,
+    #[serde(default)]
+    pub allocator_submits: crate::hle::d3d12x::AllocatorSubmitStats,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Report {
     pub xcl_version: String,
@@ -65,6 +182,9 @@ pub struct Report {
     /// none was loaded)
     #[serde(default)]
     pub dxc: crate::gpu::recomp::dxc::Toolchain,
+    /// Versioned preparation-plane counters. Optional so reports from older XCL builds load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<PreparationSummary>,
     /// D3D12.X backend: adapter, interface layouts, unknown IIDs, fallbacks, presented frames
     #[serde(default)]
     pub d3d12: crate::hle::d3d12x::real::D3d12Stats,
@@ -79,6 +199,10 @@ pub struct Report {
     /// `XCL_DSTORAGE_BCPACK_FILL`
     #[serde(default)]
     pub dstorage: crate::hle::dstorage::DStorageStats,
+    /// Coarse runtime timings when `XCL_STALL_TRACE` was enabled. The events contain only
+    /// categories and monotonic times, never title paths, shader contents, or pipeline keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalls: Option<StallSummary>,
     pub notes: Vec<String>,
 }
 
@@ -142,10 +266,17 @@ pub fn build() -> Report {
         vfs,
         shaders: crate::gpu::shader::stats(),
         dxc: crate::gpu::recomp::dxc::toolchain(),
+        preparation: Some(PreparationSummary {
+            version: PREPARATION_SUMMARY_VERSION,
+            compute_build_coalescing: crate::hle::d3d12x::pso_async::compute_coalescing_stats(),
+            ranked_preloads: crate::hle::d3d12x::pso_async::ranked_preload_stats(),
+            allocator_submits: crate::hle::d3d12x::allocator_submit_stats(),
+        }),
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
         dstorage: crate::hle::dstorage::stats(),
+        stalls: crate::stall::snapshot().map(Into::into),
         notes: vec![
             "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
             "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
@@ -196,6 +327,133 @@ pub fn load(path: &std::path::Path) -> Option<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_reports_without_a_stall_summary_still_deserialize() {
+        let old = serde_json::to_value(Report::default()).unwrap();
+        assert!(old.get("stalls").is_none(), "an absent summary is not serialized");
+        assert!(old.get("preparation").is_none(), "an absent preparation summary is not serialized");
+        let report: Report = serde_json::from_value(old).unwrap();
+        assert!(report.stalls.is_none());
+        assert!(report.preparation.is_none());
+    }
+
+    #[test]
+    fn preparation_summary_has_a_versioned_stable_json_shape() {
+        let summary = PreparationSummary {
+            version: PREPARATION_SUMMARY_VERSION,
+            compute_build_coalescing: crate::hle::d3d12x::pso_async::ComputeCoalescingStats {
+                keyed_submissions: 12,
+                coalescing_hits: 5,
+                unique_keyed_builds: 7,
+                current_in_flight: 3,
+                peak_in_flight: 6,
+            },
+            ranked_preloads: crate::hle::d3d12x::pso_async::RankedPreloadStats {
+                submissions: 19,
+                started: 13,
+                promoted: 4,
+            },
+            allocator_submits: crate::hle::d3d12x::AllocatorSubmitStats {
+                outer_execute_calls: 11,
+                chunks: 14,
+                multi_chunk_calls: 2,
+                forced_wait_boundaries: 3,
+                lists_marked: 37,
+                backing_mark_writes: 23,
+                signal_attempts: 14,
+                signal_failures: 1,
+                state_lock_wait_ns: 101,
+                state_lock_hold_ns: 202,
+            },
+        };
+        let json = serde_json::to_value(summary).unwrap();
+        assert_eq!(json["version"], PREPARATION_SUMMARY_VERSION);
+        assert_eq!(json["compute_build_coalescing"]["keyed_submissions"], 12);
+        assert_eq!(json["compute_build_coalescing"]["coalescing_hits"], 5);
+        assert_eq!(json["compute_build_coalescing"]["unique_keyed_builds"], 7);
+        assert_eq!(json["compute_build_coalescing"]["current_in_flight"], 3);
+        assert_eq!(json["compute_build_coalescing"]["peak_in_flight"], 6);
+        assert_eq!(json["ranked_preloads"]["submissions"], 19);
+        assert_eq!(json["ranked_preloads"]["started"], 13);
+        assert_eq!(json["ranked_preloads"]["promoted"], 4);
+        assert_eq!(json["allocator_submits"]["outer_execute_calls"], 11);
+        assert_eq!(json["allocator_submits"]["state_lock_hold_ns"], 202);
+
+        let mut version_two = json;
+        version_two["version"] = 2.into();
+        version_two.as_object_mut().unwrap().remove("allocator_submits");
+        let loaded: PreparationSummary = serde_json::from_value(version_two.clone()).unwrap();
+        assert_eq!(loaded.allocator_submits, Default::default());
+
+        let mut version_one = version_two;
+        version_one["version"] = 1.into();
+        version_one.as_object_mut().unwrap().remove("ranked_preloads");
+        let loaded: PreparationSummary = serde_json::from_value(version_one).unwrap();
+        assert_eq!(loaded.ranked_preloads, Default::default());
+    }
+
+    #[test]
+    fn a_stall_snapshot_has_a_versioned_stable_json_shape() {
+        let mut histogram = [0; crate::stall::HISTOGRAM_BUCKETS];
+        histogram[10] = 2;
+        let summary = StallSummary::from(crate::stall::Snapshot {
+            aggregates: vec![crate::stall::AggregateSnapshot {
+                kind: crate::stall::StallKind::DxcCompile,
+                count: 2,
+                total_ns: 2500,
+                max_ns: 1476,
+                histogram,
+            }],
+            slow_spans: vec![crate::stall::SlowSpan {
+                sequence: 7,
+                kind: crate::stall::StallKind::GpuWait,
+                started_ns: 100,
+                duration_ns: 50_000_000,
+            }],
+        });
+        let json = serde_json::to_value(summary).unwrap();
+
+        assert_eq!(json["version"], STALL_SUMMARY_VERSION);
+        assert_eq!(json["aggregates"][0]["kind"], "dxc_compile");
+        assert_eq!(json["aggregates"][0]["count"], 2);
+        assert_eq!(json["aggregates"][0]["histogram_log2_ns"][10], 2);
+        assert_eq!(json["aggregates"][0]["histogram_log2_ns"].as_array().unwrap().len(), crate::stall::HISTOGRAM_BUCKETS);
+        assert_eq!(json["slow_events"][0]["kind"], "gpu_wait");
+        assert_eq!(json["slow_events"][0]["sequence"], 7);
+        assert_eq!(json["slow_events"][0]["duration_ns"], 50_000_000);
+    }
+
+    #[test]
+    fn pipeline_stall_names_are_stable() {
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueAdmission), "pipeline_queue_admission");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueSpeculative), "pipeline_queue_speculative");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueDemand), "pipeline_queue_demand");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineRestoreDemand), "pipeline_restore_demand");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineRestoreWait), "pipeline_restore_wait");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineRestoreReconcile), "pipeline_restore_reconcile");
+    }
+
+    #[test]
+    fn missing_fields_in_a_stall_summary_take_safe_defaults() {
+        let summary: StallSummary = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert_eq!(summary, StallSummary { version: 1, aggregates: Vec::new(), slow_events: Vec::new() });
+    }
+
+    #[test]
+    fn a_stall_summary_keeps_only_the_newest_bounded_events() {
+        let slow_spans = (0..crate::stall::SLOW_SPAN_CAPACITY + 2)
+            .map(|sequence| crate::stall::SlowSpan {
+                sequence: sequence as u64,
+                kind: crate::stall::StallKind::GpuWait,
+                started_ns: sequence as u64,
+                duration_ns: crate::stall::SLOW_SPAN_NS,
+            })
+            .collect();
+        let summary = StallSummary::from(crate::stall::Snapshot { aggregates: Vec::new(), slow_spans });
+        assert_eq!(summary.slow_events.len(), crate::stall::SLOW_SPAN_CAPACITY);
+        assert_eq!(summary.slow_events[0].sequence, 2);
+    }
 
     #[test]
     fn a_crash_is_kept_while_another_thread_writes_the_report() {

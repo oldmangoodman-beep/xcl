@@ -91,39 +91,60 @@ pub fn compact_nest_tag() -> Option<String> {
 /// `translate_full` in the compact form (`compact = true`) or the plain one.
 #[cfg(test)]
 pub fn translate_full_as(code: &[u8], o: KernelOptions, compact: bool) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, Some(compact), None, super::compact::TABLE_WORDS_WAVE32)
+    translate_entry(code, o, Entry::Kernel, Some(compact), None)
 }
 
 /// `translate_full` in the compact form with an explicit dispatch nesting policy.
 #[cfg(test)]
 pub fn translate_full_nested(code: &[u8], o: KernelOptions, nest: super::compact::Nest) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, Some(true), Some(nest), super::compact::TABLE_WORDS_WAVE32)
+    translate_entry(code, o, Entry::Kernel, Some(true), Some(nest))
 }
 
 pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, compact_mode(), None, super::compact::TABLE_WORDS_WAVE32)
+    translate_entry(code, o, Entry::Kernel, compact_mode(), None)
 }
 
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Mesh(ms.clone()), None, None, 0)
+    translate_entry(code, o, Entry::Mesh(ms.clone()), None, None)
 }
 
 /// A vertex shader (the recompiler's `Mode::Vertex`; wave-size independent).
 pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Vertex(vs.clone()), None, None, 0)
+    translate_entry(code, o, Entry::Vertex(vs.clone()), None, None)
 }
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None, 0)
+    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
 /// group of 21 triangles into `res` (the recompiler's `Mode::Geometry`). Always wave64.
 pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
-    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
+    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None)
+}
+
+/// Whether `entry` uses the measured, one-path heap-window read form. Graphics, mesh and
+/// geometry stages retain the guarded form until they have stage-specific measurements.
+fn reads_heap_flat(entry: &Entry, heap: bool, mem_windows: u32) -> bool {
+    heap && matches!(entry, Entry::Kernel | Entry::Compute(_)) && mem_windows & crate::gpu::recomp::HEAP_FLAT != 0
+}
+
+#[cfg(test)]
+#[test]
+fn only_compute_programs_read_heap_windows_flat() {
+    use crate::gpu::recomp::{GsInterface, MsInterface, HEAP_FLAT, HEAP_WINDOWS};
+    let flat = 4 | HEAP_WINDOWS | HEAP_FLAT;
+    assert!(reads_heap_flat(&Entry::Kernel, true, flat));
+    assert!(reads_heap_flat(&Entry::Compute(CsInterface::default()), true, flat));
+    assert!(!reads_heap_flat(&Entry::Mesh(MsInterface::default()), true, flat));
+    assert!(!reads_heap_flat(&Entry::Geometry(GsInterface::default()), true, flat));
+    assert!(!reads_heap_flat(&Entry::Vertex(VsInterface::default()), true, flat));
+    assert!(!reads_heap_flat(&Entry::Pixel(PsInterface::default()), true, flat));
+    assert!(!reads_heap_flat(&Entry::Compute(CsInterface::default()), true, 4 | HEAP_WINDOWS));
+    assert!(!reads_heap_flat(&Entry::Compute(CsInterface::default()), false, flat));
 }
 
 /// The entry ABI.
@@ -137,15 +158,17 @@ pub enum Entry {
     Geometry(GsInterface),
 }
 
-/// A compute-mode program (the CS ABI of `cs`).
-pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
-    translate_compute_on(code, o, cs, true)
+/// Whether `d` accesses the group's LDS rather than using the DS encoding for a cross-lane
+/// operation. GDS is separate global memory and is refused by the instruction lowering itself.
+pub(crate) fn real_lds_access(d: &Decoded) -> bool {
+    d.enc.name == "ENC_DS"
+        && crate::gpu::rdna2::field_value(d.enc, &d.words, "GDS") != Some(1)
+        && !matches!(d.inst.name, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP")
 }
 
-/// `translate_compute` for a GPU: one that runs only 32-lane waves takes larger compact tables.
-pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool) -> Result<Kernel, String> {
-    let tables = if wave32_only { super::compact::TABLE_WORDS_WAVE32 } else { super::compact::TABLE_WORDS };
-    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables)
+/// A compute-mode program (the CS ABI of `cs`).
+pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
+    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None)
 }
 
 fn translate_entry(
@@ -154,15 +177,20 @@ fn translate_entry(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
-    tables: usize,
 ) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
+    #[cfg(test)]
+    let no_select_fold = super::module::NO_SELECT_FOLD.with(|c| c.get());
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables))
+        .spawn(move || {
+            #[cfg(test)]
+            super::module::NO_SELECT_FOLD.with(|c| c.set(no_select_fold));
+            translate_on_this_thread(&code, o, entry, compact, nest)
+        })
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -178,7 +206,7 @@ fn translate_entry(
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::recomp::HEAP_FLAT)).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -192,7 +220,6 @@ fn translate_on_this_thread(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
-    tables: usize,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
@@ -205,9 +232,24 @@ fn translate_on_this_thread(
     let kernel = matches!(entry, Entry::Kernel);
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+    if gfx && o.wave64 {
+        let upper = crate::gpu::recomp::upper_lanes::analyze(&cfg.insts);
+        if upper.reads.values().any(|&r| r == crate::gpu::recomp::upper_lanes::Read::Shadow) {
+            return Err("wave64 graphics v_writelane spill needs the HLSL path".into());
+        }
+        if o.split && upper.reads.values().any(|&r| r != crate::gpu::recomp::upper_lanes::Read::Native) {
+            return Err("wave64 VS / PS in 32-lane waves: a read of lanes 32–63".into());
+        }
+    }
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
+    if split && !matches!(entry, Entry::Geometry(_)) && cfg.insts.iter().any(real_lds_access) {
+        return Err("split wave64 LDS access needs the HLSL path".into());
+    }
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    if gfx && !crate::gpu::recomp::graphics_reductions(&cfg.insts, &leaders, o.wave64).reads.is_empty() {
+        return Err("graphics whole-wave reduction needs the HLSL path".into());
+    }
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
@@ -259,6 +301,10 @@ fn translate_on_this_thread(
             [1, 1, 1]
         }
     };
+    // Entry setup may contain real control flow (compute dispatch limits use a guarded
+    // prologue). The program must start after that prologue's join, not by appending another
+    // branch to the already-terminated physical entry block.
+    let prologue = lw.cur();
     // the HLSL kernel loads and stores every register its emitted instructions name: all of
     // them in a program with branches, those up to the first s_endpgm in straight-line code
     let branchy = cfg.insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
@@ -282,7 +328,7 @@ fn translate_on_this_thread(
         _ if !compute && !kernel => None,
         Some(false) => None,
         Some(true) => super::compact::plan(&cfg, &lw),
-        None => super::compact::automatic_plan(&cfg, &lw, compute && split, tables),
+        None => super::compact::automatic_plan(&cfg, &lw, compute && split),
     };
     if let Some(p) = &plan {
         crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());
@@ -325,12 +371,12 @@ fn translate_on_this_thread(
     if gs_only {
         // the GS alone: in the lower hardware wave only
         let gate = lw.block(Some(1));
-        lw.edge(Block(0), gate);
+        lw.edge(prologue, gate);
         lw.s.m.set_block(gate);
         let up = lw.upper;
         lw.cond_br(up, exit, h0);
     } else {
-        lw.edge(Block(0), h0);
+        lw.edge(prologue, h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
     // scalar loads the program repeats keep their first values (compute programs and kernels:
@@ -440,7 +486,7 @@ fn translate_on_this_thread(
         }
     }
     lw.s.m.ret();
-    lw.s.m.set_block(Block(0));
+    lw.s.m.set_block(prologue);
     lw.s.m.br(h0);
     let hw = if split || !o.wave64 { 32 } else { 64 };
     let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
@@ -474,7 +520,7 @@ impl Lw {
     /// `entry`: the shader with its buffers,
     /// the SSA's entry block, the program's LDS and the split form's exchange storage and
     /// partner. The caller then sets up the lanes for its entry (`setup_lanes*`), lowers the
-    /// program's blocks, branches from `Block(0)` to the first of them and ends with
+    /// program's blocks, branches from the entry prologue's exit to the first of them and ends with
     /// [`Lw::finish`]. #1426's block walk (`translate_on_this_thread`) and the recompiler's
     /// per-lane lowering (`recomp::lower_dxil`) both build their `Lw` here.
     pub fn new(insts: &[Decoded], leaders: &BTreeSet<u64>, o: KernelOptions, entry: &Entry) -> Lw {
@@ -517,6 +563,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            heap_flat: reads_heap_flat(entry, heap_mem.is_some(), o.mem_windows),
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),
@@ -537,6 +584,7 @@ impl Lw {
             xs: None,
             xw: None,
             xc: None,
+            barrier_waves: None,
             waves: 1,
             cw: z,
             xn: z,
@@ -567,7 +615,7 @@ impl Lw {
         let mut slot = 1u32;
         for d in insts {
             let n = d.inst.name;
-            if d.enc.name == "ENC_DS" && !matches!(n, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP") {
+            if real_lds_access(d) {
                 uses_lds = true;
             }
             if n == "DS_BPERMUTE_B32" {
@@ -594,6 +642,10 @@ impl Lw {
         };
         if let (Some(t), true) = (group_threads, split) {
             lw.waves = t.div_ceil(64).max(1);
+        }
+        if let (Some(t), Entry::Compute(_) | Entry::Mesh(_)) = (group_threads, entry) {
+            let hw_lanes = if split || !o.wave64 { 32 } else { 64 };
+            lw.barrier_waves = Some(t.div_ceil(hw_lanes).max(1));
         }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
@@ -642,6 +694,15 @@ impl Lw {
         }
         Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn compute_dispatch_limit_prologue_reaches_the_program_after_its_guard() {
+    let code = crate::gpu::rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
+    let cs = CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    translate_compute(&code, options, &cs).expect("a guarded dispatch-limit prologue");
 }
 
 #[cfg(test)]
@@ -741,7 +802,44 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     }
     let zero = lw.c(0);
     sgpr.insert(VAR_SCC, zero);
+    let io = lw.init.io.expect("the I/O buffer");
+    let mut dispatch_limited = lw.s.m.i1c(false);
+    let mut limits = Vec::new();
+    for (k, _) in cs.threads.iter().enumerate().filter(|(_, &threads)| threads > 1) {
+        let off = lw.c((crate::gpu::recomp::IO_THREAD_LIMIT[k] * 4) as u32);
+        let limit = lw.s.raw_load(io, off, 1)[0];
+        let zero = lw.c(0);
+        let limited = lw.cmp(Pred::Ne, limit, zero);
+        dispatch_limited = lw.lor(dispatch_limited, limited);
+        limits.push((k, limit));
+    }
     let (lo, hi) = entry_exec(lw, total, tid);
+    let (exec_lo, exec_hi) = (lw.tmp_var(), lw.tmp_var());
+    lw.wr(exec_lo, lo);
+    lw.wr(exec_hi, hi);
+    let _ = lw.guarded(dispatch_limited, &mut |lw| {
+        let mut dispatch_live = lw.s.m.i1c(true);
+        for &(k, limit) in &limits {
+            let zero = lw.c(0);
+            let unlimited = lw.cmp(Pred::Eq, limit, zero);
+            let group = lw.s.group_id(k as u32);
+            let width = lw.c(cs.threads[k]);
+            let base = lw.mul(group, width);
+            let id = lw.add(base, gtid[k]);
+            let inside = lw.cmp(Pred::ULt, id, limit);
+            let axis_live = lw.lor(unlimited, inside);
+            dispatch_live = lw.land(dispatch_live, axis_live);
+        }
+        let (dispatch_lo, dispatch_hi) = lw.ballot(dispatch_live);
+        let old_lo = lw.rd(exec_lo);
+        let old_hi = lw.rd(exec_hi);
+        let lo = lw.and(old_lo, dispatch_lo);
+        let hi = lw.and(old_hi, dispatch_hi);
+        lw.wr(exec_lo, lo);
+        lw.wr(exec_hi, hi);
+        Ok(())
+    });
+    let (lo, hi) = (lw.rd(exec_lo), lw.rd(exec_hi));
     sgpr.insert(126, lo);
     sgpr.insert(127, hi);
     let mut vgpr = HashMap::new();

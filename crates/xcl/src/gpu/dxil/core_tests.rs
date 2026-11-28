@@ -187,6 +187,51 @@ fn branchy_graphics_stages_validate() {
     }
 }
 
+/// Wave64 graphics shaders that need `upper_lanes` are refused in 32-lane mode so the PSO
+/// route falls back to HLSL. Native wave64 and shaders without upper-lane reads stay direct.
+#[test]
+fn wave64_graphics_with_upper_lane_reads_refused_in_32_lane_mode() {
+    use crate::gpu::recomp::{Mode, PsInterface, VsInterface};
+    let vsi = VsInterface { inputs: vec![], outputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], attr_base: 4, params: None };
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let upper_body = |exp| {
+        prog(&[
+            ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 193)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 133)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 2)], None),
+            exp,
+        ])
+    };
+    let native_body = |exp| {
+        prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 242)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 242)], None),
+            exp,
+        ])
+    };
+    let vs_exp = ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 4), ("VSRC3", 5), ("DONE", 1)][..], None);
+    let ps_exp = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 4), ("VSRC3", 5), ("DONE", 1), ("VM", 1)][..], None);
+    let split = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let native = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+    let (vs_upper, ps_upper) = (upper_body(vs_exp), upper_body(ps_exp));
+    for e in [
+        super::kernel::translate_vertex(&vs_upper, split, &vsi).err().expect("split VS upper read"),
+        super::kernel::translate_pixel(&ps_upper, split, &psi).err().expect("split PS upper read"),
+    ] {
+        assert!(e.contains("lanes 32–63"), "{e}");
+    }
+    assert!(super::coverage::translate_mode(&vs_upper, &Mode::Vertex(vsi.clone()), split, false).is_err());
+    assert!(super::coverage::translate_mode(&ps_upper, &Mode::Pixel(psi.clone()), split, false).is_err());
+    super::kernel::translate_vertex(&vs_upper, native, &vsi).expect("native wave64 VS");
+    super::kernel::translate_pixel(&ps_upper, native, &psi).expect("native wave64 PS");
+
+    super::kernel::translate_vertex(&native_body(vs_exp), split, &vsi).expect("split VS without upper reads");
+    super::kernel::translate_pixel(&native_body(ps_exp), split, &psi).expect("split PS without upper reads");
+}
+
 /// A long pixel shader (guarded memory accesses make thousands of joins between a
 /// register's write and the output stores) translates quickly and stays small: the
 /// SSA builder drops trivial phis, `Module::optimize` cleans up the rest.
@@ -659,6 +704,17 @@ fn raw_loads_in_root_windows_are_branchless() {
     let heap_dxil = translate(&loads, KernelOptions { wave64: false, split: false, mem_windows: 4 | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
         .expect("heap windows translate");
     super::validate::validate(&heap_dxil).expect("heap windows validate");
+    let flat_dxil = translate(&loads, KernelOptions {
+        wave64: false,
+        split: false,
+        mem_windows: 4 | crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::recomp::HEAP_FLAT,
+        sampler_base: 0,
+    }).expect("flat heap windows translate");
+    super::validate::validate(&flat_dxil).expect("flat heap windows validate");
+    if let (Ok(heap), Ok(flat)) = (super::validate::disassemble(&heap_dxil), super::validate::disassemble(&flat_dxil)) {
+        let branches = |s: &str| s.lines().filter(|line| line.trim_start().starts_with("br i1 ")).count();
+        assert!(branches(&flat) < branches(&heap), "flat heap reads must remove guarded-read branches: guarded {}, flat {}", branches(&heap), branches(&flat));
+    }
 
     let writes = prog(&[
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),

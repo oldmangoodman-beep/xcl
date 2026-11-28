@@ -68,6 +68,12 @@ impl Op {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests can compare emitted code with the guarded-select fold disabled.
+    pub(crate) static NO_SELECT_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How an instruction may be merged with an identical one.
 #[derive(PartialEq)]
 enum Cse {
@@ -106,10 +112,193 @@ impl Module {
         }
     }
 
+    /// Conservative unsigned `[lo, hi]` value range of an `i32` value, up to `depth` steps deep.
+    fn unsigned_range_i32(&self, v: Value, depth: u8) -> (u32, u32) {
+        if let Some(c) = self.const_u64(v) {
+            let k = c as u32;
+            return (k, k);
+        }
+        if depth == 0 {
+            return (0, u32::MAX);
+        }
+        let Value::Inst(j) = v else { return (0, u32::MAX) };
+        let d = depth - 1;
+        match &self.insts[j as usize].op {
+            Op::Bin(BinOp::And, x, y, 0) => match self.const_u64(*x).or_else(|| self.const_u64(*y)) {
+                Some(m) => (0, m as u32),
+                None => (0, u32::MAX),
+            },
+            Op::Bin(BinOp::LShr, _, sh, 0) => match self.const_u64(*sh) {
+                Some(s) if s < 32 => (0, u32::MAX >> s),
+                _ => (0, u32::MAX),
+            },
+            Op::Cast(CastOp::ZExt, inner, _) => match self.int_width(self.value_ty(*inner)) {
+                Some(iw) if iw < 32 => (0, (1u32 << iw) - 1),
+                _ => (0, u32::MAX),
+            },
+            Op::Select(_, t, f) => {
+                let (lt, ht) = self.unsigned_range_i32(*t, d);
+                let (lf, hf) = self.unsigned_range_i32(*f, d);
+                (lt.min(lf), ht.max(hf))
+            }
+            Op::Call(f, args) if args.len() == 3 && self.funcs[*f as usize].name == "dx.op.binary.i32" => {
+                match self.const_u64(args[0]) {
+                    Some(39) => {
+                        let (la, ha) = self.unsigned_range_i32(args[1], d);
+                        let (lb, hb) = self.unsigned_range_i32(args[2], d);
+                        (la.max(lb), ha.max(hb))
+                    }
+                    Some(40) => {
+                        let (la, ha) = self.unsigned_range_i32(args[1], d);
+                        let (lb, hb) = self.unsigned_range_i32(args[2], d);
+                        (la.min(lb), ha.min(hb))
+                    }
+                    _ => (0, u32::MAX),
+                }
+            }
+            _ => (0, u32::MAX),
+        }
+    }
+
+    /// Conservative signed `[lo, hi]` value range of an `i32` value, up to `depth` steps deep.
+    fn signed_range_i32(&self, v: Value, depth: u8) -> (i32, i32) {
+        if let Some(c) = self.const_u64(v) {
+            let k = c as u32 as i32;
+            return (k, k);
+        }
+        if depth == 0 {
+            return (i32::MIN, i32::MAX);
+        }
+        let Value::Inst(j) = v else { return (i32::MIN, i32::MAX) };
+        let d = depth - 1;
+        match &self.insts[j as usize].op {
+            Op::Bin(BinOp::And, x, y, 0) => match self.const_u64(*x).or_else(|| self.const_u64(*y)) {
+                Some(m) if (m as u32) <= i32::MAX as u32 => (0, m as u32 as i32),
+                _ => (i32::MIN, i32::MAX),
+            },
+            Op::Bin(BinOp::LShr, _, sh, 0) => match self.const_u64(*sh) {
+                Some(s) if (1..32).contains(&s) => (0, (u32::MAX >> s) as i32),
+                _ => (i32::MIN, i32::MAX),
+            },
+            Op::Bin(BinOp::AShr, _, sh, 0) => match self.const_u64(*sh) {
+                Some(s) if (1..32).contains(&s) => (i32::MIN >> s, i32::MAX >> s),
+                _ => (i32::MIN, i32::MAX),
+            },
+            Op::Cast(CastOp::ZExt, inner, _) => match self.int_width(self.value_ty(*inner)) {
+                Some(iw) if iw < 32 => (0, ((1u32 << iw) - 1) as i32),
+                _ => (i32::MIN, i32::MAX),
+            },
+            Op::Cast(CastOp::SExt, inner, _) => match self.int_width(self.value_ty(*inner)) {
+                Some(iw) if (1..32).contains(&iw) => (-(1i32 << (iw - 1)), (1i32 << (iw - 1)) - 1),
+                _ => (i32::MIN, i32::MAX),
+            },
+            Op::Select(_, t, f) => {
+                let (lt, ht) = self.signed_range_i32(*t, d);
+                let (lf, hf) = self.signed_range_i32(*f, d);
+                (lt.min(lf), ht.max(hf))
+            }
+            Op::Call(f, args) if args.len() == 3 && self.funcs[*f as usize].name == "dx.op.binary.i32" => {
+                match self.const_u64(args[0]) {
+                    Some(37) => {
+                        let (la, ha) = self.signed_range_i32(args[1], d);
+                        let (lb, hb) = self.signed_range_i32(args[2], d);
+                        (la.max(lb), ha.max(hb))
+                    }
+                    Some(38) => {
+                        let (la, ha) = self.signed_range_i32(args[1], d);
+                        let (lb, hb) = self.signed_range_i32(args[2], d);
+                        (la.min(lb), ha.min(hb))
+                    }
+                    _ => (i32::MIN, i32::MAX),
+                }
+            }
+            _ => (i32::MIN, i32::MAX),
+        }
+    }
+
+    /// Simplifies `dx.op.binary.i32` integer min/max (`IMax=37`, `IMin=38`, `UMax=39`, `UMin=40`)
+    /// via operand identity, lattice absorption, and conservative `[lo, hi]` interval bounds.
+    fn simplify_int_minmax(&self, op_code: u64, a: Value, b: Value) -> Option<Value> {
+        let (is_signed, is_max, dual) = match op_code {
+            37 => (true, true, 38u64),
+            38 => (true, false, 37u64),
+            39 => (false, true, 40u64),
+            40 => (false, false, 39u64),
+            _ => return None,
+        };
+        if a == b {
+            return Some(a);
+        }
+        // Lattice idempotence & absorption: min(min(x,y), x) = min(x,y), min(max(x,y), x) = x, etc.
+        for (cand, other) in [(a, b), (b, a)] {
+            if let Value::Inst(j) = cand {
+                if let Op::Call(f2, a2) = &self.insts[j as usize].op {
+                    if a2.len() == 3 && self.funcs[*f2 as usize].name == "dx.op.binary.i32" {
+                        let inner_op = self.const_u64(a2[0]);
+                        if a2[1] == other || a2[2] == other {
+                            if inner_op == Some(op_code) {
+                                return Some(cand);
+                            }
+                            if inner_op == Some(dual) {
+                                return Some(other);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if is_signed {
+            let (la, ha) = self.signed_range_i32(a, 4);
+            let (lb, hb) = self.signed_range_i32(b, 4);
+            if is_max {
+                if la >= hb {
+                    return Some(a);
+                }
+                if lb >= ha {
+                    return Some(b);
+                }
+            } else {
+                if ha <= lb {
+                    return Some(a);
+                }
+                if hb <= la {
+                    return Some(b);
+                }
+            }
+        } else {
+            let (la, ha) = self.unsigned_range_i32(a, 4);
+            let (lb, hb) = self.unsigned_range_i32(b, 4);
+            if is_max {
+                if la >= hb {
+                    return Some(a);
+                }
+                if lb >= ha {
+                    return Some(b);
+                }
+            } else {
+                if ha <= lb {
+                    return Some(a);
+                }
+                if hb <= la {
+                    return Some(b);
+                }
+            }
+        }
+        None
+    }
+
     /// Cheap algebraic & constant simplification on already-resolved operands.
     fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
         // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
         if matches!(self.types[ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
+            return None;
+        }
+        if let Op::Call(f, args) = op {
+            if args.len() == 3 && self.funcs[*f as usize].name == "dx.op.binary.i32" {
+                if let Some(op_code) = self.const_u64(args[0]) {
+                    return self.simplify_int_minmax(op_code, args[1], args[2]);
+                }
+            }
             return None;
         }
         match *op {
@@ -427,7 +616,7 @@ impl Module {
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,cse,select,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -457,6 +646,14 @@ impl Module {
         }
 
         let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
+        let mut inst_at = vec![usize::MAX; self.insts.len()];
+        let mut at = 0;
+        for &b in &order {
+            for &i in &self.blocks[b as usize] {
+                inst_at[i as usize] = at;
+                at += 1;
+            }
+        }
 
         // trivial phis (all incoming values the phi itself or one value), to a fixed point
         while !skip("phi") {
@@ -482,7 +679,14 @@ impl Module {
                         }
                         same = Some(v);
                     }
-                    if let (true, Some(v)) = (trivial, same) {
+                    // A phi may refer to a value produced on a backedge. Replacing the phi
+                    // with that value would make uses near the block header precede its
+                    // definition in the serialized function.
+                    let available = same.is_some_and(|v| match v {
+                        Value::Inst(j) => inst_at[j as usize] < inst_at[i],
+                        _ => true,
+                    });
+                    if let (true, true, Some(v)) = (trivial, available, same) {
                         repl[i] = Some(v);
                         changed = true;
                     }
@@ -586,7 +790,11 @@ impl Module {
                             }
                             same = Some(v);
                         }
-                        if let (true, Some(v)) = (trivial, same) {
+                        let available = same.is_some_and(|v| match v {
+                            Value::Inst(j) => inst_at[j as usize] < inst_at[i],
+                            _ => true,
+                        });
+                        if let (true, true, Some(v)) = (trivial, available, same) {
                             repl[i] = Some(v);
                             changed = true;
                         }
@@ -603,6 +811,14 @@ impl Module {
                 let i = self.blocks[b as usize][k] as usize;
                 self.insts[i].op.map_operands(|v| resolve(&mut repl, v));
             }
+        }
+
+        #[cfg(test)]
+        let skip_select = NO_SELECT_FOLD.with(|c| c.get());
+        #[cfg(not(test))]
+        let skip_select = false;
+        if !skip("select") && !skip_select {
+            self.fold_guarded_selects(&order, &repl);
         }
 
         // dead instructions: live = side effects, terminators and their operands, transitively
@@ -634,6 +850,14 @@ impl Module {
 
         if !skip("merge") && self.simplify_cfg() {
             let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            inst_at.fill(usize::MAX);
+            let mut at = 0;
+            for &b in &order {
+                for &i in &self.blocks[b as usize] {
+                    inst_at[i as usize] = at;
+                    at += 1;
+                }
+            }
             let mut repl2: Vec<Option<Value>> = vec![None; self.insts.len()];
             let mut phi_changed = false;
             while !skip("phi") {
@@ -659,7 +883,11 @@ impl Module {
                             }
                             same = Some(v);
                         }
-                        if let (true, Some(v)) = (trivial, same) {
+                        let available = same.is_some_and(|v| match v {
+                            Value::Inst(j) => inst_at[j as usize] < inst_at[i],
+                            _ => true,
+                        });
+                        if let (true, true, Some(v)) = (trivial, available, same) {
                             repl2[i] = Some(v);
                             changed = true;
                             phi_changed = true;
@@ -704,6 +932,115 @@ impl Module {
                 }
             }
             debug_assert!(self.uses_well_formed(&order));
+        }
+    }
+
+    /// Whether `op` computes each lane from only that lane's operands. Operations whose
+    /// evaluation observes other lanes, memory, or undefined integer division operands are
+    /// deliberately excluded.
+    fn lane_local(&self, op: &Op, ty: Ty) -> bool {
+        match op {
+            Op::Bin(BinOp::UDiv | BinOp::URem, ..) => false,
+            Op::Bin(BinOp::SDiv | BinOp::SRem, ..) => self.is_float(ty),
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+            Op::Call(f, args) => {
+                let d = &self.funcs[*f as usize];
+                d.attrs == FnAttrs::ReadNone
+                    && d.name.starts_with("dx.op.")
+                    && args.first().and_then(|&a| self.const_u64(a)).is_some_and(|id| matches!(id, 6..=56 | 101 | 102 | 124..=132))
+            }
+            _ => false,
+        }
+    }
+
+    /// Reads through `select(c, current, old)` only where the value is ultimately observed
+    /// under the same `c`. This removes guest-EXEC preservation arms from chains of lane-local
+    /// operations without changing inactive lanes. Phis and non-lane-local operations observe
+    /// all lanes and stop the fold.
+    fn fold_guarded_selects(&mut self, order: &[u32], repl: &[Option<Value>]) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Seen {
+            Unused,
+            Where(Value),
+            All,
+        }
+        fn meet(s: &mut Seen, by: Seen) {
+            *s = match (*s, by) {
+                (x, Seen::Unused) => x,
+                (Seen::Unused, y) => y,
+                (Seen::Where(a), Seen::Where(b)) if a == b => Seen::Where(a),
+                _ => Seen::All,
+            }
+        }
+
+        let live = |i: u32| repl[i as usize].is_none();
+        let mut seen = vec![Seen::Unused; self.insts.len()];
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                if let (true, Op::Phi(inc)) = (live(i), &self.insts[i as usize].op) {
+                    for &(v, _) in inc {
+                        if let Value::Inst(j) = v {
+                            seen[j as usize] = Seen::All;
+                        }
+                    }
+                }
+            }
+        }
+        for &b in order.iter().rev() {
+            for &i in self.blocks[b as usize].iter().rev() {
+                if !live(i) {
+                    continue;
+                }
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if matches!(op, Op::Phi(_)) {
+                    continue;
+                }
+                let me = if self.lane_local(op, ty) { seen[i as usize] } else { Seen::All };
+                if me == Seen::Unused {
+                    continue;
+                }
+                let mut by = |v: Value, s: Seen| {
+                    if let Value::Inst(j) = v {
+                        meet(&mut seen[j as usize], s);
+                    }
+                };
+                match *op {
+                    Op::Select(c, a, b) => {
+                        by(c, me);
+                        by(a, Seen::Where(c));
+                        by(b, me);
+                    }
+                    _ => op.for_each_operand(|v| by(v, me)),
+                }
+            }
+        }
+        for &b in order {
+            for k in 0..self.blocks[b as usize].len() {
+                let i = self.blocks[b as usize][k];
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if !live(i) || seen[i as usize] == Seen::Unused || !self.lane_local(op, ty) {
+                    continue;
+                }
+                let me = seen[i as usize];
+                let outer_condition = if let Op::Select(c, ..) = *op { Some(c) } else { None };
+                let mut op = op.clone();
+                let mut pos = 0;
+                op.map_operands(|mut v| {
+                    let at = pos;
+                    pos += 1;
+                    while let Value::Inst(j) = v {
+                        let Op::Select(c, t, f) = self.insts[j as usize].op else { break };
+                        v = match (outer_condition, at) {
+                            (Some(outer), 1) if outer == c => t,
+                            (Some(outer), 2) if outer == c => f,
+                            _ if me == Seen::Where(c) => t,
+                            _ => break,
+                        };
+                    }
+                    v
+                });
+                self.insts[i as usize].op = op;
+            }
         }
     }
 
@@ -835,7 +1172,7 @@ impl Module {
                 while let Some(&term_i) = self.blocks[a].last() {
                     let Op::Br(b_blk) = self.insts[term_i as usize].op else { break };
                     let b = b_blk.0 as usize;
-                    if b == 0 || b == a || self.blocks[b].is_empty() || pred_edges[b] != 1 {
+                    if b == 0 || b == a || self.blocks[b].is_empty() || pred_edges[b] != 1 || self.preserve_block_boundary[b] {
                         break;
                     }
                     // Verify every leading phi in `b` has an incoming value from `a` before mutating.
@@ -1131,6 +1468,31 @@ mod tests {
     }
 
     #[test]
+    fn simplify_cfg_keeps_preserved_block_boundary() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let guarded = m.new_block();
+        let exit = m.new_block();
+        m.preserve_block_boundary(guarded);
+
+        let void = m.void();
+        let sink_ty = m.func_ty(void, &[]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        m.br(guarded);
+        m.set_block(guarded);
+        m.call(sink, &[]);
+        m.br(exit);
+        m.set_block(exit);
+        m.ret();
+
+        m.optimize();
+        assert_eq!(reachable_blocks(&m), 2, "preserved boundary should survive linear block merging");
+    }
+
+    #[test]
     fn simplify_cfg_preserves_phi_conflict_trampoline() {
         let mut m = Module::new();
         m.define_entry("main");
@@ -1259,6 +1621,47 @@ mod tests {
         let Op::Phi(inc) = &m.insts[iv_i as usize].op else { panic!("expected phi") };
         assert!(inc.iter().any(|&(_, b)| b == header), "header phi backedge should point to header after latch merge");
         assert!(!inc.iter().any(|&(_, b)| b == latch), "merged latch must not remain in header phi");
+    }
+
+    #[test]
+    fn trivial_loop_phi_keeps_backedge_definition_after_header_uses() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let header = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let one = m.i32c(1);
+        let limit = m.i32c(10);
+        m.br(header);
+
+        m.set_block(header);
+        let iv = m.phi(i32t);
+        m.add_incoming(iv, iv, entry);
+        m.br(latch);
+
+        m.set_block(latch);
+        let next = m.bin(BinOp::Add, iv, one);
+        m.add_incoming(iv, next, latch);
+        let cont = m.cmp(Pred::ULt, next, limit);
+        m.cond_br(cont, header, exit);
+
+        m.set_block(exit);
+        m.call(sink, &[next]);
+        m.ret();
+
+        m.optimize();
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+        let Value::Inst(iv_i) = iv else { unreachable!() };
+        assert!(m.blocks.iter().any(|b| b.contains(&iv_i)), "the backedge value cannot replace the header phi");
     }
 
     #[test]
@@ -1401,4 +1804,218 @@ mod tests {
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }
+    #[test]
+    fn guarded_selects_fold_only_for_same_condition_lane_local_uses() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        let x = m.call(src, &[]);
+        let (one, three, five, sentinel) = (m.i32c(1), m.i32c(3), m.i32c(5), m.i32c(0xA5A5_5A5A));
+        let exec = m.cmp(Pred::ULt, x, five);
+        let old = m.bin(BinOp::Xor, x, sentinel);
+        let current = m.bin(BinOp::Add, x, one);
+        let saved = m.select(exec, current, old);
+        let product = m.bin(BinOp::Mul, saved, three);
+        let guarded = m.select(exec, product, saved);
+
+        // A second preserved value is read by an all-lane observer and must remain intact.
+        let must_stay = m.select(exec, current, x);
+        let all_lane_use = m.bin(BinOp::Sub, must_stay, one);
+        m.call(sink, &[guarded]);
+        m.call(sink, &[all_lane_use]);
+        m.ret();
+        m.optimize();
+
+        let Value::Inst(guarded_i) = guarded else { panic!() };
+        let Value::Inst(product_i) = product else { panic!() };
+        assert!(matches!(m.insts[guarded_i as usize].op, Op::Select(c, t, f) if c == exec && t == product && f == old));
+        assert!(matches!(m.insts[product_i as usize].op, Op::Bin(BinOp::Mul, a, b, 0) if (a, b) == (current, three) || (a, b) == (three, current)));
+        let body = &m.blocks[entry.0 as usize];
+        let present = |v: Value| matches!(v, Value::Inst(i) if body.contains(&i));
+        assert!(!present(saved), "the EXEC-preservation select should have no uses");
+        assert!(present(must_stay), "an all-lane use must retain its preservation select");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+}
+
+#[cfg(test)]
+mod int_minmax_tests {
+    use super::*;
+    use crate::gpu::dxil::{
+        kernel::{self, KernelOptions},
+        validate,
+    };
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner;
+
+    #[test]
+    fn simplify_int_minmax_folds_bounds_absorption_and_clamps() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let i32t = m.i32();
+        let void = m.void();
+        let src_ty = m.func_ty(i32t, &[]);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let bin_ty = m.func_ty(i32t, &[i32t, i32t, i32t]);
+        let src = m.declare("src", src_ty, FnAttrs::NoUnwind);
+        let sink = m.declare("sink", sink_ty, FnAttrs::NoUnwind);
+        let bin_fn = m.declare("dx.op.binary.i32", bin_ty, FnAttrs::ReadNone);
+        m.set_block(entry);
+
+        let x = m.call(src, &[]);
+        let y = m.call(src, &[]);
+        let imax = m.i32c(37);
+        let imin = m.i32c(38);
+        let umax = m.i32c(39);
+        let umin = m.i32c(40);
+        let c0 = m.i32c(0);
+        let c16 = m.i32c(16);
+        let c255 = m.i32c(255);
+        let c100 = m.i32c(100);
+        let cneg = m.i32c((-10i32) as u32);
+        let cu_max = m.i32c(u32::MAX);
+        let ci_min = m.i32c(i32::MIN as u32);
+        let ci_max = m.i32c(i32::MAX as u32);
+        let mff = m.i32c(0xFF);
+
+        // 1. Constant folding & identity/absorbing bounds.
+        let k_umin = m.call(bin_fn, &[umin, c255, c100]);
+        let k_imax = m.call(bin_fn, &[imax, cneg, c100]);
+        let umin_zero = m.call(bin_fn, &[umin, x, c0]);
+        let umax_zero = m.call(bin_fn, &[umax, x, c0]);
+        let umin_all = m.call(bin_fn, &[umin, x, cu_max]);
+        let imin_min = m.call(bin_fn, &[imin, x, ci_min]);
+        let imax_min = m.call(bin_fn, &[imax, x, ci_min]);
+        let imin_max = m.call(bin_fn, &[imin, x, ci_max]);
+
+        // 2. Lattice idempotence & absorption.
+        let mxy = m.call(bin_fn, &[umin, x, y]);
+        let idemp = m.call(bin_fn, &[umin, mxy, x]);
+        let absorb = m.call(bin_fn, &[umax, mxy, x]);
+
+        // 3. Range-based elision on masked byte (0..=255) and ashr16 (-32768..=32767).
+        let byte = m.bin(BinOp::And, x, mff);
+        let byte_imax0 = m.call(bin_fn, &[imax, byte, c0]);
+        let byte_umin255 = m.call(bin_fn, &[umin, byte, c255]);
+        let s16 = m.bin(BinOp::AShr, x, c16);
+        let c_i16_lo = m.i32c((-32768i32) as u32);
+        let c_i16_hi = m.i32c(32767);
+        let s16_lo = m.call(bin_fn, &[imax, s16, c_i16_lo]);
+        let s16_hi = m.call(bin_fn, &[imin, s16_lo, c_i16_hi]);
+
+        // 4. Full 4-op med3_i32(x, 0, 255) collapses to 2 ops: imin(imax(x, 0), 255).
+        let p = m.call(bin_fn, &[imin, x, c0]);
+        let q = m.call(bin_fn, &[imax, x, c0]);
+        let r = m.call(bin_fn, &[imin, q, c255]);
+        let med = m.call(bin_fn, &[imax, p, r]);
+
+        // 5. Soundness check: signed mask with bit 31 set MUST NOT fold imax(x & 0x8000_00FF, 0).
+        let m_sign = m.i32c(0x8000_00FF);
+        let signed_bits = m.bin(BinOp::And, x, m_sign);
+        let must_stay = m.call(bin_fn, &[imax, signed_bits, c0]);
+
+        for v in [
+            k_umin,
+            k_imax,
+            umin_zero,
+            umax_zero,
+            umin_all,
+            imin_min,
+            imax_min,
+            imin_max,
+            idemp,
+            absorb,
+            byte_imax0,
+            byte_umin255,
+            s16_hi,
+            med,
+            must_stay,
+        ] {
+            m.call(sink, &[v]);
+        }
+        m.ret();
+        m.optimize();
+
+        let args: Vec<Value> = m.blocks[entry.0 as usize]
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, a) if *f == sink => Some(a[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 15);
+        assert_eq!(m.const_u64(args[0]), Some(100), "umin(255, 100) -> 100");
+        assert_eq!(m.const_u64(args[1]), Some(100), "imax(-10, 100) -> 100");
+        assert_eq!(m.const_u64(args[2]), Some(0), "umin(x, 0) -> 0");
+        assert_eq!(args[3], x, "umax(x, 0) -> x");
+        assert_eq!(args[4], x, "umin(x, u32::MAX) -> x");
+        assert_eq!(m.const_u64(args[5]), Some(i32::MIN as u32 as u64), "imin(x, i32::MIN) -> i32::MIN");
+        assert_eq!(args[6], x, "imax(x, i32::MIN) -> x");
+        assert_eq!(args[7], x, "imin(x, i32::MAX) -> x");
+        assert_eq!(args[8], mxy, "umin(umin(x, y), x) -> umin(x, y)");
+        assert_eq!(args[9], x, "umax(umin(x, y), x) -> x");
+        assert_eq!(args[10], byte, "imax(x & 0xFF, 0) -> x & 0xFF");
+        assert_eq!(args[11], byte, "umin(x & 0xFF, 255) -> x & 0xFF");
+        assert_eq!(args[12], s16, "clamp(ashr(x, 16), -32768, 32767) -> ashr(x, 16)");
+        assert_eq!(args[13], r, "med3_i32(x, 0, 255) collapses to imin(imax(x, 0), 255)");
+        assert_eq!(args[14], must_stay, "imax(x & 0x800000FF, 0) must not fold");
+    }
+
+    #[test]
+    fn med3_via_sgpr_bounds_collapses_and_matches_gpu() {
+        // Real RDNA2 pattern: upper bound loaded into an SGPR (becomes constant only after mem2reg),
+        // then fed into v_med3_i32 / v_med3_u32 in both bound orders.
+        let mut code = Vec::new();
+        code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 255)], Some(255)).unwrap());
+        code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 128)], None).unwrap()); // 0
+        // v2 = med3_i32(v0, s3=0, s2=255) -> 2 ops (down from 4)
+        code.extend(encode("V_MED3_I32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 3), ("SRC2", 2)], None).unwrap());
+        // v3 = med3_i32(v0, s2=255, s3=0) -> 2 ops (reversed bounds, down from 4)
+        code.extend(encode("V_MED3_I32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 256), ("SRC1", 2), ("SRC2", 3)], None).unwrap());
+        // v4 = med3_u32(v0, s3=0, s2=255) -> 1 op (umin(v0, 255), down from 4)
+        code.extend(encode("V_MED3_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 256), ("SRC1", 3), ("SRC2", 2)], None).unwrap());
+        // v5 = med3_u32(v0, s3=0, v1) -> 1 op (umin(v0, v1), down from 4)
+        code.extend(encode("V_MED3_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 256), ("SRC1", 3), ("SRC2", 257)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("translate sgpr med3");
+        validate::validate(&dxil).expect("validate sgpr med3");
+        let dis = validate::disassemble(&dxil).expect("disasm sgpr med3");
+        let calls = dis.matches("call i32 @dx.op.binary.i32(").count();
+        assert_eq!(calls, 6, "expected 6 binary.i32 calls (2+2+1+1, down from 16), got {calls}:\n{dis}");
+
+        if !matches!(runner::wave32_supported(), Ok(true)) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let v0s: [u32; 10] = [0, 1, 128, 255, 256, 1000, (-1i32) as u32, (-255i32) as u32, i32::MIN as u32, i32::MAX as u32];
+        let v1s: [u32; 10] = [10, 0, 200, 100, 300, 50, u32::MAX, 42, 0x8000_0001, 500];
+        let mut st = runner::KernelState::default();
+        for l in 0..v0s.len() {
+            st.vgpr[l][0] = v0s[l];
+            st.vgpr[l][1] = v1s[l];
+        }
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run sgpr med3");
+        for l in 0..v0s.len() {
+            let (a, b) = (v0s[l], v1s[l]);
+            let want_clamp_i = (a as i32).clamp(0, 255) as u32;
+            assert_eq!(r.vgpr[l][2], want_clamp_i, "med3_i32(v0, 0, 255) lane {l}");
+            assert_eq!(r.vgpr[l][3], want_clamp_i, "med3_i32(v0, 255, 0) lane {l}");
+            assert_eq!(r.vgpr[l][4], a.min(255), "med3_u32(v0, 0, 255) lane {l}");
+            assert_eq!(r.vgpr[l][5], a.min(b), "med3_u32(v0, 0, v1) lane {l}");
+        }
+    }
+
 }

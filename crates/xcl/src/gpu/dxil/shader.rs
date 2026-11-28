@@ -518,6 +518,17 @@ impl Shader {
         }
     }
 
+    /// Drop static binding metadata that this optimized shader cannot reach.
+    /// Dynamic binding descriptors conservatively keep the complete table.
+    pub(super) fn prune_unused_bindings(&mut self) {
+        let Some(refs) = self.m.referenced_bindings() else { return };
+        self.bindings.retain(|binding| refs.iter().any(|&(class, space, lower, upper)| {
+            class == binding.class as u8
+                && space == binding.space
+                && (lower..=upper).contains(&binding.lower)
+        }));
+    }
+
     /// Writes metadata, bitcode and the signed container (panics on a builder error: tests;
     /// translators use [`Shader::try_finish`]).
     pub fn finish(self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {

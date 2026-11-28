@@ -51,4 +51,4 @@ jobs:
 
       - name: Build and test
         shell: pwsh
-        run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
+        run: ./scripts/test.ps1 --nocapture --skip test_title_runs_and_game_folder_is_untouched

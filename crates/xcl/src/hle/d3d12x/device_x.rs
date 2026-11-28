@@ -78,6 +78,7 @@ pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, d
     let d = if desc.is_null() { [0; 4] } else { pc_queue_desc(desc.read_unaligned()) };
     let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::present::track_queue(*ppv as usize);
         super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
     }
     hr
@@ -88,6 +89,14 @@ pub(super) unsafe extern "system" fn create_command_allocator_x(this: *mut c_voi
     real::dev_create_command_allocator(this, pc_list_type(ty) as usize, riid, ppv)
 }
 
+fn active_list_allocator(alloc: usize) -> usize {
+    active_list_allocator_with(alloc, super::alloc_pool::current)
+}
+
+fn active_list_allocator_with(alloc: usize, current: impl FnOnce(usize) -> usize) -> usize {
+    current(alloc)
+}
+
 unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let dma = !riid.is_null() && guid_bytes(&*riid) == guid_bytes(&IID_XBOX_DMA_COMMAND_LIST);
     let riid = if dma { &IID_GRAPHICS_COMMAND_LIST as *const GUID } else { riid };
@@ -95,12 +104,15 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
-        let resolved_pso = super::pso_async::resolve_for_bind(pso);
-        let hr = real::dev_create_command_list(this, node, ty, alloc, resolved_pso, riid, ppv);
+        let prepared = super::bind::PreparedNativePipeline::new(pso);
+        let resolved_pso = prepared.raw();
+        let pc_alloc = active_list_allocator(alloc);
+        let hr = real::dev_create_command_list(this, node, ty, pc_alloc, resolved_pso, riid, ppv);
         if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-            super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+            super::list_x::on_create_with_backing(*ppv, alloc, pc_alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+            prepared.commit(*ppv, alloc);
             super::dred::reset(*ppv);
-            if pso != 0 {
+            if pso != 0 && resolved_pso != 0 {
                 super::dred::mark_pipeline(*ppv, pso, resolved_pso);
             }
         }
@@ -115,7 +127,6 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     // the title's inline D3D12.X code writes into the list object: it gets one of the
     // console's shape (`title_list`)
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::console_list::enabled() {
-        super::bind::reset(*ppv, alloc, pso);
         *ppv = super::title_list::wrap(*ppv);
     }
     hr
@@ -1065,19 +1076,78 @@ pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void
     ret
 }
 
+const MAX_ALIAS_LOGS: u64 = 16;
+const MAX_ALIAS_TRACKED: usize = 16_384;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlacedDescSummary {
+    dim: u32,
+    width: u64,
+    height: u32,
+    format: u32,
+    flags: u32,
+}
+
+impl PlacedDescSummary {
+    fn from_desc(x: &[u8; 0x38]) -> Self {
+        let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+        Self {
+            dim: u(0),
+            width: u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()),
+            height: u(0x18),
+            format: u(0x20),
+            flags: u(0x30),
+        }
+    }
+}
+
+impl std::fmt::Display for PlacedDescSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dimension {} {}x{} format {} flags {:#x}", self.dim, self.width, self.height, self.format, self.flags)
+    }
+}
+
+fn record_alias_in(
+    seen: &mut Option<std::collections::HashMap<usize, PlacedDescSummary>>,
+    logged: &AtomicU64,
+    va: usize,
+    cur: PlacedDescSummary,
+    max_tracked: usize,
+) -> Option<PlacedDescSummary> {
+    if logged.load(Ordering::Relaxed) >= MAX_ALIAS_LOGS {
+        *seen = None;
+        return None;
+    }
+    let m = seen.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(slot) = m.get_mut(&va) {
+        let prev = std::mem::replace(slot, cur);
+        let prev_count = logged.fetch_add(1, Ordering::Relaxed);
+        if prev_count + 1 >= MAX_ALIAS_LOGS {
+            *seen = None;
+        }
+        return (prev_count < MAX_ALIAS_LOGS).then_some(prev);
+    }
+    if m.len() < max_tracked {
+        m.insert(va, cur);
+    }
+    None
+}
+
 /// Resources the title placed at an address an earlier one was placed at: on the console they
 /// share that memory (aliasing – transient render targets reuse it). Logged (first 16).
 fn note_alias(va: usize, x: &[u8; 0x38]) {
-    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, String>>> = std::sync::Mutex::new(None);
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, PlacedDescSummary>>> = std::sync::Mutex::new(None);
     static N: AtomicU64 = AtomicU64::new(0);
-    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
-    let what = format!("dimension {} {}x{} format {} flags {:#x}", u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x30));
-    let mut g = SEEN.lock().unwrap();
-    let m = g.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(prev) = m.insert(va, what.clone()) {
-        if N.fetch_add(1, Ordering::Relaxed) < 16 {
-            crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({what}) – aliases an earlier resource there ({prev})");
-        }
+    if N.load(Ordering::Relaxed) >= MAX_ALIAS_LOGS {
+        return;
+    }
+    let cur = PlacedDescSummary::from_desc(x);
+    let prev = {
+        let mut g = SEEN.lock().unwrap();
+        record_alias_in(&mut g, &N, va, cur, MAX_ALIAS_TRACKED)
+    };
+    if let Some(prev) = prev {
+        crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({cur}) – aliases an earlier resource there ({prev})");
     }
 }
 
@@ -1127,8 +1197,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
-                    if let Some(bytes) = console_bytes {
-                        super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                    if super::title_textures::register_gpu_owned(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)).is_err() {
+                        if let Some(bytes) = console_bytes {
+                            super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                        }
                     }
                     real::note_title_address(*ppv as usize, va as usize);
                 }
@@ -1254,11 +1326,14 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
-    }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        let dispatches = list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
+        let stride = u32::from_le_bytes(pc[..4].try_into().unwrap());
+        let dispatch_only = list.len() == 1 && dispatches
+            && stride >= 12 && stride % 4 == 0;
+        super::bind::note_indirect_signature(*ppv as usize, super::bind::IndirectSignatureInfo::new(
+            dispatches, needs_root, dispatch_only.then_some(stride),
+        ));
     }
     hr
 }
@@ -1266,6 +1341,14 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_command_lists_use_the_allocator_pools_active_backing() {
+        assert_eq!(active_list_allocator_with(0x1000, |alloc| {
+            assert_eq!(alloc, 0x1000);
+            0x2000
+        }), 0x2000);
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
@@ -1721,5 +1804,65 @@ mod tests {
         if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
             m.remove(&((luid.LowPart, luid.HighPart), 24));
         }
+    }
+
+    fn placed_desc(dim: u32, width: u64, height: u32, format: u32, flags: u32) -> [u8; 0x38] {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&dim.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&height.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+        x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+        x
+    }
+
+    #[test]
+    fn note_alias_logs_first_16_and_drops_table_after_cap() {
+        let first = PlacedDescSummary::from_desc(&placed_desc(3, 1920, 1080, 28, 0x5));
+        assert_eq!(first.to_string(), "dimension 3 1920x1080 format 28 flags 0x5");
+
+        let mut seen = None;
+        let logged = AtomicU64::new(0);
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, first, MAX_ALIAS_TRACKED), None);
+        let mut expected_prev = first;
+        for i in 1..=MAX_ALIAS_LOGS {
+            let next = PlacedDescSummary::from_desc(&placed_desc(3, 1920 + i, 1080, 28, i as u32));
+            assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, next, MAX_ALIAS_TRACKED), Some(expected_prev), "alias #{i}");
+            expected_prev = next;
+            if i < MAX_ALIAS_LOGS {
+                assert!(seen.is_some(), "table stays active before cap (alias #{i})");
+            }
+        }
+        assert!(seen.is_none(), "16th alias must drop the tracking table");
+        let after = PlacedDescSummary::from_desc(&placed_desc(1, 4096, 1, 0, 0));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, after, MAX_ALIAS_TRACKED), None);
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x2000, after, MAX_ALIAS_TRACKED), None);
+        assert!(seen.is_none(), "calls after cap must not reallocate the tracking table");
+    }
+
+    #[test]
+    fn note_alias_bounds_tracked_entries_without_aliases() {
+        let mut seen = None;
+        let logged = AtomicU64::new(0);
+        let max_tracked = 8;
+        let d0 = PlacedDescSummary::from_desc(&placed_desc(3, 64, 64, 28, 1));
+        for i in 0..(max_tracked + 5) {
+            assert_eq!(record_alias_in(&mut seen, &logged, 0x10000 + i * 0x1000, d0, max_tracked), None);
+        }
+        assert_eq!(seen.as_ref().unwrap().len(), max_tracked, "tracked VA count must stay bounded");
+        let d1 = PlacedDescSummary::from_desc(&placed_desc(3, 128, 128, 28, 2));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x10000, d1, max_tracked), Some(d0), "aliasing a tracked entry still fires");
+        assert_eq!(logged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn note_alias_short_circuits_when_cap_already_reached() {
+        let d0 = PlacedDescSummary::from_desc(&placed_desc(3, 32, 32, 28, 0));
+        let mut seen = Some(std::collections::HashMap::from([(0x5000usize, d0)]));
+        let logged = AtomicU64::new(MAX_ALIAS_LOGS);
+        let d1 = PlacedDescSummary::from_desc(&placed_desc(3, 64, 64, 28, 4));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x5000, d1, MAX_ALIAS_TRACKED), None);
+        assert!(seen.is_none(), "residual map must be freed once cap is reached");
+        assert_eq!(logged.load(Ordering::Relaxed), MAX_ALIAS_LOGS);
     }
 }

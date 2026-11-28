@@ -73,6 +73,7 @@ pub(crate) unsafe fn wait(
     }
     let start = Instant::now();
     let mut remaining = timeout_ms;
+    let wait_stall = crate::stall::span(crate::stall::StallKind::GpuWait);
     loop {
         let status = WaitForSingleObject(event, remaining);
         let error = (status == WAIT_FAILED).then(Error::from_thread);
@@ -88,6 +89,7 @@ pub(crate) unsafe fn wait(
         }
         let elapsed = start.elapsed().as_millis();
         if status == WAIT_TIMEOUT || elapsed >= u128::from(timeout_ms) {
+            drop(wait_stall);
             return Err(dev.GetDeviceRemovedReason().err().map_or(FenceError::Timeout(timeout_ms), FenceError::Removed));
         }
         remaining = timeout_ms - elapsed as u32;

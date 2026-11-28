@@ -330,10 +330,39 @@ fn references(s: &[u8], paired: bool) -> (usize, usize) {
     (usize::from(ix.wrapping_add(delta)), usize::from(ix))
 }
 
+/// Spreads a 4-bit symbol onto even bit positions `0, 2, 4, 6`.
+const SPREAD4: [u8; 16] = [
+    0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15,
+    0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55,
+];
+
+/// Spreads an 8-bit symbol onto even bit positions `0, 2, ..., 14`.
+const SPREAD8: [u16; 256] = {
+    let mut t = [0u16; 256];
+    let mut v = 0usize;
+    while v < 256 {
+        let mut out = 0u16;
+        let mut k = 0;
+        while k < 8 {
+            out |= (((v >> k) & 1) as u16) << (2 * k);
+            k += 1;
+        }
+        t[v] = out;
+        v += 1;
+    }
+    t
+};
+
 /// Two 4-bit symbols, the first on the even bits.
+#[inline(always)]
 fn interleave(a: u8, b: u8) -> u8 {
-    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
-    spread(a) | spread(b) << 1
+    SPREAD4[usize::from(a & 15)] | (SPREAD4[usize::from(b & 15)] << 1)
+}
+
+/// Two 8-bit symbols, the first on the even bits.
+#[inline(always)]
+fn wide_interleave(a: u8, b: u8) -> u16 {
+    SPREAD8[usize::from(a)] | (SPREAD8[usize::from(b)] << 1)
 }
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
@@ -347,26 +376,40 @@ fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: 
 }
 
 /// Zigzag residual (0, -1, 1, -2, ...) modulo 2^bits.
+#[inline(always)]
 fn zz(v: u8, bits: u32) -> u8 {
     let mask = ((1u32 << bits) - 1) as u8;
     ((v >> 1) ^ if v & 1 != 0 { mask } else { 0 }) & mask
 }
 
-/// Element widths of the plain formats' endpoints and indices.
+/// Element masks and active counts of the plain formats' endpoints and indices.
 struct Widths {
-    ep: [u8; 8],
-    ix: [u8; 32],
+    ep_mask: [u8; 8],
+    ep_len: usize,
+    ix_mask: [u8; 32],
+    ix_len: usize,
     paired: bool,
 }
 
 const fn widths(ep: [u8; 8], ix3: usize, ix2: usize, paired: bool) -> Widths {
-    let mut ix = [0; 32];
+    let mut ep_mask = [0u8; 8];
+    let mut ep_len = 0;
     let mut k = 0;
-    while k < ix3 + ix2 {
-        ix[k] = if k < ix3 { 3 } else { 2 };
+    while k < 8 {
+        if ep[k] != 0 {
+            ep_mask[k] = ((1u16 << ep[k]) - 1) as u8;
+            ep_len = k + 1;
+        }
         k += 1;
     }
-    Widths { ep, ix, paired }
+    let mut ix_mask = [0u8; 32];
+    let ix_len = ix3 + ix2;
+    let mut k = 0;
+    while k < ix_len {
+        ix_mask[k] = if k < ix3 { 7 } else { 3 };
+        k += 1;
+    }
+    Widths { ep_mask, ep_len, ix_mask, ix_len, paired }
 }
 
 const BC1: Widths = widths([5, 6, 5, 5, 6, 5, 0, 0], 0, 16, false);
@@ -389,11 +432,17 @@ fn plain<'a>(
         let ep_ref = &pick(i, ep_ref, &history, dictionary, &zero).ep;
         let ix_ref = &pick(i, ix_ref, &history, dictionary, &zero).ix;
         let mut v = residual(s);
-        for ((v, r), bits) in v.ep.iter_mut().zip(ep_ref).zip(w.ep) {
-            *v = v.wrapping_add(*r) & ((1u16 << bits) - 1) as u8;
+        for ((v, &r), &mask) in v.ep[..w.ep_len].iter_mut().zip(ep_ref).zip(&w.ep_mask) {
+            *v = v.wrapping_add(r) & mask;
         }
-        for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
-            *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
+        if w.ix_len == 16 {
+            for ((v, &r), &mask) in v.ix[..16].iter_mut().zip(&ix_ref[..16]).zip(&w.ix_mask[..16]) {
+                *v = v.wrapping_add(r) & mask;
+            }
+        } else {
+            for ((v, &r), &mask) in v.ix[..w.ix_len].iter_mut().zip(ix_ref).zip(&w.ix_mask) {
+                *v = v.wrapping_add(r) & mask;
+            }
         }
         history[i % HISTORY] = v;
         pack(&v, block);
@@ -402,22 +451,26 @@ fn plain<'a>(
 }
 
 /// 2-bit index residuals: one symbol per 2x2 quad.
-fn quads(rank: &[u8; 256], s: &[u8], ix: &mut [u8]) {
+#[inline(always)]
+fn quads(rank: &[u8; 256], s: &[u8; 4], ix: &mut [u8; 16]) {
     for (q, &sym) in s.iter().enumerate() {
         let v = rank[usize::from(sym)];
         let base = (q >> 1) * 8 + (q & 1) * 2;
-        for (k, p) in [0, 1, 4, 5].into_iter().enumerate() {
-            ix[base + p] = v >> (2 * k) & 3;
-        }
+        ix[base] = v & 3;
+        ix[base + 1] = (v >> 2) & 3;
+        ix[base + 4] = (v >> 4) & 3;
+        ix[base + 5] = (v >> 6) & 3;
     }
 }
 
 /// 3-bit index residuals: one symbol per two pixels in raster order.
+#[inline(always)]
 fn pairs(rank: &[u8; 64], s: &[u8], ix: &mut [u8]) {
-    for (k, &sym) in s.iter().enumerate() {
+    let (chunks, _) = ix.as_chunks_mut::<2>();
+    for (&sym, dst) in s.iter().zip(chunks) {
         let v = rank[usize::from(sym & 63)];
-        ix[2 * k] = v & 7;
-        ix[2 * k + 1] = v >> 4 & 7;
+        dst[0] = v & 7;
+        dst[1] = (v >> 4) & 7;
     }
 }
 
@@ -426,7 +479,7 @@ fn bc1_residual(t: &Tables, s: &[u8]) -> Plain {
     for (k, bits) in [5, 6, 5, 5, 6, 5].into_iter().enumerate() {
         v.ep[k] = zz(s[2 + k], bits);
     }
-    quads(&t.rank1, &s[8..12], &mut v.ix);
+    quads(t.rank1, s[8..12].try_into().unwrap(), (&mut v.ix[..16]).try_into().unwrap());
     v
 }
 
@@ -446,7 +499,7 @@ fn bc3_residual(t: &Tables, s: &[u8]) -> Plain {
         ..Default::default()
     };
     pairs(&t.rank3a, &s[6..14], &mut v.ix[..16]);
-    quads(&t.rank3c, &s[20..24], &mut v.ix[16..]);
+    quads(t.rank3c, s[20..24].try_into().unwrap(), (&mut v.ix[16..]).try_into().unwrap());
     v
 }
 
@@ -470,54 +523,88 @@ fn bc5_residual(t: &Tables, s: &[u8]) -> Plain {
 const BC1_CODE: [u32; 4] = [0, 2, 3, 1];
 const BC4_CODE: [u64; 8] = [0, 2, 3, 4, 5, 6, 7, 1];
 
-fn bc1_color(ep: &[u8], ix: &[u8], out: &mut [u8]) {
+#[inline(always)]
+fn bc1_color(ep: &[u8; 6], ix: &[u8; 16], out: &mut [u8; 8]) {
     let c0 = u16::from(ep[0]) << 11 | u16::from(ep[1]) << 5 | u16::from(ep[2]);
     let c1 = u16::from(ep[3]) << 11 | u16::from(ep[4]) << 5 | u16::from(ep[5]);
-    let bits = (0..16).fold(0, |acc, p| {
-        acc | BC1_CODE[usize::from(ix[p] & 3)] << (2 * p)
-    });
-    out[..2].copy_from_slice(&c0.to_le_bytes());
-    out[2..4].copy_from_slice(&c1.to_le_bytes());
-    out[4..8].copy_from_slice(&bits.to_le_bytes());
+    let mut bits = 0u32;
+    for (p, &val) in ix.iter().enumerate() {
+        bits |= BC1_CODE[usize::from(val & 3)] << (2 * p);
+    }
+    let word = u64::from(c0) | (u64::from(c1) << 16) | (u64::from(bits) << 32);
+    *out = word.to_le_bytes();
 }
 
 /// BC4 half: endpoints are kept 128 below their stored value.
-fn bc4_alpha(e0: u8, e1: u8, ix: &[u8], out: &mut [u8]) {
-    let bits = (0..16).fold(0u64, |acc, p| {
-        acc | BC4_CODE[usize::from(ix[p] & 7)] << (16 + 3 * p)
-    });
+#[inline(always)]
+fn bc4_alpha(e0: u8, e1: u8, ix: &[u8; 16], out: &mut [u8; 8]) {
+    let mut bits = 0u64;
+    for (p, &val) in ix.iter().enumerate() {
+        bits |= BC4_CODE[usize::from(val & 7)] << (16 + 3 * p);
+    }
     let v = u64::from(e0 ^ 0x80) | u64::from(e1 ^ 0x80) << 8 | bits;
-    out[..8].copy_from_slice(&v.to_le_bytes());
+    *out = v.to_le_bytes();
 }
 
 fn bc1_pack(v: &Plain, out: &mut [u8]) {
-    bc1_color(&v.ep, &v.ix, out);
+    bc1_color(
+        v.ep[..6].try_into().unwrap(),
+        v.ix[..16].try_into().unwrap(),
+        (&mut out[..8]).try_into().unwrap(),
+    );
 }
 
 fn bc3_pack(v: &Plain, out: &mut [u8]) {
-    bc4_alpha(v.ep[6], v.ep[7], &v.ix[..16], &mut out[..8]);
-    bc1_color(&v.ep, &v.ix[16..], &mut out[8..]);
+    let (a, c) = out.split_at_mut(8);
+    bc4_alpha(v.ep[6], v.ep[7], v.ix[..16].try_into().unwrap(), a.try_into().unwrap());
+    bc1_color(
+        v.ep[..6].try_into().unwrap(),
+        v.ix[16..].try_into().unwrap(),
+        (&mut c[..8]).try_into().unwrap(),
+    );
 }
 
 fn bc4_pack(v: &Plain, out: &mut [u8]) {
-    bc4_alpha(v.ep[0], v.ep[1], &v.ix, out);
+    bc4_alpha(v.ep[0], v.ep[1], v.ix[..16].try_into().unwrap(), (&mut out[..8]).try_into().unwrap());
 }
 
 fn bc5_pack(v: &Plain, out: &mut [u8]) {
-    bc4_alpha(v.ep[0], v.ep[1], &v.ix[..16], &mut out[..8]);
-    bc4_alpha(v.ep[2], v.ep[3], &v.ix[16..], &mut out[8..]);
+    let (a, b) = out.split_at_mut(8);
+    bc4_alpha(v.ep[0], v.ep[1], v.ix[..16].try_into().unwrap(), a.try_into().unwrap());
+    bc4_alpha(v.ep[2], v.ep[3], v.ix[16..].try_into().unwrap(), (&mut b[..8]).try_into().unwrap());
 }
 
+/// Even and odd bit nibbles of every byte, zigzag-decoded to signed 4-bit residuals.
+const NIBBLES: [[i16; 2]; 256] = {
+    let mut t = [[0i16; 2]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut even = 0u8;
+        let mut odd = 0u8;
+        let mut k = 0;
+        while k < 4 {
+            even |= (((b as u8) >> (2 * k)) & 1) << k;
+            odd |= (((b as u8) >> (2 * k + 1)) & 1) << k;
+            k += 1;
+        }
+        let ze = (even >> 1) as i16 ^ -((even & 1) as i16);
+        let zo = (odd >> 1) as i16 ^ -((odd & 1) as i16);
+        t[b] = [ze, zo];
+        b += 1;
+    }
+    t
+};
+
 /// A byte's even and odd bits as two zigzag-coded 4-bit residuals.
+#[inline(always)]
 fn nibbles(b: u8, odd_first: bool) -> [i16; 2] {
-    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
-    let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
-    let (even, odd) = (z(half(b)), z(half(b >> 1)));
+    let [even, odd] = NIBBLES[usize::from(b)];
     if odd_first { [odd, even] } else { [even, odd] }
 }
 
 /// Index residual plus reference, both left-aligned to 16 bits at their own
 /// widths, back to `bits` bits (signed).
+#[inline(always)]
 fn add_index(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
     let up = |v: i16, b: u8| {
         if b == 0 || b > 16 {
@@ -538,9 +625,11 @@ struct Bits {
 }
 
 impl Bits {
+    #[inline(always)]
     fn put(&mut self, value: u64, n: u32) {
         if n > 0 && self.at < 128 {
-            self.v |= (u128::from(value) & ((1u128 << n) - 1)) << self.at;
+            let masked = if n < 64 { value & ((1u64 << n) - 1) } else { value };
+            self.v |= u128::from(masked) << self.at;
         }
         self.at += n;
     }
@@ -734,15 +823,15 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
         m if pbits(m) => (0..ends).for_each(|e| w.put(field(e / 2, e % 2, prec[0]) & 1, 1)),
         _ => {}
     }
-    let anchors: &[u8] = match subsets {
-        2 => &[0, ANCHOR2[part]],
-        3 => &[0, ANCHOR3A[part], ANCHOR3B[part]],
-        _ => &[0],
+    let anchor_mask: u16 = match subsets {
+        2 => 1 | (1 << ANCHOR2[part]),
+        3 => 1 | (1 << ANCHOR3A[part]) | (1 << ANCHOR3B[part]),
+        _ => 1,
     };
     let mut indices = |set: usize| {
-        let bits = ix.bits[set];
+        let bits = u32::from(ix.bits[set]);
         for (p, &v) in ix.ix[set].iter().enumerate() {
-            let n = u32::from(bits) - u32::from(anchors.contains(&(p as u8)));
+            let n = bits - u32::from((anchor_mask >> p) & 1);
             w.put(u64::from(v as u16), n);
         }
     };
@@ -919,11 +1008,7 @@ fn bc6<'a>(
         },
     );
     let z = |v: u16| (v >> 1) ^ (v & 1).wrapping_neg();
-    let wide = |a: u8, b: u8| {
-        (0..8).fold(0u16, |acc, k| {
-            acc | u16::from(a >> k & 1) << (2 * k) | u16::from(b >> k & 1) << (2 * k + 1)
-        })
-    };
+    let wide = wide_interleave;
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
         let mode = s[30].wrapping_add(1);
@@ -998,14 +1083,186 @@ fn bc6<'a>(
                 );
             }
         }
-        let anchor = if two { ANCHOR2[usize::from(part)] } else { 0 };
+        let anchor_mask: u16 = if two { 1 | (1 << ANCHOR2[usize::from(part)]) } else { 1 };
+        let bias = 1u16 << (bits - 1);
         for (p, &v) in ix.ix.iter().enumerate() {
-            let short = p == 0 || p == usize::from(anchor);
-            let v = (v as u16).wrapping_add(1 << (bits - 1));
-            w.put(v.into(), u32::from(bits) - u32::from(short));
+            let v = (v as u16).wrapping_add(bias);
+            w.put(v.into(), u32::from(bits) - u32::from((anchor_mask >> p) & 1));
         }
         block.copy_from_slice(&w.v.to_le_bytes());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    #[test]
+    fn lut_helpers_match_scalar_reference_exhaustively() {
+        let spread4 = |v: u8| (0..4).fold(0u8, |acc, k| acc | ((v >> k) & 1) << (2 * k));
+        let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | ((v >> (2 * k)) & 1) << k);
+        let z4 = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+        for a in 0..=255u8 {
+            let (even, odd) = (z4(half(a)), z4(half(a >> 1)));
+            assert_eq!(nibbles(a, false), [even, odd]);
+            assert_eq!(nibbles(a, true), [odd, even]);
+            for b in 0..=255u8 {
+                assert_eq!(interleave(a, b), spread4(a) | (spread4(b) << 1));
+                let wide_ref = (0..8).fold(0u16, |acc, k| {
+                    acc | (u16::from((a >> k) & 1) << (2 * k)) | (u16::from((b >> k) & 1) << (2 * k + 1))
+                });
+                assert_eq!(wide_interleave(a, b), wide_ref);
+            }
+        }
+
+        // Precomputed Widths masks and active lengths for BC1/BC3/BC4/BC5.
+        for (w, ep_bits, ix3, ix2) in [
+            (&BC1, [5u8, 6, 5, 5, 6, 5, 0, 0], 0usize, 16usize),
+            (&BC3, [5, 6, 5, 5, 6, 5, 8, 8], 16, 16),
+            (&BC4, [8, 8, 0, 0, 0, 0, 0, 0], 16, 0),
+            (&BC5, [8, 8, 8, 8, 0, 0, 0, 0], 32, 0),
+        ] {
+            let want_ep_len = ep_bits.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+            assert_eq!(w.ep_len, want_ep_len);
+            assert_eq!(w.ix_len, ix3 + ix2);
+            for (k, &bits) in ep_bits.iter().enumerate() {
+                assert_eq!(w.ep_mask[k], ((1u16 << bits) - 1) as u8);
+            }
+            for (k, &mask) in w.ix_mask.iter().enumerate() {
+                let bits = if k < ix3 { 3 } else if k < ix3 + ix2 { 2 } else { 0 };
+                assert_eq!(mask, (1u8 << bits) - 1);
+            }
+        }
+
+        // BC7 and BC6H u16 anchor bitmasks match slice/branch anchor predicates.
+        for part in 0..64usize {
+            for subsets in [1usize, 2, 3] {
+                let anchors: &[u8] = match subsets {
+                    2 => &[0, ANCHOR2[part]],
+                    3 => &[0, ANCHOR3A[part], ANCHOR3B[part]],
+                    _ => &[0],
+                };
+                let mask: u16 = match subsets {
+                    2 => 1 | (1 << ANCHOR2[part]),
+                    3 => 1 | (1 << ANCHOR3A[part]) | (1 << ANCHOR3B[part]),
+                    _ => 1,
+                };
+                for p in 0..16usize {
+                    assert_eq!(((mask >> p) & 1) != 0, anchors.contains(&(p as u8)));
+                }
+            }
+            if part < 32 {
+                for two in [false, true] {
+                    let anchor = if two { ANCHOR2[part] } else { 0 };
+                    let mask: u16 = if two { 1 | (1 << ANCHOR2[part]) } else { 1 };
+                    for p in 0..16usize {
+                        assert_eq!(((mask >> p) & 1) != 0, p == 0 || p == usize::from(anchor));
+                    }
+                }
+            }
+        }
+
+        // Bits::put matches u128 reference across n = 0, small widths, 64, and overflow past 128.
+        let mut got = Bits::default();
+        let mut ref_v = 0u128;
+        let mut ref_at = 0u32;
+        for (val, n) in [(0xFFFFu64, 0u32), (0x55, 5), (0xDEAD_BEEF_CAFE_BABE, 64), (0x3FF, 10), (0xFFFF, 60)] {
+            got.put(val, n);
+            if n > 0 && ref_at < 128 {
+                ref_v |= (u128::from(val) & ((1u128 << n) - 1)) << ref_at;
+            }
+            ref_at += n;
+            assert_eq!((got.v, got.at), (ref_v, ref_at));
+        }
+    }
+
+    #[test]
+    fn all_bc_fixtures_and_packers_match_baseline() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/bcpack");
+        let tables = Tables::builtin();
+        let cases: [(&str, u8, usize, u64); 12] = [
+            ("bc1-2-0", 1, 2 * 8, 0x00241ed045f935b7),
+            ("bc1-16-1", 1, 16 * 8, 0xaa27d5c23c617a11),
+            ("bc1-16-9", 1, 16 * 8, 0x5af81e16cde0f88b),
+            ("bc1-700-2", 1, 700 * 8, 0x6c1294776a5e0f7f),
+            ("bc1-8192-3", 1, 8192 * 8, 0xa0d8a27ea25cb660),
+            ("bc3-16-1", 3, 16 * 8, 0xc9b128a6e1beda7b),
+            ("bc4-16-1", 4, 16 * 8, 0x80173d43d3e12784),
+            ("bc5-16-1", 5, 16 * 8, 0x4338d58b289e83fc),
+            ("bc6-16-1", 6, 16 * 8, 0x4312c31241f68f5f),
+            ("bc7-2-0", 7, 2 * 8, 0xb3e3f4cd147b0999),
+            ("bc7-16-1", 7, 16 * 8, 0x013a7ec1ceec8b71),
+            ("bc7-8192-3", 7, 8192 * 8, 0x0b54870998ec2325),
+        ];
+        for (stem, mode, out_len, want_hash) in cases {
+            let src = std::fs::read(dir.join(format!("{stem}.bin"))).unwrap();
+            let mut dst = vec![0u8; out_len];
+            decode(mode, &src, &mut dst, tables).unwrap_or_else(|e| panic!("{stem}: {e}"));
+            assert_eq!(fnv1a(&dst), want_hash, "{stem} output diverged from baseline");
+        }
+        let bad_src = std::fs::read(dir.join("bc7-700-2.bin")).unwrap();
+        let mut bad_dst = vec![0u8; 700 * 8];
+        assert_eq!(decode(7, &bad_src, &mut bad_dst, tables), Err(Error("unused BC7 control code")));
+
+        // Verify fixed-size bc1_color/bc4_alpha and every BC6H mode 1..=14 / BC7 mode 0..=7.
+        let ep6 = [19u8, 45, 7, 29, 12, 31];
+        let ix16: [u8; 16] = std::array::from_fn(|p| ((p * 5 + 3) & 7) as u8);
+        let (mut got1, mut got4) = ([0u8; 8], [0u8; 8]);
+        bc1_color(&ep6, &ix16, &mut got1);
+        let c0 = u16::from(ep6[0]) << 11 | u16::from(ep6[1]) << 5 | u16::from(ep6[2]);
+        let c1 = u16::from(ep6[3]) << 11 | u16::from(ep6[4]) << 5 | u16::from(ep6[5]);
+        let ref_bits1 = (0..16).fold(0u32, |acc, p| acc | (BC1_CODE[usize::from(ix16[p] & 3)] << (2 * p)));
+        assert_eq!(&got1[..2], &c0.to_le_bytes());
+        assert_eq!(&got1[2..4], &c1.to_le_bytes());
+        assert_eq!(&got1[4..8], &ref_bits1.to_le_bytes());
+        bc4_alpha(0x2A, 0xD5, &ix16, &mut got4);
+        let ref_v4 = u64::from(0x2Au8 ^ 0x80)
+            | (u64::from(0xD5u8 ^ 0x80) << 8)
+            | (0..16).fold(0u64, |acc, p| acc | (BC4_CODE[usize::from(ix16[p] & 7)] << (16 + 3 * p)));
+        assert_eq!(got4, ref_v4.to_le_bytes());
+
+        // Exercise all 14 BC6H modes (1..=14) and all 8 BC7 modes (0..=7) end-to-end.
+        let bc6_recs: Vec<[u8; 32]> = (1u8..=14)
+            .map(|m| {
+                let mut r = [0u8; 32];
+                for (k, slot) in r.iter_mut().enumerate().take(30) {
+                    *slot = (m.wrapping_mul(17).wrapping_add((k as u8).wrapping_mul(11))) & 0x7F;
+                }
+                r[30] = m - 1;
+                r[31] = (m * 3) & 31;
+                r
+            })
+            .collect();
+        let mut bc6_out = [[0u8; 16]; 14];
+        bc6(bc6_recs.iter().map(|r| &r[..]), bc6_out.iter_mut().map(|b| &mut b[..]), tables.bc6).unwrap();
+        assert!(bc6_out.iter().all(|b| b.iter().any(|&x| x != 0)));
+
+        let mut bc7_recs = Vec::new();
+        for mode in 0u16..8 {
+            let idx = tables.ctrl7.iter().position(|&c| c != 0 && (c & 7) == mode).unwrap();
+            let mut r = [0u8; 32];
+            for (k, slot) in r.iter_mut().enumerate().take(30) {
+                *slot = ((mode as u8 + 1).wrapping_mul(13).wrapping_add((k as u8).wrapping_mul(7))) & 0x3F;
+            }
+            r[30] = (idx & 31) as u8;
+            r[31] = ((idx >> 5) & 15) as u8;
+            bc7_recs.push(r);
+        }
+        let mut bc7_out = [[0u8; 16]; 8];
+        bc7(bc7_recs.iter().map(|r| &r[..]), bc7_out.iter_mut().map(|b| &mut b[..]), tables).unwrap();
+        for (mode, block) in bc7_out.iter().enumerate() {
+            assert_eq!(block[0].trailing_zeros() as usize, mode, "BC7 mode {mode} header bit");
+        }
+    }
 }
 

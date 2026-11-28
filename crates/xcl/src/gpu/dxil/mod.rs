@@ -57,3 +57,5 @@ mod msaa_tests;
 mod round_tests;
 #[cfg(test)]
 mod geometry_tests;
+#[cfg(test)]
+mod select_tests;

@@ -244,11 +244,29 @@ const MEM_64K_PAGES: u32 = 0x2040_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
-    let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
+    let protection = sanitize_protect(p);
+    let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, protection);
     if !q.is_null() {
-        crate::hle::d3d12x::sparse::committed(q as usize, n);
+        crate::hle::d3d12x::sparse::committed_with_protection(q as usize, n, read_write(protection));
     }
     q
+}
+
+/// A writable protection without PAGE_GUARD.
+fn read_write(protection: u32) -> bool {
+    matches!(protection & 0xFF, 0x04 | 0x08 | 0x40 | 0x80) && protection & 0x100 == 0
+}
+
+fn own_process(process: HANDLE) -> bool {
+    if process == unsafe { thr::GetCurrentProcess() } {
+        return true;
+    }
+    let id = unsafe { thr::GetProcessId(process) };
+    id != 0 && id == unsafe { thr::GetCurrentProcessId() }
+}
+
+unsafe fn note_protection(addr: *const c_void, size: usize, protection: u32) {
+    crate::hle::d3d12x::sparse::protection_changed(addr as usize, size, read_write(protection));
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
@@ -477,7 +495,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
-    if proc_ == thr::GetCurrentProcess() {
+    if own_process(proc_) {
         let a = addr as usize;
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
             || (t & 0x8000 != 0 && in_graphics_reservation(a))
@@ -489,15 +507,37 @@ pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, si
 }
 
 pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    if own_process(proc_) {
+        return VirtualAlloc(addr, size, t, p);
+    }
     mem::VirtualAllocEx(proc_, addr, size, sanitize_alloc_type(t), sanitize_protect(p))
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtect(addr, size, sanitize_protect(p), old)
+    let protection = sanitize_protect(p);
+    let writable = read_write(protection);
+    if !writable {
+        note_protection(addr, size, protection);
+    }
+    let ok = mem::VirtualProtect(addr, size, protection, old);
+    if ok != 0 && writable {
+        note_protection(addr, size, protection);
+    }
+    ok
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
+    let protection = sanitize_protect(p);
+    let own = own_process(proc_);
+    let writable = read_write(protection);
+    if own && !writable {
+        note_protection(addr, size, protection);
+    }
+    let ok = mem::VirtualProtectEx(proc_, addr, size, protection, old);
+    if ok != 0 && own && writable {
+        note_protection(addr, size, protection);
+    }
+    ok
 }
 
 /// XALLOC_ATTRIBUTES bit fields.

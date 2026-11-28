@@ -10,6 +10,9 @@ $null = Get-Command cargo -ErrorAction Stop
 $ErrorActionPreference = 'Continue'
 cargo build --workspace
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# Compile every custom benchmark target and execute each closure once without timing samples.
+cargo bench -p xcl --bench '*' -- --test
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # GPU tests that cannot run on this adapter pass too: each prints "SKIPPED <test>: <reason>"
 # to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
 $skipped = @()

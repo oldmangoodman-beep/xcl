@@ -50,6 +50,12 @@ struct SegmentBook {
     /// finished primary's last submit, and the PC does not let a list be submitted again before
     /// that (#1452, debug layer id 553). A console does.
     first: Option<usize>,
+    /// Closed object that receives calls after an unrecoverable split failure, until Reset.
+    failed: Option<usize>,
+    /// The identity-bearing primary returned a failed Close and can never be Reset again.
+    primary_broken: bool,
+    /// Non-primary lists whose failed Close permanently forbids Reset/reuse.
+    unresettable: Vec<usize>,
 }
 
 /// Wrapper address -> split segment book (populated lazily only for lists that split).
@@ -145,6 +151,10 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     hr
 }
 
+fn recover_failed_with<T>(failed: usize, in_flight: bool, reuse: impl FnOnce(usize) -> Option<T>, replace: impl FnOnce() -> Option<T>) -> Option<T> {
+    if in_flight { replace() } else { reuse(failed) }
+}
+
 /// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_pc`
 /// (calling directly rather than through the dual-dispatch vtable thunk so console state always
 /// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
@@ -154,13 +164,33 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
 pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
     let primary = *((this as usize + F_PRIMARY) as *const *mut c_void);
     let adopted = super::real::is_adopted(primary);
-    let stand_in = if adopted && super::alloc_pool::in_flight(primary as usize) {
+    let (failed, primary_broken, first) = SEGMENTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(this as usize)))
+        .map_or((None, false, None), |b| (b.failed, b.primary_broken, b.first));
+    let stand_in = if let Some(failed) = failed {
+        recover_failed_with(
+            failed,
+            super::alloc_pool::in_flight(failed),
+            |failed| (super::list_x::reset_pc(failed as *mut c_void, alloc, pso) >= 0).then_some(failed),
+            || super::list_x::reset_stand_in(this, primary, alloc, pso),
+        )
+    } else if primary_broken {
+        match first.filter(|&p| !super::alloc_pool::in_flight(p)) {
+            Some(first) => (super::list_x::reset_pc(first as *mut c_void, alloc, pso) >= 0).then_some(first),
+            None => super::list_x::reset_stand_in(this, primary, alloc, pso),
+        }
+    } else if adopted && super::alloc_pool::in_flight(primary as usize) {
         super::list_x::reset_stand_in(this, primary, alloc, pso)
     } else {
         None
     };
     let hr = if stand_in.is_some() {
         0
+    } else if failed.is_some() || primary_broken {
+        0x8000_4005u32 as HRESULT
     } else if adopted {
         super::list_x::reset_pc(primary, alloc, pso)
     } else {
@@ -176,7 +206,8 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             if stand_in.is_some() || m.contains_key(&(this as usize)) {
                 let b = m.entry(this as usize).or_default();
                 let mut old = std::mem::take(&mut b.extra_active);
-                old.extend(std::mem::replace(&mut b.first, stand_in));
+                old.extend(std::mem::replace(&mut b.first, stand_in).filter(|first| Some(*first) != stand_in));
+                old.extend(b.failed.take().filter(|failed| Some(*failed) != stand_in));
                 b.spares.extend(old.iter().copied());
                 old
             } else {
@@ -194,6 +225,11 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             for seg in moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 super::list_x::clear_segment_state(seg);
+                super::alloc_pool::retire_recording(seg);
+            }
+            if stand_in.is_some() {
+                super::bind::reset(primary, 0, 0);
+                super::alloc_pool::retire_recording(primary as usize);
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
@@ -252,6 +288,10 @@ pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
     };
     let sg = SEGMENTS.lock().unwrap();
     let book = sg.as_ref().and_then(|m| m.get(&(list as usize)));
+    if let Some(failed) = book.and_then(|b| b.failed) {
+        out.push(failed as *mut c_void);
+        return true;
+    }
     out.push(book.and_then(|b| b.first).map_or(primary, |f| f as *mut c_void));
     if let Some(book) = book {
         for &seg in &book.extra_active {
@@ -274,7 +314,43 @@ pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
     let sg = SEGMENTS.lock().unwrap();
     sg.as_ref()
         .and_then(|m| m.get(&(wrapper as usize)))
-        .is_none_or(|b| b.extra_active.len() + n <= MAX_EXTRA_SEGMENTS)
+        .is_none_or(|b| b.failed.is_none() && b.extra_active.len() + n <= MAX_EXTRA_SEGMENTS)
+}
+
+/// Reserve every bookkeeping slot a split will publish, before its producer is closed.
+pub(super) fn prepare_split(wrapper: *mut c_void, n: usize) -> bool {
+    let mut sg = SEGMENTS.lock().unwrap();
+    let m = sg.get_or_insert_with(HashMap::new);
+    if m.try_reserve(1).is_err() {
+        return false;
+    }
+    let b = m.entry(wrapper as usize).or_default();
+    if b.failed.is_some()
+        || b.extra_active.len() + n > MAX_EXTRA_SEGMENTS
+        || b.extra_active.try_reserve(n).is_err()
+        || b.spares.try_reserve(n).is_err()
+        || b.unresettable.try_reserve(1).is_err()
+    {
+        return false;
+    }
+    let mut wg = WRAPPER_OF.lock().unwrap();
+    wg.get_or_insert_with(HashMap::new).try_reserve(1).is_ok()
+}
+
+/// Reserve only the bookkeeping a fail-closed transition or successful standby return needs.
+/// Unlike a recording split, this does not consume physical-segment capacity.
+pub(super) fn prepare_fail_closed(wrapper: *mut c_void) -> bool {
+    let mut sg = SEGMENTS.lock().unwrap();
+    let m = sg.get_or_insert_with(HashMap::new);
+    if m.try_reserve(1).is_err() {
+        return false;
+    }
+    let b = m.entry(wrapper as usize).or_default();
+    if b.failed.is_some() || b.spares.try_reserve(1).is_err() || b.unresettable.try_reserve(1).is_err() {
+        return false;
+    }
+    let mut wg = WRAPPER_OF.lock().unwrap();
+    wg.get_or_insert_with(HashMap::new).try_reserve(1).is_ok()
 }
 
 /// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse
@@ -288,8 +364,19 @@ pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
 
 /// Give back to `wrapper`'s spare pool a closed PC command list that did not become a segment.
 pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
+    super::alloc_pool::retire_recording(pc as usize);
     let mut sg = SEGMENTS.lock().unwrap();
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
+}
+
+/// Take segment `pc` out of `wrapper`'s recording, so it is not submitted. Its failed Close left
+/// it open, so quarantine it until wrapper destruction rather than treating it as a closed spare.
+pub(super) fn drop_segment(wrapper: *mut c_void, pc: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    if let Some(b) = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize))) {
+        b.extra_active.retain(|&p| p != pc as usize);
+        b.unresettable.push(pc as usize);
+    }
 }
 
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
@@ -314,6 +401,30 @@ pub(super) unsafe fn activate_segment(wrapper: *mut c_void, old_pc: *mut c_void,
     m.insert(new_pc as usize, wrapper as usize);
 }
 
+/// Route a terminally failed recording to a known-closed object until the title Resets it.
+pub(super) unsafe fn fail_closed(wrapper: *mut c_void, old_pc: *mut c_void, closed_pc: *mut c_void, producer_broken: bool) {
+    *((wrapper as usize + F_BACKING) as *mut usize) = closed_pc as usize;
+    let mut sg = SEGMENTS.lock().unwrap();
+    let b = sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default();
+    b.failed = Some(closed_pc as usize);
+    if producer_broken {
+        if old_pc as usize == *((wrapper as usize + F_PRIMARY) as *const usize) {
+            b.primary_broken = true;
+        } else {
+            b.extra_active.retain(|&p| p != old_pc as usize);
+            if b.first == Some(old_pc as usize) {
+                b.first = None;
+            }
+            b.unresettable.push(old_pc as usize);
+        }
+    }
+    drop(sg);
+    let mut wg = WRAPPER_OF.lock().unwrap();
+    let m = wg.get_or_insert_with(HashMap::new);
+    m.remove(&(old_pc as usize));
+    m.insert(closed_pc as usize, wrapper as usize);
+}
+
 /// For `KickoffX` on an already-split list: returns `(primary, prior_closed_segments, extra_to_reclaim)`
 /// when `active_pc != primary`, switches `F_BACKING` back to `primary`, and moves all extra
 /// segments (including `active_pc`) into `spares` so recording resumes cleanly on `primary`.
@@ -322,6 +433,9 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
     let wrapper = wrapper_of(active_pc)?;
     let mut sg = SEGMENTS.lock().unwrap();
     let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
+    if book.failed.is_some() {
+        return None;
+    }
     let primary = book.first.map_or_else(|| *((wrapper as usize + F_PRIMARY) as *const *mut c_void), |f| f as *mut c_void);
     if primary == active_pc {
         return None;
@@ -405,21 +519,20 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             if let Some(m) = wg.as_mut() {
                 m.remove(&(pc as usize));
                 if let Some(ref b) = book {
-                    for &seg in b.extra_active.iter().chain(b.spares.iter()).chain(b.first.iter()) {
+                    for &seg in b.extra_active.iter().chain(b.spares.iter()).chain(b.first.iter()).chain(b.failed.iter()).chain(b.unresettable.iter()) {
                         m.remove(&seg);
                     }
                 }
             }
         }
         if let Some(b) = book {
-            for seg in b.extra_active.into_iter().chain(b.spares.into_iter()).chain(b.first) {
+            for seg in b.extra_active.into_iter().chain(b.spares.into_iter()).chain(b.first).chain(b.failed).chain(b.unresettable) {
                 let raw = seg as *mut c_void;
                 super::bind::forget(raw);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
                 rel(raw);
             }
         }
-        super::bind::forget(pc);
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n
@@ -451,6 +564,134 @@ mod tests {
     }
     unsafe extern "system" fn fake_this(this: *mut c_void, a: u64, b: u64, c: u64, d: u64) -> u64 {
         this as u64 + a + 10 * b + 100 * c + 1000 * d
+    }
+
+    const REUSED_PSO: usize = 0x7E57_D102;
+
+    unsafe extern "system" fn reuse_release(this: *mut c_void) -> u32 {
+        let fake = &mut *(this as *mut Fake);
+        fake.refs -= 1;
+        if fake.refs == 0 {
+            // The adopted list forgets before the native runtime frees it. Model an allocator
+            // immediately handing the same address to a new list before Release returns.
+            super::super::bind::forget(this);
+            super::super::bind::reset(this, 0, REUSED_PSO);
+        }
+        fake.refs
+    }
+
+    #[test]
+    fn wrapper_release_does_not_forget_a_new_list_at_the_reused_primary_address() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = reuse_release as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        unsafe {
+            let wrapper = wrap(primary as *mut c_void);
+            super::super::bind::reset(primary as *mut c_void, 0, REUSED_PSO + 1);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*(*(wrapper as *const *const usize)).add(2));
+            assert_eq!(rel(wrapper), 0);
+            assert_eq!(super::super::bind::tracked_pso(primary as *mut c_void), REUSED_PSO);
+            super::super::bind::forget(primary as *mut c_void);
+            drop(Box::from_raw(primary));
+        }
+    }
+
+    #[test]
+    fn split_limit_counts_every_physical_extra_segment() {
+        let wrapper = 0x7ffe_3001usize as *mut c_void;
+        {
+            let mut sg = SEGMENTS.lock().unwrap();
+            sg.get_or_insert_with(HashMap::new).insert(
+                wrapper as usize,
+                SegmentBook { extra_active: (0..MAX_EXTRA_SEGMENTS - 1).map(|i| 0x8000 + i).collect(), ..Default::default() },
+            );
+        }
+        assert!(can_split(wrapper, 1));
+        assert!(!can_split(wrapper, 2), "a deferred dispatch needs two physical segments");
+        assert!(!prepare_split(wrapper, 2));
+        assert_eq!(SEGMENTS.lock().unwrap().as_ref().unwrap()[&(wrapper as usize)].extra_active.len(), MAX_EXTRA_SEGMENTS - 1);
+        assert!(prepare_split(wrapper, 1));
+        push_segment(wrapper, 0x9000usize as *mut c_void);
+        assert!(!can_split(wrapper, 1));
+        assert!(can_split(wrapper, 0));
+        assert!(prepare_fail_closed(wrapper), "Kickoff standby does not consume segment capacity");
+        SEGMENTS.lock().unwrap().as_mut().unwrap().get_mut(&(wrapper as usize)).unwrap().failed = Some(0x9100);
+        assert!(!prepare_fail_closed(wrapper), "an already failed recording cannot preflight again");
+        SEGMENTS.lock().unwrap().as_mut().unwrap().remove(&(wrapper as usize));
+    }
+
+    #[test]
+    fn failed_primary_routes_submission_and_calls_to_closed_standby() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let standby = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        unsafe {
+            let wrapper = wrap(primary as *mut c_void);
+            fail_closed(wrapper, primary as *mut c_void, standby as *mut c_void, true);
+            assert_eq!(*((wrapper as usize + F_BACKING) as *const usize), standby as usize);
+            assert!(!can_split(wrapper, 1));
+            let mut submitted = Vec::new();
+            assert!(push_segments(wrapper, &mut submitted));
+            assert_eq!(submitted, vec![standby as *mut c_void]);
+            {
+                let books = SEGMENTS.lock().unwrap();
+                let book = &books.as_ref().unwrap()[&(wrapper as usize)];
+                assert!(book.primary_broken);
+                assert_eq!(book.failed, Some(standby as usize));
+            }
+
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrapper as *const *const usize)).add(2));
+            assert_eq!(rel(wrapper), 0);
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(standby));
+        }
+    }
+
+    #[test]
+    fn failed_continuation_reset_keeps_the_closed_producer_reusable() {
+        let producer = 0x7ffe_4002usize as *mut c_void;
+        let standby = 0x7ffe_4003usize as *mut c_void;
+        let mut object = vec![0usize; OBJECT_BYTES / std::mem::size_of::<usize>()];
+        let wrapper = object.as_mut_ptr() as *mut c_void;
+        unsafe {
+            *((wrapper as usize + F_PRIMARY) as *mut usize) = producer as usize;
+            fail_closed(wrapper, producer, standby, false);
+        }
+        let books = SEGMENTS.lock().unwrap();
+        let book = &books.as_ref().unwrap()[&(wrapper as usize)];
+        assert_eq!(book.failed, Some(standby as usize));
+        assert!(!book.primary_broken);
+        assert!(book.unresettable.is_empty());
+        drop(books);
+        SEGMENTS.lock().unwrap().as_mut().unwrap().remove(&(wrapper as usize));
+        WRAPPER_OF.lock().unwrap().as_mut().unwrap().remove(&(standby as usize));
+    }
+
+    #[test]
+    fn in_flight_failed_standby_is_replaced_instead_of_reused() {
+        use std::cell::Cell;
+        let reused = Cell::new(false);
+        let replaced = Cell::new(false);
+        let selected = recover_failed_with(
+            0x7100,
+            true,
+            |_| {
+                reused.set(true);
+                Some(0x7100)
+            },
+            || {
+                replaced.set(true);
+                Some(0x7200)
+            },
+        );
+        assert_eq!(selected, Some(0x7200));
+        assert!(!reused.get() && replaced.get());
     }
 
     /// The SDK's inline writers check `write < end` (or `write + n <= end`): never room here.

@@ -10,6 +10,8 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
+pub use alloc_pool::AllocatorSubmitStats;
+mod build_queue;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -19,13 +21,16 @@ mod cpu_writes;
 pub mod dred;
 mod fence_x;
 pub mod frame;
+pub(crate) mod gfx_records;
 pub mod guard;
 mod late_release;
 pub mod layout;
 pub mod list_x;
+pub mod memory_report;
 pub mod null;
 pub mod present;
 pub mod pso_async;
+mod queue_submit;
 pub mod real;
 mod shader_cache_session;
 pub mod sparse;
@@ -33,10 +38,15 @@ mod standin;
 pub mod title_list;
 pub mod title_textures;
 mod uma_driver;
+mod used_journal;
 pub mod vram;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
+
+pub fn allocator_submit_stats() -> AllocatorSubmitStats {
+    alloc_pool::submit_stats()
+}
 
 use crate::util::{HRESULT, S_OK};
 

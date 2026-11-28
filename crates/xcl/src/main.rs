@@ -35,6 +35,7 @@ Usage:
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
       --precompile [--only STAGE]: caches compiled shaders before a run (e.g. --only cs).
+      --prepare-corpus: builds every staged native pipeline recipe for a title folder.
           --pipelines also builds compute pipelines and caches them for the next run.
           --used-only skips compute shaders whose pipelines were not used in earlier runs.
       --export-hlsl DIR [--count N] [--min-kb N] [--record-hash HEX]: writes deterministic

@@ -138,9 +138,9 @@ unsafe impl Send for Clock {}
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// (token, qpc of the origin it was issued at)
-static ISSUED: Mutex<Vec<(u64, i64)>> = Mutex::new(Vec::new());
+static ISSUED: Mutex<VecDeque<(u64, i64)>> = Mutex::new(VecDeque::new());
 /// (token, origin qpc, flip qpc)
-static FLIPPED: Mutex<Vec<(u64, i64, i64)>> = Mutex::new(Vec::new());
+static FLIPPED: Mutex<VecDeque<(u64, i64, i64)>> = Mutex::new(VecDeque::new());
 static LAST_ORIGIN: AtomicI64 = AtomicI64::new(0);
 /// qpc of the origins the clock released and no WaitFrameEventX has consumed yet (the origin
 /// semaphore counts up to ORIGIN_SEMAPHORE_MAX): each token gets its own frame's origin, not
@@ -260,23 +260,115 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
     S_FALSE
 }
 
+// Writability and stack-handle fast paths adapted from PR #2692 by Decodere.
+fn is_writable_protect(protect: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE, PAGE_WRITECOPY};
+    matches!(protect & 0xFF, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+}
+
+/// Fast-path working-set check for `[p, end)`: a definite answer for resident pages, otherwise
+/// `None` so `writable` can inspect the virtual-memory regions without touching the pages.
+fn resident_and_writable(p: usize, end: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::PAGE_GUARD;
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    const MAX_PAGES: usize = 16;
+    let first = p >> 12;
+    let pages = ((end - 1) >> 12) - first + 1;
+    if pages > MAX_PAGES {
+        return None;
+    }
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_PAGES] = unsafe { std::mem::zeroed() };
+    for (k, e) in ws[..pages].iter_mut().enumerate() {
+        e.VirtualAddress = ((first + k) << 12) as *mut std::ffi::c_void;
+    }
+    let size = (pages * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+    if unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
+        return None;
+    }
+    let mut all_resident = true;
+    for e in &ws[..pages] {
+        let flags = unsafe { e.VirtualAttributes.Flags };
+        let protect = ((flags >> 4) & 0x7FF) as u32;
+        if flags & 1 != 0 && protect != 0 {
+            if protect & PAGE_GUARD != 0 || !is_writable_protect(protect) {
+                return Some(false);
+            }
+        } else {
+            all_resident = false;
+        }
+    }
+    all_resident.then_some(true)
+}
+
+/// Whether `[p, p + len)` is committed, unguarded and writable without touching any page.
+fn writable(p: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD};
+    if p == 0 || len == 0 || len > 256 << 20 {
+        return false;
+    }
+    let Some(end) = p.checked_add(len) else { return false };
+    if let Some(ok) = resident_and_writable(p, end) {
+        return ok;
+    }
+    let mut cur = p;
+    while cur < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(cur as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if n == 0 || mbi.State != MEM_COMMIT || mbi.Protect & PAGE_GUARD != 0 || !is_writable_protect(mbi.Protect) {
+            return false;
+        }
+        let Some(next) = (mbi.BaseAddress as usize).checked_add(mbi.RegionSize) else { return false };
+        if next <= cur {
+            return false;
+        }
+        cur = next;
+    }
+    true
+}
+
+/// Stack-allocated ancillary handles (at most `MAXIMUM_WAIT_OBJECTS - 1`).
+struct AncillaryHandles {
+    handles: [HANDLE; 63],
+    len: usize,
+}
+
+impl std::ops::Deref for AncillaryHandles {
+    type Target = [HANDLE];
+    fn deref(&self) -> &[HANDLE] {
+        &self.handles[..self.len]
+    }
+}
+
+impl IntoIterator for AncillaryHandles {
+    type Item = HANDLE;
+    type IntoIter = std::iter::Take<std::array::IntoIter<HANDLE, 63>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.handles.into_iter().take(self.len)
+    }
+}
+
 /// the handles of an ancillary block `{ u32 count; HANDLE* list @8; i32* signaled @0x10 }`
-unsafe fn ancillary(block: *const u8) -> Result<Vec<HANDLE>, HRESULT> {
+unsafe fn ancillary(block: *const u8) -> Result<AncillaryHandles, HRESULT> {
+    let mut out = AncillaryHandles { handles: [std::ptr::null_mut(); 63], len: 0 };
     if block.is_null() {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     if !crate::gpu::shader::readable(block as usize, 16) {
         return Err(E_INVALIDARG);
     }
     let count = (block as *const u32).read_unaligned() as usize;
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     let list = (block.add(8) as *const usize).read_unaligned();
     if count > 63 || !crate::gpu::shader::readable(list, count * 8) {
         return Err(E_INVALIDARG);
     }
-    Ok((0..count).map(|i| (list as *const HANDLE).add(i).read_unaligned()).collect())
+    for (i, slot) in out.handles[..count].iter_mut().enumerate() {
+        *slot = (list as *const HANDLE).add(i).read_unaligned();
+    }
+    out.len = count;
+    Ok(out)
 }
 
 unsafe fn note_signaled(block: *const u8, index: i32) {
@@ -284,7 +376,7 @@ unsafe fn note_signaled(block: *const u8, index: i32) {
         return;
     }
     let out = (block.add(0x10) as *const usize).read_unaligned();
-    if crate::gpu::shader::readable(out, 4) {
+    if writable(out, 4) {
         (out as *mut i32).write_unaligned(index);
     }
 }
@@ -363,7 +455,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     trace_calls(format_args!("WaitFrameEventX(type {ty}, timeout {timeout_ms} ms, block {block:p}, flags {flags:#x}, token in {:#x})", if token.is_null() { 0 } else { *token }));
     let scheduled = with(|c| {
         ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled)
-            .then(|| (c.kinds[ty as usize].internal as usize, Arc::clone(&c.kinds[ty as usize].extra)))
+            .then(|| (c.kinds[ty as usize].internal as usize, (interval_override() == Some(0)).then(|| Arc::clone(&c.kinds[ty as usize].extra))))
     });
     let Some((internal, scheduled_extra)) = scheduled else { return E_INVALIDARG };
     let token_in = if token.is_null() { 0 } else { *token };
@@ -374,8 +466,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
         Ok(h) => h,
         Err(e) => return e,
     };
-    let uncapped = interval_override() == Some(0);
-    let (hr, index, origin_now) = if uncapped {
+    let (hr, index, origin_now) = if let Some(scheduled_extra) = scheduled_extra {
         for &h in &scheduled_extra.0 {
             if SetEvent(h) == 0 {
                 ReleaseSemaphore(h, 1, std::ptr::null_mut());
@@ -402,16 +493,18 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
         }
         (hr, index, Some(now))
     } else {
-        let mut hs = vec![internal as HANDLE];
-        hs.extend(extra);
-        let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
+        let mut hs = [std::ptr::null_mut(); 64];
+        hs[0] = internal as HANDLE;
+        hs[1..1 + extra.len()].copy_from_slice(&extra);
+        let count = 1 + extra.len();
+        let r = WaitForMultipleObjects(count as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
         ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
         if r == WAIT_TIMEOUT {
             ACTIVITY[1].fetch_add(1, Ordering::Relaxed);
         }
         let (hr, index) = if r == WAIT_TIMEOUT {
             (S_FALSE, -1)
-        } else if ((r - WAIT_OBJECT_0) as usize) < hs.len() {
+        } else if ((r - WAIT_OBJECT_0) as usize) < count {
             // -2: the frame event itself, else the index of the ancillary handle
             (S_OK, if r == WAIT_OBJECT_0 { -2 } else { (r - WAIT_OBJECT_0) as i32 - 1 })
         } else {
@@ -440,9 +533,9 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
                 t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) & TOKEN_MASK;
             }
             if issued.len() >= KNOWN_TOKENS {
-                issued.remove(0);
+                issued.pop_front();
             }
-            issued.push((t, origin));
+            issued.push_back((t, origin));
             if !token.is_null() {
                 *token = t;
             }
@@ -459,10 +552,9 @@ pub fn mark_flipped(token: u64) {
     // the frame's own origin (a token XCL did not issue: the latest origin)
     let origin = ISSUED.lock().unwrap().iter().rev().find(|e| e.0 == token).map(|e| e.1).unwrap_or_else(|| LAST_ORIGIN.load(Ordering::Relaxed));
     let mut f = FLIPPED.lock().unwrap();
-    f.push((token, origin, qpc()));
-    if f.len() > FLIPPED_KEEP {
-        let n = f.len() - FLIPPED_KEEP;
-        f.drain(..n);
+    f.push_back((token, origin, qpc()));
+    while f.len() > FLIPPED_KEEP {
+        f.pop_front();
     }
 }
 
@@ -621,6 +713,76 @@ mod tests {
         assert_eq!(effective_clock_interval_us(33333, Some(8333)), Some(8333));
         assert_eq!(effective_clock_interval_us(16667, Some(33333)), Some(16667));
         assert_eq!(effective_clock_interval_us(33333, Some(200)), Some(1000));
+    }
+
+    #[test]
+    fn note_signaled_requires_every_target_page_to_be_writable() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD,
+            PAGE_READONLY, PAGE_READWRITE,
+        };
+        let block = |out: usize| {
+            let mut b = [0u8; 0x18];
+            b[0x10..].copy_from_slice(&out.to_le_bytes());
+            b
+        };
+        unsafe {
+            assert!(!writable(0, 4) && !writable(usize::MAX - 1, 4));
+            let base = VirtualAlloc(std::ptr::null(), 0x3000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            assert!(!base.is_null());
+            let (ro, guard) = (base.add(0x1000), base.add(0x2000));
+            (ro as *mut i32).write_unaligned(0x1234_5678);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(ro as *const _, 0x1000, PAGE_READONLY, &mut old), 0);
+            assert_ne!(VirtualProtect(guard as *const _, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            assert!(writable(base as usize, 4));
+            assert!(!writable(base as usize + 0xFFE, 4) && !writable(guard as usize, 4));
+            note_signaled(block(ro as usize).as_ptr(), 9);
+            assert_eq!((ro as *const i32).read_unaligned(), 0x1234_5678);
+            note_signaled(block(base as usize).as_ptr(), 7);
+            assert_eq!((base as *const i32).read_unaligned(), 7);
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(guard as *const _, &mut mbi, std::mem::size_of_val(&mbi)), 0);
+            assert_ne!(mbi.Protect & PAGE_GUARD, 0, "validation consumed the guard page");
+            assert_ne!(VirtualFree(base as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn ancillary_stack_handles_preserve_boundaries_and_order() {
+        unsafe {
+            assert!(ancillary(std::ptr::null()).unwrap().is_empty());
+            let mut block = [0u8; 0x18];
+            let list: [HANDLE; 63] = std::array::from_fn(|i| ((i + 1) * 4) as HANDLE);
+            block[..4].copy_from_slice(&63u32.to_le_bytes());
+            block[8..16].copy_from_slice(&(list.as_ptr() as usize).to_le_bytes());
+            let got = ancillary(block.as_ptr()).unwrap();
+            assert_eq!(&*got, &list);
+            assert_eq!(got.into_iter().collect::<Vec<_>>(), list);
+            block[..4].copy_from_slice(&64u32.to_le_bytes());
+            assert_eq!(ancillary(block.as_ptr()).err(), Some(E_INVALIDARG));
+        }
+    }
+
+    #[test]
+    fn frame_history_deques_evict_oldest_in_order() {
+        let mut issued = VecDeque::new();
+        for i in 0..KNOWN_TOKENS + 10 {
+            if issued.len() >= KNOWN_TOKENS {
+                issued.pop_front();
+            }
+            issued.push_back(i);
+        }
+        assert_eq!((issued.len(), issued.front(), issued.back()), (KNOWN_TOKENS, Some(&10), Some(&(KNOWN_TOKENS + 9))));
+
+        let mut flipped = VecDeque::new();
+        for i in 0..FLIPPED_KEEP + 10 {
+            flipped.push_back(i);
+            while flipped.len() > FLIPPED_KEEP {
+                flipped.pop_front();
+            }
+        }
+        assert_eq!((flipped.len(), flipped.front(), flipped.back()), (FLIPPED_KEEP, Some(&10), Some(&(FLIPPED_KEEP + 9))));
     }
 
     #[test]

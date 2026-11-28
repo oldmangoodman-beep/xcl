@@ -127,7 +127,7 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 | **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
-| **DirectStorage** | ✅ | the console's DirectStorage queues: file and memory sources, zlib, and BCPack – the console's texture compression – for BC1, BC3, BC4, BC5, BC6H and BC7 (BC2 and the hardware swizzle are refused) | unit tests on synthetic streams; retail BCPack chunks of all six modes byte-identical with a reference decoder (`XCL_SAMPLE_BCPACK`) |
+| **DirectStorage** | ✅ | the console's DirectStorage queues: file and memory sources, queued event notifications, zlib, and BCPack – the console's texture compression – for BC1, BC3, BC4, BC5, BC6H and BC7 (BC2 and the hardware swizzle are refused) | unit tests on synthetic streams; retail BCPack chunks of all six modes byte-identical with a reference decoder (`XCL_SAMPLE_BCPACK`) |
 
 </details>
 
@@ -151,7 +151,7 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
-| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 912 / 912 entries detiled in the tested retail archive; GPU upload bit exact in test fixtures |
+| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures; supported GPU-written title subresources copy back before their writer queue's title fence becomes visible | 912 / 912 entries detiled in the tested retail archive; GPU upload bit exact in test fixtures |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
@@ -241,8 +241,12 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
-  can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
-  made up of complete native waves can use the per-lane form for branches on whole-wave masks.
+  can still differ there. Recognized compiler-pattern wave64 vertex and pixel min/max/and/or
+  reductions and constant-lane scalar spill slots preserve missing partial-wave lanes; other
+  missing-lane reads can still differ. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
+  made up of complete native waves can use the per-lane form for branches on whole-wave masks;
+  split-wave64 programs that access LDS stay on the HLSL path to preserve instruction order
+  between their two hardware wave32 halves.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
 
 ```powershell
@@ -252,7 +256,7 @@ xcl inspect D:\Game\game.exe               # the game's imports and what XCL has
 xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
-xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
+xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run (except by default on AMD)
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only   # only the compute pipelines an earlier run of the title used
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
@@ -262,21 +266,42 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
-- When a game folder contains a `shaders.rpf` shader pack or loose `.dxbc` files under
-  `shaders/`, XCL shows shader preparation in the game window before executing title code.
-  The same window then presents the game. The percentage counts
-  processed records. The timer counts seconds since one finished (or preparation started);
-  five seconds without progress counts as a stall, and the window shows when the last one ended.
-  XCL prepares supported shader stages and compute pipelines, including
-  split pieces and their whole fallback. Graphics pipelines that need state supplied by the
-  title are created during play. Later launches reuse matching cache entries.
-  Closing the window cancels the launch. A compiler or driver failure stops it and reports
-  the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
-  `XCL_PREPARE=0` leaves the preparation out: the game starts at once and builds the shaders it
-  uses as it goes (it stands still while they build).
+- XCL uses the game window to show preparation progress before executing title code. It prepares
+  supported shader packs, supported loose shaders under `shaders/`, recorded graphics history and
+  staged pipeline recipes. Closing the window cancels launch. A failed staged recipe stops launch.
+  With presentation disabled, preparation runs without a window. A staged corpus still gates
+  launch when the null renderer is selected. For an unstaged title set `XCL_PREPARE=0`
+  to skip startup preparation, or `XCL_PREPARE_GRAPHICS=0` to skip optional graphics history.
+  Native recipes validated on this adapter and driver reuse their verified blobs across
+  rebuilds. Compute verification also survives changes to the preparation worker count.
+  Changes to translation, pipeline layout, settings or cache files trigger validation. During
+  validation, exact recipes that the driver accepts are imported from the previous pipeline
+  library; incompatible or missing recipes are rebuilt normally.
+- To prepare known graphics, two-pass mesh and compute recipes offline, use a local
+  [archive layout profile](scripts/pso_corpus/archive-profile.md) with the following commands.
+  The staging command accepts several journals, deduplicates their recipes and atomically publishes
+  a content identity for later preparation receipts.
+
+  ```powershell
+  python scripts/pso_corpus/pso_archive.py profile.json archive.bin pipelines.bin
+  python scripts/pso_corpus/stage.py --title <title-folder> pipelines.bin
+  xcl shaders <title-folder> --prepare-corpus --threads 8
+  ```
+
+  The offline command accepts up to 32 workers. Normal launch also prepares the staged corpus.
+  When a shader pack or local history overlaps the corpus, XCL prepares each exact match once.
+  Use the same adapter and memory-window
+  configuration for offline preparation and play so the driver can reuse the results.
+  Graphics state combinations absent from the supplied recipes and local history can still
+  require a first-use compile during play.
 - For compute shaders that XCL can split, the runtime first tries the saved driver blob for
   the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
   or the driver rejects it, XCL builds the split pieces.
+- A split program first seen through `ExecuteIndirect` is also kept in
+  `used-indirect-split.txt` beside the DXIL cache. A later `--pipelines --used-only` pass still
+  builds its direct-dispatch pieces and whole fallback, and additionally saves both its pieces and
+  whole fallback under the indirect root; other split programs do not pay for those potentially
+  long driver compiles.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
@@ -302,9 +327,16 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
-    default.
+    default. Expiry stops the title before later GPU work is submitted; it never treats elapsed
+    time as proof that the waited-for work completed.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+  Loading a cached shader without split pieces reuses the file buffer, avoiding a second
+  payload-sized allocation.
+- XCL saves an eligible driver blob when its pipeline takes at least 250 ms to build, even
+  after the bounded in-memory blob cache fills. This is off by default on AMD;
+  `XCL_PSO_DISK_CACHE=1` forces it on, and `XCL_PSO_DISK_CACHE=0` disables it elsewhere.
+  Compute blobs with different ordered static-sampler root signatures use separate entries.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
@@ -322,11 +354,16 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+  On AMD, cold 128–256 KiB compute pipelines use a separate lane (three background / four
+  wanted at once on hosts with at least 32 GiB RAM, two / three below that), configurable with
+  `XCL_MEDIUM_PSO_CONCURRENCY` and `XCL_MEDIUM_PSO_WANTED_CONCURRENCY`.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
   pipeline bound at the last operation DRED saw complete and those bound after it, by their
   console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
+- `XCL_TEXTURE_LEVEL_PAGES=1` gives sampled title textures backing as their mip levels stream in.
+  Zero-filled mip uploads in a batch share one staging span and still clear any mapped tiles.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
@@ -339,14 +376,46 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+  With `XCL_STALL_TRACE=1`, `report.json` also contains versioned aggregate counts, total/max time and
+  log2-nanosecond histograms for coarse runtime stalls, plus a bounded list of the newest spans of at
+  least 50 ms. The tracing is off by default.
+  `XCL_STALL_TRACE_DETAIL=1` includes high-frequency draw, dispatch, binding, descriptor/view,
+  barrier, copy and command-list lifecycle recording costs on the title's first observed submitting
+  thread; it also enables the coarse trace. Use it only for a diagnostic run because every recorded
+  call reads the clock and updates counters.
+  `XCL_GPU_TIMING=1` times each native title `ExecuteCommandLists` chunk on the CPU. The count and
+  slowest duration/list count are written to `report.json`; chunks taking at least 50 ms are logged
+  (`XCL_GPU_TIMING_MS` changes that threshold). It also retains a bounded set of exact
+  queue-generation fence receipts and polls them without waiting while collecting the report.
+  Tracked, completed and pending receipt counts are reported separately, along with exact-marker
+  failures, receipts discarded on tracker contention and pending receipts evicted at the capacity
+  bound. They are the correlation foundation for GPU timestamp durations, not GPU timing samples.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
     is not a whole number is ignored.
   - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
-    waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
-    memory in use. Where the lines stop changing is where the title stopped.
+    waits, DirectStorage requests), a `memory:` line with the process's commit and video memory in
+    use, a `memory by owner` line splitting the known XCL allocations from `other`, and sampled
+    texture resident / SRV-addressable / virtual texel totals. It also reports completed background
+    pipelines retained behind stand-ins and how many frames ago they were last used, and the
+    active foreground time plus
+    serialization wait spent looking for CPU writes before submits (write-watch bytes/ranges/pages,
+    sparse queue/fence-state/copy phases and zero/dirty volume, upload-gate wait/hold time split
+    between submit preparation and synchronous readback, and other refresh work). A negative
+    `other` exposes an overlapping or stale sample; unavailable
+    adapter segments say `unknown`. Where the lines stop changing is where the title stopped.
+  - `XCL_PSO_PRESSURE_OBSERVE=1`: every 2 seconds, shadow the compute-pipeline eviction policy
+    without changing residency. It retains rebuild inputs and logs bounded policy outcomes when
+    adapter-local usage reaches 90% of budget. `XCL_ACTIVITY` is not required.
+  - `XCL_PSO_PRESSURE_EVICT=1`: enable that policy. At most one rebuildable non-console compute
+    pipeline unused for 600 frames and resident for 60 frames is evicted per sample (at most 32
+    candidates scanned and 8 exact transactions attempted); demand restores its exact identity.
+    Eviction stops below 75% of budget. This experimental opt-in takes precedence over observe mode.
+    `report.json` records cumulative detach, owner-retirement and restoration totals under
+    `d3d12.pipeline_pressure`. A generation-owner release means XCL issued COM `Release`; it does
+    not prove that the driver immediately reclaimed the allocation or video memory.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
@@ -370,11 +439,78 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 </details>
 
+## Reproducible cold and warm runs
+
+On a clean commit, build and run the same title once with fresh XCL caches and once with those
+exact caches warm:
+
+```powershell
+.\scripts\perf-run.ps1 -Game 'D:\Games\SomeTitle' -OutDir 'D:\xcl-perf\run-1' -Seconds 120
+```
+
+The script builds `xcl` in release mode and refuses a dirty worktree or a non-empty output
+folder. Both runs use a new temporary `XCL_DATA_ROOT` and `XCL_DXIL_CACHE`; the warm run reuses
+the cold run's directories. They are deleted afterwards, and existing user caches are never read,
+changed, or deleted. The output folder contains only each run's `xcl.log` and `report.json`, plus
+a versioned `manifest.json` with the commit, run order, hardware/toolchain, selected XCL
+environment, cache identity, durations, and exit status. It contains no game files or cache data.
+
+The manifest identifies the workload with a SHA-256 metadata fingerprint over its sorted relative
+file paths, lengths, and UTC modification-time ticks. Only the fingerprint and its algorithm/version
+are recorded; the inventory's file names and absolute paths are not persisted. This is a metadata
+fingerprint, not a content hash: a content change that preserves the path, length, and modification
+time is not detected.
+
+The manifest calls these states **XCL-cold** and **XCL-warm**. GPU driver caches are
+driver-controlled and are explicitly recorded as `uncontrolled`; this is not a fully cold-driver
+benchmark.
+
+Compare two completed artifact folders without modifying them:
+
+```powershell
+.\scripts\perf-compare.ps1 -Baseline 'D:\xcl-perf\main' -Candidate 'D:\xcl-perf\change' > comparison.json
+```
+
+The console shows raw cold/warm duration, exit/timeout state, stall totals/counts/maxima, the five
+compute-build coalescing counters, and ranked-preload submissions, starts and promotions. The
+allocator section also reports execute/chunk topology, retirement-signal outcomes, mark writes and
+allocator-state lock timing. Sparse upload-gate submit/readback wait and hold times are summed from
+the activity log; artifacts from older builds label those counters missing rather than zero. The
+redirected JSON keeps those values, raw deltas, and stall log2
+histograms. Missing reports or preparation summaries and unsupported preparation versions remain
+explicit states; they are not treated as zero. The tool
+refuses different workload fingerprints or identity algorithm/versions, run order, requested
+duration, runtime environment, system, GPU, or GPU driver. Missing reports and stall summaries are
+labelled as missing; it does not infer significance or percentages.
+
 ## Tests
 
 ```powershell
-.\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+.\scripts\test.ps1                         # build + benchmark smoke + all workspace tests
+.\scripts\perf-run.tests.ps1               # cold/warm runner fixture (no game is run)
+.\scripts\perf-compare.tests.ps1           # comparison fixture (synthetic artifacts)
+cargo bench -p xcl                          # synthetic performance benchmarks
+cargo bench -p xcl --bench core             # run one benchmark target
+cargo bench -p xcl --bench core -- --json   # one versioned JSON object per result
+cargo run -p xcl --bin xcl-bench-compare -- baseline.ndjson candidate.ndjson --max-regression-percent 5
 ```
+
+Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
+executable. The dependency-free harness prints median, mean and minimum time plus throughput; a
+positional substring selects benchmarks, and `cargo bench -p xcl -- --test` runs every closure once
+as a fast smoke check. `--json` emits newline-delimited, versioned records containing the sample
+count and iterations, nanoseconds per iteration, optional throughput, and the build profile,
+build profile, effective optimization level, debug-assertion setting, Rust compiler, OS, architecture
+and CPU identity used for the run. The build fields describe the compiler invocation that produced
+the benchmark, not whichever `rustc` is on `PATH` when it runs. `XCL_BENCH_PROFILE`,
+`XCL_BENCH_OPT_LEVEL`, `XCL_BENCH_DEBUG_ASSERTIONS`, `XCL_BENCH_TOOLCHAIN`, `XCL_BENCH_OS`,
+`XCL_BENCH_ARCH` and `XCL_BENCH_CPU` override those identity
+fields for reproducible CI; set the CPU override on systems where automatic detection reports
+`null`. The records are suitable for saved baselines and automated comparisons.
+`xcl-bench-compare` requires an explicit allowed regression
+percentage, compares the observed medians, and exits 1 when any benchmark exceeds it. It refuses
+different benchmark sets or optional environment/hardware metadata. This is a deterministic
+threshold check, not a claim of statistical significance.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks

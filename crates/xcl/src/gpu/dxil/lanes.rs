@@ -223,10 +223,6 @@ impl Lw {
             Partner::Present => {}
             Partner::Spin => return self.exchange_spin(vals),
             Partner::Missing => return vals.iter().map(|_| self.c(0)).collect(),
-            Partner::Unsupported(why) => {
-                self.exchange_error.get_or_insert_with(|| format!("pc {:#x}: wave64 exchange: {why}", self.pc));
-                return vals.iter().map(|_| self.c(0)).collect();
-            }
         }
         let (xs, base) = self.xs_storage();
         let slot = self.xslot;
@@ -258,8 +254,9 @@ impl Lw {
     /// The spin exchange (several console waves per group): the HLSL `xcl_x_meet` with
     /// `XCL_X_SPIN`. Each half stores its words in its slot (double-buffered by the parity
     /// of the exchange count), fences, adds its lane count to its arrival counter and waits
-    /// (one lane, bounded) for the partner's counter; a partner that never arrives marks
-    /// the wave dead and its exchanges give 0 from then on.
+    /// (one lane, bounded) for the partner's counter. A timed-out half sets the high bit of
+    /// the shared partner counter with compare-exchange; both halves observe that marker and
+    /// stop consuming exchanged values, so failure is dispatch-wide rather than half-local.
     fn exchange_spin(&mut self, vals: &[Value]) -> Vec<Value> {
         let stores: Vec<(Value, Value)> = vals.iter().enumerate().map(|(i, &v)| (self.c(i as u32), v)).collect();
         let loads: Vec<Value> = (0..vals.len()).map(|i| self.c(i as u32)).collect();
@@ -318,28 +315,73 @@ impl Lw {
             let other = lw.add(other, ho);
             let other = lw.addc(other, cbase);
             lw.guarded(first, &mut |lw| {
-                lw.s.gs_atomic(super::module::RmwOp::Add, xc, own, lanes);
+                const FAIL: u32 = 0x8000_0000;
+                let old = lw.s.gs_atomic(super::module::RmwOp::Add, xc, own, lanes);
+                let after = lw.add(old, lanes);
+                let bounds = lw.or(old, after);
+                let bounds = lw.or(bounds, need);
+                let bounds_high = lw.andc(bounds, FAIL);
+                let bounds_fail = lw.cmpc(Pred::Ne, bounds_high, 0);
                 let pre = lw.cur();
-                let lp = lw.block(Some(2));
-                let ex = lw.block(Some(1));
-                lw.br(lp);
+                let lp = lw.block(Some(3));
+                let check_done = lw.block(Some(1));
+                let check_timeout = lw.block(Some(1));
+                let timeout = lw.block(Some(1));
+                let check_race = lw.block(Some(1));
+                let retry = lw.block(Some(1));
+                let success = lw.block(Some(2));
+                let failure = lw.block(Some(3));
+                let ex = lw.block(Some(2));
+                lw.cond_br(bounds_fail, failure, lp);
                 lw.s.m.set_block(lp);
                 let i32 = lw.s.m.i32();
                 let n = lw.s.m.phi(i32);
                 let z = lw.c(0);
                 lw.s.m.add_incoming(n, z, pre);
                 let c = lw.s.gs_atomic(super::module::RmwOp::Add, xc, other, z);
-                let d = lw.sub(c, need);
-                let done = lw.cmp(Pred::SGe, d, z);
+                let partner_high = lw.andc(c, FAIL);
+                let partner_failed = lw.cmpc(Pred::Ne, partner_high, 0);
+                lw.cond_br(partner_failed, failure, check_done);
+
+                lw.s.m.set_block(check_done);
+                let done = lw.cmp(Pred::UGe, c, need);
+                lw.cond_br(done, success, check_timeout);
+
+                lw.s.m.set_block(check_timeout);
                 let n1 = lw.addc(n, 1);
                 let out = lw.cmpc(Pred::UGe, n1, 1 << 20);
-                let stop = lw.lor(done, out);
-                let me = lw.cur();
-                lw.s.m.add_incoming(n, n1, me);
-                lw.cond_br(stop, ex, lp);
+                let keep_polling = lw.cur();
+                lw.cond_br(out, timeout, lp);
+                lw.s.m.add_incoming(n, n1, keep_polling);
+
+                lw.s.m.set_block(timeout);
+                let marked = lw.orc(c, FAIL);
+                let actual = lw.s.gs_cmpxchg(xc, other, c, marked);
+                let marked_partner = lw.cmp(Pred::Eq, actual, c);
+                let actual_high = lw.andc(actual, FAIL);
+                let already_failed = lw.cmpc(Pred::Ne, actual_high, 0);
+                let failed = lw.lor(marked_partner, already_failed);
+                lw.cond_br(failed, failure, check_race);
+
+                lw.s.m.set_block(check_race);
+                let raced_done = lw.cmp(Pred::UGe, actual, need);
+                lw.cond_br(raced_done, success, retry);
+
+                lw.s.m.set_block(retry);
+                let retry_from = lw.cur();
+                lw.br(lp);
+                lw.s.m.add_incoming(n, n1, retry_from);
+
+                lw.s.m.set_block(success);
+                lw.wr(ok, one);
+                lw.br(ex);
+
+                lw.s.m.set_block(failure);
+                let zero = lw.c(0);
+                lw.wr(ok, zero);
+                lw.br(ex);
+
                 lw.s.m.set_block(ex);
-                let okv = lw.u(done);
-                lw.wr(ok, okv);
                 Ok(())
             })?;
             let okv = lw.rd(ok);

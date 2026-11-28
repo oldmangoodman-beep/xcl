@@ -271,7 +271,12 @@ impl Shader {
         // a refused piece leaves the whole program unsplit: say so
         let refused = |e: String| crate::xlog_warn!("compute split: piece {} of {} refused, the program stays whole: {}",
             stage + 1, plan.blocks.len(), e.lines().next().unwrap_or_default());
-        let blob = dst.try_finish(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
+        if !dst.m.terminated() {
+            dst.m.ret();
+        }
+        dst.m.optimize();
+        dst.prune_unused_bindings();
+        let blob = dst.finish_optimized(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
         crate::gpu::dxil::validate::validate(&blob).map_err(refused).ok()?;
         Some(blob)
     }
@@ -711,9 +716,32 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use crate::gpu::{
-        dxil::{kernel::{Entry, KernelOptions}, lower::Lw, module::{BinOp, CastOp, Pred}},
+        dxil::{
+            container::Stage,
+            kernel::{Entry, KernelOptions},
+            lower::Lw,
+            module::{BinOp, CastOp, Pred},
+            shader::{ResClass, Shader},
+        },
         recomp::{runner, CsInterface},
     };
+
+    #[test]
+    fn optimized_piece_prunes_only_unreferenced_static_bindings() {
+        let mut shader = Shader::new(Stage::Compute, (6, 6));
+        let used = shader.raw_uav(2, 0);
+        let _unused = shader.cbv(7, 1, 16);
+        let zero = shader.m.i32c(0);
+        shader.raw_store(used, zero, &[zero]);
+        shader.m.ret();
+        shader.m.optimize();
+
+        shader.prune_unused_bindings();
+
+        assert_eq!(shader.bindings.len(), 1);
+        assert_eq!(shader.bindings[0].class, ResClass::Uav);
+        assert_eq!((shader.bindings[0].space, shader.bindings[0].lower), (0, 2));
+    }
 
     #[test]
     fn oversized_loop_occupies_one_piece_up_to_the_hard_ceiling() {
@@ -844,6 +872,13 @@ mod tests {
         crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
         let chain = chain.expect("split the synthetic program");
         assert!(chain.pieces.len() >= 3);
+        let has_memory_binding: Vec<_> = chain.pieces.iter().map(|piece| {
+            crate::gpu::dxil::validate::disassemble(piece).unwrap()
+                .contains("ResBind { i32 2, i32 2, i32 0, i8 1 }")
+        }).collect();
+        assert!(has_memory_binding.iter().any(|&present| present));
+        assert!(has_memory_binding.iter().any(|&present| !present),
+            "pieces that only transport scratch must omit the title-memory binding");
         let initial: Vec<_> = (1..=threads * 3).collect();
         let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
             let n = (i as u32 % 4) + 1;

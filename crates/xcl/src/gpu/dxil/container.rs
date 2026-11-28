@@ -134,24 +134,31 @@ fn fourcc(s: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*s)
 }
 
-/// The `DXIL` part: program header, bitcode header, bitcode.
-fn program_part(stage: Stage, sm: (u32, u32), dxil_version: (u32, u32), bitcode: &[u8]) -> Vec<u8> {
-    assert!(bitcode.len() % 4 == 0);
-    let mut p = Vec::with_capacity(24 + bitcode.len());
-    let total = 24 + bitcode.len();
-    p.extend_from_slice(&(((stage as u32) << 16) | (sm.0 << 4) | sm.1).to_le_bytes());
-    p.extend_from_slice(&((total / 4) as u32).to_le_bytes());
-    p.extend_from_slice(&fourcc(b"DXIL").to_le_bytes());
-    p.extend_from_slice(&((dxil_version.0 << 8) | dxil_version.1).to_le_bytes());
-    p.extend_from_slice(&16u32.to_le_bytes());
-    p.extend_from_slice(&(bitcode.len() as u32).to_le_bytes());
-    p.extend_from_slice(bitcode);
-    p
+/// The 24-byte `DXIL` part header: program header + bitcode header.
+fn program_header(stage: Stage, sm: (u32, u32), dxil_version: (u32, u32), bitcode_len: usize) -> [u8; 24] {
+    assert!(bitcode_len % 4 == 0);
+    let words = [
+        ((stage as u32) << 16) | (sm.0 << 4) | sm.1,
+        ((24 + bitcode_len) / 4) as u32,
+        fourcc(b"DXIL"),
+        (dxil_version.0 << 8) | dxil_version.1,
+        16u32,
+        bitcode_len as u32,
+    ];
+    let mut hdr = [0u8; 24];
+    for (i, v) in words.into_iter().enumerate() {
+        hdr[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    hdr
 }
 
 /// PSV0 with `PSVRuntimeInfo3` (validator 1.8+).
 fn psv_part(psv: &Psv) -> Vec<u8> {
-    let mut p = Vec::new();
+    let str_raw = psv.entry.len() + 2;
+    let str_len = str_raw.next_multiple_of(4);
+    let res_len = if psv.resources.is_empty() { 0 } else { 4 + 24 * psv.resources.len() };
+    let exact_len = 68 + res_len + str_len;
+    let mut p = Vec::with_capacity(exact_len);
     let w = |p: &mut Vec<u8>, v: u32| p.extend_from_slice(&v.to_le_bytes());
     w(&mut p, 52);
     p.extend_from_slice(&[0; 16]); // stage-specific union (none for compute)
@@ -174,58 +181,67 @@ fn psv_part(psv: &Psv) -> Vec<u8> {
         }
     }
     // String table: "" then the entry name, padded to 4 bytes.
-    let mut strings = vec![0u8];
-    strings.extend_from_slice(psv.entry.as_bytes());
-    strings.push(0);
-    while strings.len() % 4 != 0 {
-        strings.push(0);
-    }
-    w(&mut p, strings.len() as u32);
-    p.extend_from_slice(&strings);
+    w(&mut p, str_len as u32);
+    p.push(0);
+    p.extend_from_slice(psv.entry.as_bytes());
+    p.push(0);
+    p.extend_from_slice(&[0u8; 3][..str_len - str_raw]);
     w(&mut p, 0); // semantic index table
+    debug_assert_eq!(p.len(), exact_len);
     p
 }
 
-/// An empty input / output signature.
-fn empty_signature() -> Vec<u8> {
-    let mut p = Vec::new();
-    p.extend_from_slice(&0u32.to_le_bytes());
-    p.extend_from_slice(&8u32.to_le_bytes());
-    p
-}
+/// An empty input / output signature (`0u32`, `8u32` LE).
+const EMPTY_SIGNATURE: [u8; 8] = [0, 0, 0, 0, 8, 0, 0, 0];
 
-/// Builds the signed container for a DXIL program.
-pub fn container(stage: Stage, sm: (u32, u32), bitcode: &[u8], features: u64, psv: &Psv) -> Vec<u8> {
+/// Assembles and signs a DXBC container directly from borrowed prefix parts and `bitcode`
+/// (single bitcode copy, exact allocation).
+fn assemble_container(prefix_parts: &[([u8; 4], &[u8])], stage: Stage, sm: (u32, u32), bitcode: &[u8]) -> Vec<u8> {
     let dxil_version = (1, sm.1.min(8));
-    let parts: Vec<([u8; 4], Vec<u8>)> = vec![
-        (*b"SFI0", features.to_le_bytes().to_vec()),
-        (*b"ISG1", empty_signature()),
-        (*b"OSG1", empty_signature()),
-        (*b"PSV0", psv_part(psv)),
-        (*b"DXIL", program_part(stage, sm, dxil_version, bitcode)),
-    ];
-    let header = 32 + 4 * parts.len();
-    let total: usize = header + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+    let dxil_hdr = program_header(stage, sm, dxil_version, bitcode.len());
+    let dxil_len = dxil_hdr.len() + bitcode.len();
+    let part_count = prefix_parts.len() + 1;
+    let header = 32 + 4 * part_count;
+    let total = header + prefix_parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>() + 8 + dxil_len;
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(b"DXBC");
     out.extend_from_slice(&[0; 16]);
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&(total as u32).to_le_bytes());
-    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(part_count as u32).to_le_bytes());
     let mut off = header;
-    for (_, d) in &parts {
+    for (_, d) in prefix_parts {
         out.extend_from_slice(&(off as u32).to_le_bytes());
         off += 8 + d.len();
     }
-    for (cc, d) in &parts {
+    out.extend_from_slice(&(off as u32).to_le_bytes());
+    for (cc, d) in prefix_parts {
         out.extend_from_slice(cc);
         out.extend_from_slice(&(d.len() as u32).to_le_bytes());
         out.extend_from_slice(d);
     }
+    out.extend_from_slice(b"DXIL");
+    out.extend_from_slice(&(dxil_len as u32).to_le_bytes());
+    out.extend_from_slice(&dxil_hdr);
+    out.extend_from_slice(bitcode);
+    debug_assert_eq!(out.len(), total);
     let digest = hash(&out[20..]);
     out[4..20].copy_from_slice(&digest);
     out
+}
+
+/// Builds the signed container for a DXIL program.
+pub fn container(stage: Stage, sm: (u32, u32), bitcode: &[u8], features: u64, psv: &Psv) -> Vec<u8> {
+    let sfi0 = features.to_le_bytes();
+    let psv_bytes = psv_part(psv);
+    let prefix = [
+        (*b"SFI0", sfi0.as_slice()),
+        (*b"ISG1", EMPTY_SIGNATURE.as_slice()),
+        (*b"OSG1", EMPTY_SIGNATURE.as_slice()),
+        (*b"PSV0", psv_bytes.as_slice()),
+    ];
+    assemble_container(&prefix, stage, sm, bitcode)
 }
 
 // ------------------------------------------------- graphics signatures
@@ -253,11 +269,11 @@ pub struct SigPartElement {
 /// (DXC writes names in declaration order while sorting elements by register).
 pub fn signature_part(elems: &[SigPartElement], name_order: &[&str]) -> Vec<u8> {
     let mut strings: Vec<u8> = Vec::new();
-    let mut offs: Vec<(String, u32)> = Vec::new();
+    let mut offs: Vec<(&str, u32)> = Vec::with_capacity(name_order.len() + elems.len());
     let base = 8 + 32 * elems.len() as u32;
     for n in name_order.iter().copied().chain(elems.iter().map(|e| e.name.as_str())) {
-        if !offs.iter().any(|(s, _)| s == n) {
-            offs.push((n.to_string(), base + strings.len() as u32));
+        if !offs.iter().any(|&(s, _)| s == n) {
+            offs.push((n, base + strings.len() as u32));
             strings.extend_from_slice(n.as_bytes());
             strings.push(0);
         }
@@ -265,12 +281,13 @@ pub fn signature_part(elems: &[SigPartElement], name_order: &[&str]) -> Vec<u8> 
     while strings.len() % 4 != 0 {
         strings.push(0);
     }
-    let mut p = Vec::new();
+    let exact_len = 8 + 32 * elems.len() + strings.len();
+    let mut p = Vec::with_capacity(exact_len);
     let w = |p: &mut Vec<u8>, v: u32| p.extend_from_slice(&v.to_le_bytes());
     w(&mut p, elems.len() as u32);
     w(&mut p, 8);
     for e in elems {
-        let off = offs.iter().find(|(s, _)| *s == e.name).unwrap().1;
+        let off = offs.iter().find(|&&(s, _)| s == e.name).unwrap().1;
         for v in [e.stream, off, e.index, e.system_value, e.comp_type, e.register] {
             w(&mut p, v);
         }
@@ -278,6 +295,7 @@ pub fn signature_part(elems: &[SigPartElement], name_order: &[&str]) -> Vec<u8> 
         w(&mut p, e.min_precision);
     }
     p.extend_from_slice(&strings);
+    debug_assert_eq!(p.len(), exact_len);
     p
 }
 
@@ -330,24 +348,15 @@ pub struct PsvFull {
 
 /// Writes PSV0 for [`PsvFull`].
 pub fn psv_part_full(psv: &PsvFull) -> Vec<u8> {
-    let mut p = Vec::new();
-    let w = |p: &mut Vec<u8>, v: u32| p.extend_from_slice(&v.to_le_bytes());
-    w(&mut p, 52);
-    p.extend_from_slice(&psv.stage_info);
-    w(&mut p, psv.min_wave);
-    w(&mut p, psv.max_wave);
-    p.extend_from_slice(&[psv.stage as u8, psv.uses_view_id as u8, psv.info1[0], psv.info1[1]]);
-    p.extend_from_slice(&[psv.inputs.len() as u8, psv.outputs.len() as u8, psv.prims.len() as u8, psv.input_vectors]);
-    p.extend_from_slice(&psv.output_vectors);
-    for n in psv.numthreads {
-        w(&mut p, n);
-    }
-    let all: Vec<&PsvSigElement> = psv.inputs.iter().chain(&psv.outputs).chain(&psv.prims).collect();
+    let total_elems = psv.inputs.len() + psv.outputs.len() + psv.prims.len();
+    let elems = || psv.inputs.iter().chain(&psv.outputs).chain(&psv.prims);
     // String table: "" then non-system names in element order (not
     // deduplicated, as DXC writes it), then the entry name.
-    let mut strings = vec![0u8];
-    let mut name_off = Vec::new();
-    for e in &all {
+    let str_raw = 1 + elems().map(|e| if e.name.is_empty() { 0 } else { e.name.len() + 1 }).sum::<usize>() + psv.entry.len() + 1;
+    let mut strings = Vec::with_capacity(str_raw.next_multiple_of(4));
+    strings.push(0);
+    let mut name_off = Vec::with_capacity(total_elems);
+    for e in elems() {
         if e.name.is_empty() {
             name_off.push(0);
         } else {
@@ -362,6 +371,36 @@ pub fn psv_part_full(psv: &PsvFull) -> Vec<u8> {
     while strings.len() % 4 != 0 {
         strings.push(0);
     }
+    // Semantic index table: each element's index list, reusing an existing run.
+    let mut table: Vec<u32> = Vec::new();
+    let mut idx_off = Vec::with_capacity(total_elems);
+    for e in elems() {
+        let n = e.indices.len();
+        let found = if n == 0 || table.len() < n { None } else { (0..=table.len() - n).find(|&i| table[i..i + n] == e.indices[..]) };
+        idx_off.push(match found {
+            Some(i) => i as u32,
+            None => {
+                table.extend_from_slice(&e.indices);
+                (table.len() - n) as u32
+            }
+        });
+    }
+    let res_len = if psv.resources.is_empty() { 0 } else { 4 + 24 * psv.resources.len() };
+    let sig_len = if total_elems == 0 { 0 } else { 4 + 16 * total_elems };
+    let tbl_len = 4 * psv.tables.iter().map(Vec::len).sum::<usize>();
+    let p_len = 68 + res_len + strings.len() + 4 * table.len() + sig_len + tbl_len;
+    let mut p = Vec::with_capacity(p_len);
+    let w = |p: &mut Vec<u8>, v: u32| p.extend_from_slice(&v.to_le_bytes());
+    w(&mut p, 52);
+    p.extend_from_slice(&psv.stage_info);
+    w(&mut p, psv.min_wave);
+    w(&mut p, psv.max_wave);
+    p.extend_from_slice(&[psv.stage as u8, psv.uses_view_id as u8, psv.info1[0], psv.info1[1]]);
+    p.extend_from_slice(&[psv.inputs.len() as u8, psv.outputs.len() as u8, psv.prims.len() as u8, psv.input_vectors]);
+    p.extend_from_slice(&psv.output_vectors);
+    for n in psv.numthreads {
+        w(&mut p, n);
+    }
     w(&mut p, entry_off);
     w(&mut p, psv.resources.len() as u32);
     if !psv.resources.is_empty() {
@@ -374,27 +413,13 @@ pub fn psv_part_full(psv: &PsvFull) -> Vec<u8> {
     }
     w(&mut p, strings.len() as u32);
     p.extend_from_slice(&strings);
-    // Semantic index table: each element's index list, reusing an existing run.
-    let mut table: Vec<u32> = Vec::new();
-    let mut idx_off = Vec::new();
-    for e in &all {
-        let n = e.indices.len();
-        let found = if n == 0 || table.len() < n { None } else { (0..=table.len() - n).find(|&i| table[i..i + n] == e.indices[..]) };
-        idx_off.push(match found {
-            Some(i) => i as u32,
-            None => {
-                table.extend_from_slice(&e.indices);
-                (table.len() - n) as u32
-            }
-        });
-    }
     w(&mut p, table.len() as u32);
     for v in &table {
         w(&mut p, *v);
     }
-    if !all.is_empty() {
+    if total_elems > 0 {
         w(&mut p, 16);
-        for (i, e) in all.iter().enumerate() {
+        for (i, e) in elems().enumerate() {
             w(&mut p, name_off[i]);
             w(&mut p, idx_off[i]);
             let cs = (e.cols & 0xF) | ((e.start_col & 3) << 4) | ((e.allocated as u8) << 6);
@@ -406,6 +431,7 @@ pub fn psv_part_full(psv: &PsvFull) -> Vec<u8> {
             w(&mut p, *v);
         }
     }
+    debug_assert_eq!(p.len(), p_len);
     p
 }
 
@@ -413,35 +439,17 @@ pub fn psv_part_full(psv: &PsvFull) -> Vec<u8> {
 /// mesh primitive outputs) and a prebuilt PSV0.
 #[allow(clippy::too_many_arguments)]
 pub fn container_with_signatures(stage: Stage, sm: (u32, u32), bitcode: &[u8], features: u64, isg: Vec<u8>, osg: Vec<u8>, psg: Option<Vec<u8>>, psv: Vec<u8>) -> Vec<u8> {
-    let dxil_version = (1, sm.1.min(8));
-    let mut parts: Vec<([u8; 4], Vec<u8>)> = vec![(*b"SFI0", features.to_le_bytes().to_vec()), (*b"ISG1", isg), (*b"OSG1", osg)];
-    if let Some(p) = psg {
-        parts.push((*b"PSG1", p));
+    let sfi0 = features.to_le_bytes();
+    match psg.as_deref() {
+        Some(p) => assemble_container(
+            &[(*b"SFI0", sfi0.as_slice()), (*b"ISG1", isg.as_slice()), (*b"OSG1", osg.as_slice()), (*b"PSG1", p), (*b"PSV0", psv.as_slice())],
+            stage, sm, bitcode,
+        ),
+        None => assemble_container(
+            &[(*b"SFI0", sfi0.as_slice()), (*b"ISG1", isg.as_slice()), (*b"OSG1", osg.as_slice()), (*b"PSV0", psv.as_slice())],
+            stage, sm, bitcode,
+        ),
     }
-    parts.push((*b"PSV0", psv));
-    parts.push((*b"DXIL", program_part(stage, sm, dxil_version, bitcode)));
-    let header = 32 + 4 * parts.len();
-    let total: usize = header + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(b"DXBC");
-    out.extend_from_slice(&[0; 16]);
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(total as u32).to_le_bytes());
-    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
-    let mut off = header;
-    for (_, d) in &parts {
-        out.extend_from_slice(&(off as u32).to_le_bytes());
-        off += 8 + d.len();
-    }
-    for (cc, d) in &parts {
-        out.extend_from_slice(cc);
-        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
-        out.extend_from_slice(d);
-    }
-    let digest = hash(&out[20..]);
-    out[4..20].copy_from_slice(&digest);
-    out
 }
 
 #[cfg(test)]
@@ -482,6 +490,124 @@ mod tests {
         let ours = psv_part(&psv);
         let theirs = part(DXC_CS, b"PSV0");
         assert_eq!(ours, theirs);
+    }
+
+    #[test]
+    fn parts_and_containers_are_exact_sized_and_match_reference_layout() {
+        let ref_dxbc = |parts: &[([u8; 4], &[u8])]| -> Vec<u8> {
+            let hdr = 32 + 4 * parts.len();
+            let tot = hdr + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+            let mut o = Vec::with_capacity(tot);
+            o.extend_from_slice(b"DXBC");
+            o.extend_from_slice(&[0; 16]);
+            o.extend_from_slice(&1u16.to_le_bytes());
+            o.extend_from_slice(&0u16.to_le_bytes());
+            o.extend_from_slice(&(tot as u32).to_le_bytes());
+            o.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+            let mut off = hdr;
+            for (_, d) in parts { o.extend_from_slice(&(off as u32).to_le_bytes()); off += 8 + d.len(); }
+            for (cc, d) in parts { o.extend_from_slice(cc); o.extend_from_slice(&(d.len() as u32).to_le_bytes()); o.extend_from_slice(d); }
+            let d = hash(&o[20..]);
+            o[4..20].copy_from_slice(&d);
+            o
+        };
+        let ref_dxil = |stage: Stage, sm: (u32, u32), bc: &[u8]| -> Vec<u8> {
+            let mut p = Vec::new();
+            for v in [((stage as u32) << 16) | (sm.0 << 4) | sm.1, ((24 + bc.len()) / 4) as u32, fourcc(b"DXIL"), (1 << 8) | sm.1.min(8), 16, bc.len() as u32] {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            p.extend_from_slice(bc);
+            p
+        };
+        let res = PsvResource { res_type: PsvResType::UavRaw, space: 1, lower: 2, upper: 4, kind: 11, flags: 3 };
+        let bc = [0xDEu8, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4];
+
+        // 1. psv_part + container across 0 & N resources and all entry padding remainders.
+        for n_res in [0usize, 3] {
+            for entry in ["", "a", "ab", "abc", "main"] {
+                let psv = Psv { stage: Stage::Compute, min_wave: 32, max_wave: 64, numthreads: [8, 4, 1], resources: vec![res.clone(); n_res], entry: entry.into() };
+                let p = psv_part(&psv);
+                assert_eq!(p.capacity(), p.len(), "psv_part over-allocated for n_res={n_res} entry={entry:?}");
+                let s0 = 0x1234_5678_9ABC_DEF0u64.to_le_bytes();
+                let dxil = ref_dxil(Stage::Compute, (6, 9), &bc);
+                let got = container(Stage::Compute, (6, 9), &bc, 0x1234_5678_9ABC_DEF0, &psv);
+                let want = ref_dxbc(&[(*b"SFI0", &s0), (*b"ISG1", &EMPTY_SIGNATURE), (*b"OSG1", &EMPTY_SIGNATURE), (*b"PSV0", &p), (*b"DXIL", &dxil)]);
+                assert_eq!(got.capacity(), got.len());
+                assert_eq!(got, want);
+                assert_eq!(part(&got, b"PSV0"), p.as_slice());
+            }
+        }
+
+        // 2. signature_part with empty & repeated names + name_order reordering.
+        let empty_sig = signature_part(&[], &[]);
+        assert_eq!(empty_sig.as_slice(), &EMPTY_SIGNATURE);
+        assert_eq!(empty_sig.capacity(), empty_sig.len());
+        let mk_sig = |name: &str, idx: u32, reg: u32| SigPartElement {
+            stream: 0, name: name.into(), index: idx, system_value: 0, comp_type: 3, register: reg, mask: 0xF, rw_mask: 0x3, min_precision: 0,
+        };
+        let elems = [mk_sig("TEXCOORD", 0, 0), mk_sig("SV_Position", 0, 1), mk_sig("TEXCOORD", 1, 2)];
+        let isg = signature_part(&elems, &["SV_Position", "TEXCOORD"]);
+        assert_eq!(isg.capacity(), isg.len());
+        let off0 = u32::from_le_bytes(isg[12..16].try_into().unwrap()) as usize;
+        let off1 = u32::from_le_bytes(isg[44..48].try_into().unwrap()) as usize;
+        let off2 = u32::from_le_bytes(isg[76..80].try_into().unwrap()) as usize;
+        assert_eq!(off0, off2, "repeated semantic name must share one string offset");
+        assert!(off1 < off0, "name_order must place SV_Position before TEXCOORD");
+
+        // 3. psv_part_full (inputs/outputs/prims, empty & non-empty names, reused index runs, view_id, tables)
+        //    + container_with_signatures with PSG1 = Some and None.
+        let mk_psv_el = |name: &str, indices: &[u32], row: u8| PsvSigElement {
+            name: name.into(), indices: indices.to_vec(), rows: 1, start_row: row, cols: 4, start_col: 0,
+            allocated: true, kind: 0, comp_type: 3, interp: 2, dynamic_mask: 0, stream: 0,
+        };
+        let full = PsvFull {
+            stage: Stage::Mesh, stage_info: [7; 16], min_wave: 32, max_wave: 32, uses_view_id: true,
+            info1: [1, 2], numthreads: [32, 1, 1], resources: vec![res], entry: "mesh_main".into(),
+            inputs: vec![mk_psv_el("", &[0], 0), mk_psv_el("TEXCOORD", &[0, 1], 1)],
+            outputs: vec![mk_psv_el("COLOR", &[1], 0)],
+            prims: vec![mk_psv_el("PRIM", &[0, 1], 0)],
+            input_vectors: 2, output_vectors: [1, 0, 0, 0], tables: vec![vec![0x11, 0x22], vec![0x33]],
+        };
+        let pfull = psv_part_full(&full);
+        // Captured from the pre-refactor serializer. Keep this oracle independent of the
+        // container/reference helpers above so a same-length PSV field reordering is visible.
+        let golden = concat!(
+            "340000000707070707070707070707070707070720000000200000000d010102",
+            "0201010201000000200000000100000001000000150000000100000018000000",
+            "070000000100000002000000040000000b000000030000002000000000544558",
+            "434f4f524400434f4c4f52005052494d006d6573685f6d61696e000003000000",
+            "0000000000000000010000001000000000000000000000000100440003020000",
+            "010000000100000001014400030200000a000000020000000100440003020000",
+            "10000000010000000100440003020000110000002200000033000000",
+        );
+        let golden: Vec<u8> = golden.as_bytes().chunks_exact(2).map(|b| {
+            u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap()
+        }).collect();
+        assert_eq!(pfull, golden, "full PSV bytes changed from the pre-refactor serializer");
+        assert_eq!(pfull.capacity(), pfull.len());
+        let pfull_empty = psv_part_full(&PsvFull {
+            stage: Stage::Vertex, stage_info: [0; 16], min_wave: 0, max_wave: 0, uses_view_id: false,
+            info1: [0; 2], numthreads: [0; 3], resources: vec![], entry: "vs".into(),
+            inputs: vec![], outputs: vec![], prims: vec![], input_vectors: 0, output_vectors: [0; 4], tables: vec![],
+        });
+        assert_eq!(pfull_empty.capacity(), pfull_empty.len());
+
+        let osg = signature_part(&[mk_sig("COLOR", 0, 0)], &[]);
+        let psg = signature_part(&[mk_sig("PRIM", 0, 0)], &[]);
+        let sfi = 0x55u64.to_le_bytes();
+        let dxil = ref_dxil(Stage::Mesh, (6, 6), &bc);
+        let with_psg = container_with_signatures(Stage::Mesh, (6, 6), &bc, 0x55, isg.clone(), osg.clone(), Some(psg.clone()), pfull.clone());
+        assert_eq!(with_psg.capacity(), with_psg.len());
+        assert_eq!(with_psg, ref_dxbc(&[(*b"SFI0", &sfi), (*b"ISG1", &isg), (*b"OSG1", &osg), (*b"PSG1", &psg), (*b"PSV0", &pfull), (*b"DXIL", &dxil)]));
+        let without_psg = container_with_signatures(Stage::Mesh, (6, 6), &bc, 0x55, isg.clone(), osg.clone(), None, pfull.clone());
+        assert_eq!(without_psg.capacity(), without_psg.len());
+        assert_eq!(without_psg, ref_dxbc(&[(*b"SFI0", &sfi), (*b"ISG1", &isg), (*b"OSG1", &osg), (*b"PSV0", &pfull), (*b"DXIL", &dxil)]));
+    }
+
+    #[test]
+    #[should_panic]
+    fn program_header_rejects_unaligned_bitcode() {
+        let _ = program_header(Stage::Compute, (6, 6), (1, 6), 6);
     }
 
     pub(crate) fn part<'a>(c: &'a [u8], cc: &[u8; 4]) -> &'a [u8] {

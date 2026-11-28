@@ -132,6 +132,8 @@ fn micro(e: u32) -> (usize, usize) {
 }
 
 impl Texture {
+    pub(crate) fn dimension(&self) -> u32 { self.dimension }
+
     /// From a D3D12_RESOURCE_DESC (0x38 bytes) as the console's.
     pub fn new(d: &[u8; 0x38]) -> Result<Texture, HRESULT> {
         Self::with_pipes(d, crate::gpu::texture::console_pipes())

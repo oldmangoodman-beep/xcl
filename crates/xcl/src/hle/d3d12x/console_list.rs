@@ -435,7 +435,18 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     }
     with_list(obj, |st| new_chunk(obj, st));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
-    f(pc, allocator, pc_pso(pso))
+    // The adopted physical slot reaches real::cl_reset, which resolves and records the initial
+    // generation. Do not clear that capture again in this outer console wrapper.
+    forward_reset(pc, allocator, pso, |pc, allocator, pso| f(pc, allocator, pso))
+}
+
+unsafe fn forward_reset(
+    pc: usize,
+    allocator: *mut c_void,
+    pso: *mut c_void,
+    call: impl FnOnce(usize, *mut c_void, *mut c_void) -> HRESULT,
+) -> HRESULT {
+    call(pc, allocator, pc_pso(pso))
 }
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -714,8 +725,10 @@ unsafe fn ensure_dispatch_heaps_with(list: &ID3D12GraphicsCommandList, bound: &m
     true
 }
 
-unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool) {
-    if bound.len() >= 2 { return; }
+unsafe fn ensure_dispatch_heaps(
+    list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool, shared_view_bound: bool,
+) -> bool {
+    if bound.len() >= 2 { return shared_view_bound; }
     let mut dev: Option<ID3D12Device> = None;
     let _ = list.GetDevice(&mut dev);
     let sampler = super::console_heap::global_sampler_heap().or_else(|| {
@@ -727,7 +740,9 @@ unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Ve
         Some(dev_raw) => (heap_on_device(view, dev_raw), heap_on_device(sampler, dev_raw)),
         None => (view, sampler),
     };
+    let view_raw = view.as_ref().map(|h| h.as_raw() as usize);
     ensure_dispatch_heaps_with(list, bound, has_sampler, view, sampler);
+    shared_view_bound || view_raw.is_some_and(|view| bound.iter().any(|heap| heap.as_raw() as usize == view))
 }
 
 /// Turn the recorded console commands into commands on the PC list and close it.
@@ -748,7 +763,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     }
     // the whole recording is replayed into the PC list here: its transitions of textures kept
     // in step are these
-    super::title_textures::list_reset(st.pc);
+    super::list_x::clear_texture_transitions(st.pc);
     super::dred::reset(st.pc as *mut c_void);
     let windows = super::real::uma_window_vas();
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
@@ -759,6 +774,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     // tracked PC descriptor heaps bound on `list` (for `heap_windows` + `SAMPLER_HEAP_DIRECTLY_INDEXED`)
     let mut bound_heaps: Vec<ID3D12DescriptorHeap> = Vec::new();
     let mut has_sampler_heap = false;
+    let track_shared_view = super::vram::srv_tracking_enabled();
+    let mut shared_view_bound = false;
+    let mut recording_uses_shared_view = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -786,11 +804,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     list.SetDescriptorHeaps(&[]);
                     bound_heaps.clear();
                     has_sampler_heap = false;
+                    shared_view_bound = false;
                 } else {
-                    let heaps = super::list_x::pc_heaps(n as u32, named.as_ptr());
+                    let (heaps, uses_shared_view) = super::list_x::pc_heaps_with_shared(n as u32, named.as_ptr());
                     list.SetDescriptorHeaps(&heaps);
                     bound_heaps = heaps.into_iter().flatten().collect();
                     has_sampler_heap = bound_heaps.iter().any(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                    shared_view_bound = uses_shared_view;
                 }
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
@@ -805,7 +825,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // each barrier: type | flags, resource, subresource | before, after
                         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
-                        super::title_textures::note_transitions(st.pc, &t);
+                        super::list_x::note_texture_transitions(st.pc, &t);
                     }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
@@ -881,12 +901,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // a pipeline still being built in the background is waited for; if
                         // the background translation failed, skip instead of binding XCL's
                         // ABI root signature onto the stand-in
-                        let real = super::pso_async::resolve_wait((*p).pc);
+                        let real = super::list_x::resolve_and_record_pipeline_wait(st.pc, (*p).pc);
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;
                             continue;
                         }
-                        let user_sgprs = super::real::pso_user_sgprs(real);
+                        let user_sgprs = super::real::pso_user_sgprs_exact(real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
@@ -898,21 +918,20 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
-                        let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
+                        let own = super::real::pso_root_signature_exact(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
-                        ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
+                        shared_view_bound = ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap, shared_view_bound);
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         for k in 0..4 {
                             list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
                         }
-                        let raw = real as *mut c_void;
-                        let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
-                        list.SetPipelineState(pc);
-                        super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z])?;
+                        super::real::bind_pipeline_exact(list.as_raw(), (*p).pc, real);
+                        super::real::dispatch_chain::dispatch(&list, (*p).pc, real, st.allocator, [x, y, z])?;
+                        recording_uses_shared_view |= track_shared_view && shared_view_bound;
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,
@@ -958,6 +977,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         }
     }
     drop(guard);
+    if recording_uses_shared_view {
+        super::list_x::note_shared_view_heap_use(list.as_raw());
+    }
     if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
         crate::xlog_info!(
             "console list: {} dispatches, {} skipped (PSO without a translation), {} barriers, {} clears, {} copies, {} skipped records",
@@ -983,6 +1005,18 @@ fn bytemuck_u32(v: &[u32]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_reset_preserves_the_physical_initial_generation_capture() {
+        let mut pins = vec![1u64];
+        let hr = unsafe { forward_reset(0xC1, std::ptr::null_mut(), std::ptr::null_mut(), |_, _, _| {
+            pins.clear();
+            pins.push(2);
+            S_OK
+        }) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(pins, [2], "the outer wrapper must not clear the physical Reset hook's new pin");
+    }
 
     #[test]
     fn layout_packs_parameters_in_order() {

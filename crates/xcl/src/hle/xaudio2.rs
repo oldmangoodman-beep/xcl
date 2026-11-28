@@ -505,11 +505,56 @@ pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_byt
 // Decoded voice state (Opus & XMA1/XMA2) & IXAudio2VoiceCallback wrapper
 // ---------------------------------------------------------------------------------------
 
+const _: () = assert!(cfg!(target_endian = "little"));
+
 /// Owned decoded PCM16 buffer kept alive at a stable heap address until `OnBufferEnd`
-/// or `DestroyVoice`.
+/// or `DestroyVoice`. Empty when backed by the shared read-only `silence()` mapping.
 struct DecodedBuffer {
     orig_context: usize,
-    _pcm: Box<[u8]>,
+    _pcm: Vec<i16>,
+}
+
+/// Prepare decoded little-endian PCM16 samples for zero-copy XAudio2 submission.
+/// Returns `None` when fewer than one complete frame was decoded so the caller falls back
+/// to shared silence.
+fn prepare_decoded_pcm(mut samples: Vec<i16>, channels: u16, orig_buf: &XAudio2Buffer) -> Option<(XAudio2Buffer, Vec<i16>)> {
+    let ch = channels.max(1) as usize;
+    let max_frames = (XAUDIO2_MAX_BUFFER_BYTES as usize) / (ch * 2);
+    let total_frames = (samples.len() / ch).min(max_frames);
+    if total_frames == 0 {
+        return None;
+    }
+    samples.truncate(total_frames * ch);
+    let mut nb = *orig_buf;
+    clamp_regions(&mut nb, total_frames as u32);
+    nb.audio_bytes = (samples.len() * 2) as u32;
+    Some((nb, samples))
+}
+
+const OWNED_SILENCE_BYTES: usize = 64 * 1024;
+
+fn prepare_fallback_silence(
+    info: &XmaInfo,
+    orig_buf: &XAudio2Buffer,
+    shared: *const u8,
+) -> Option<(XAudio2Buffer, Vec<i16>)> {
+    if !shared.is_null() {
+        return Some((silent_buffer(info, orig_buf, shared, SILENCE_BYTES), Vec::new()));
+    }
+
+    // Keep decoding failures recoverable when the large shared mapping cannot be allocated.
+    // This is deliberately bounded: a missing 32 MiB mapping must not turn one submission into
+    // a comparably large per-buffer allocation.
+    let mut nb = silent_buffer(info, orig_buf, std::ptr::null(), OWNED_SILENCE_BYTES);
+    let samples = nb.audio_bytes as usize / std::mem::size_of::<i16>();
+    if samples == 0 {
+        return None;
+    }
+    let mut pcm = Vec::new();
+    pcm.try_reserve_exact(samples).ok()?;
+    pcm.resize(samples, 0);
+    nb.audio_data = pcm.as_ptr() as *const u8;
+    Some((nb, pcm))
 }
 
 enum VoiceDecoder {
@@ -664,10 +709,50 @@ static DECODED_CALLBACK_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
 // the system engine and in-place vtable patches
 // ---------------------------------------------------------------------------------------
 
+const FAST_ORIG_CAP: usize = 32;
+
+struct FastOriginals {
+    len: AtomicUsize,
+    entries: [(AtomicUsize, AtomicUsize, AtomicUsize); FAST_ORIG_CAP],
+}
+
+impl FastOriginals {
+    const fn new() -> Self {
+        Self {
+            len: AtomicUsize::new(0),
+            entries: [const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)) }; FAST_ORIG_CAP],
+        }
+    }
+
+    fn push(&self, idx: usize, vt: usize, slot: usize, orig: usize) {
+        if idx < FAST_ORIG_CAP {
+            let (ev, es, ef) = &self.entries[idx];
+            ev.store(vt, Ordering::Relaxed);
+            es.store(slot, Ordering::Relaxed);
+            ef.store(orig, Ordering::Relaxed);
+            self.len.store(idx + 1, Ordering::Release);
+        }
+    }
+
+    fn lookup(&self, vt: usize, slot: usize) -> Result<Option<usize>, ()> {
+        let n = self.len.load(Ordering::Acquire);
+        for (ev, es, ef) in &self.entries[..n] {
+            if ev.load(Ordering::Relaxed) == vt && es.load(Ordering::Relaxed) == slot {
+                return Ok(Some(ef.load(Ordering::Relaxed)));
+            }
+        }
+        if n < FAST_ORIG_CAP { Ok(None) } else { Err(()) }
+    }
+}
+
 /// Originals of patched slots: (vtable address, slot) → function.
 static ORIGINALS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// Lock-free mirror of the first `FAST_ORIG_CAP` entries of `ORIGINALS`.
+static FAST_ORIGINALS: FastOriginals = FastOriginals::new();
 /// Live silent voices (voice pointer → info).
 static XMA: Mutex<Option<HashMap<usize, XmaInfo>>> = Mutex::new(None);
+/// Count of live silent voices (fast path for plain PCM and decoded voices).
+static SILENT_LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Live decoded voices (Opus & XMA1/XMA2: voice pointer → handle).
 static DECODED_VOICES: Mutex<Option<HashMap<usize, DecodedVoiceHandle>>> = Mutex::new(None);
 /// Count of live decoded voices (fast path for plain PCM voices).
@@ -695,7 +780,9 @@ unsafe fn patch(obj: *mut c_void, slot: usize, hook: usize) {
         crate::xlog_error!("XAudio2: cannot make vtable {vt:p} writable (slot {slot})");
         return;
     }
+    let idx = g.len();
     g.push((vt as usize, slot, cur));
+    FAST_ORIGINALS.push(idx, vt as usize, slot, cur);
     p.write(hook);
     VirtualProtect(p as *const c_void, 8, old, &mut old);
 }
@@ -703,7 +790,19 @@ unsafe fn patch(obj: *mut c_void, slot: usize, hook: usize) {
 /// The original implementation of `slot` for `obj`'s class.
 unsafe fn original(obj: *mut c_void, slot: usize) -> Option<usize> {
     let vt = vtable(obj) as usize;
-    ORIGINALS.lock().unwrap().iter().find(|&&(v, s, _)| v == vt && s == slot).map(|&(_, _, f)| f)
+    lookup_original(&FAST_ORIGINALS, &ORIGINALS, vt, slot)
+}
+
+fn lookup_original(
+    fast: &FastOriginals,
+    slow: &Mutex<Vec<(usize, usize, usize)>>,
+    vt: usize,
+    slot: usize,
+) -> Option<usize> {
+    match fast.lookup(vt, slot) {
+        Ok(hit) => hit,
+        Err(()) => slow.lock().unwrap().iter().find(|&&(v, s, _)| v == vt && s == slot).map(|&(_, _, f)| f),
+    }
 }
 
 fn system_create() -> Option<(Option<CreateWithVersionFn>, Option<CreateFn>)> {
@@ -931,7 +1030,12 @@ unsafe extern "system" fn create_source_voice(
     patch_source_voice(voice);
     SOURCE_VOICES.fetch_add(1, Ordering::Relaxed);
     if let Some(i) = silent {
-        XMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(voice as usize, i);
+        {
+            let mut g = XMA.lock().unwrap();
+            if g.get_or_insert_with(HashMap::new).insert(voice as usize, i).is_none() {
+                SILENT_LIVE_COUNT.fetch_add(1, Ordering::Release);
+            }
+        }
         SILENT_VOICES.fetch_add(1, Ordering::Relaxed);
         if is_xma(tag) && XMA_VOICES.fetch_add(1, Ordering::Relaxed) == 0 {
             crate::xlog_warn!(
@@ -997,9 +1101,23 @@ unsafe extern "system" fn create_mastering_voice(
 }
 
 fn silence() -> *const u8 {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READONLY};
-    static P: OnceLock<usize> = OnceLock::new();
-    *P.get_or_init(|| unsafe { VirtualAlloc(std::ptr::null(), SILENCE_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) as usize }) as *const u8
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY};
+    static P: AtomicUsize = AtomicUsize::new(0);
+    let cached = P.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached as *const u8;
+    }
+    let allocated = unsafe { VirtualAlloc(std::ptr::null(), SILENCE_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) as usize };
+    if allocated == 0 {
+        return std::ptr::null();
+    }
+    match P.compare_exchange(0, allocated, Ordering::Release, Ordering::Acquire) {
+        Ok(_) => allocated as *const u8,
+        Err(winner) => {
+            unsafe { VirtualFree(allocated as *mut c_void, 0, MEM_RELEASE) };
+            winner as *const u8
+        }
+    }
 }
 
 unsafe fn submit_decoded_buffer(
@@ -1040,47 +1158,48 @@ unsafe fn submit_decoded_buffer(
         }
     };
 
-    let mut nb = orig_buf;
-    let pcm_bytes: Box<[u8]> = match decoded_pcm {
-        Ok(samples) if !samples.is_empty() => {
-            let total_frames = (samples.len() / state.channels.max(1) as usize) as u32;
-            clamp_regions(&mut nb, total_frames);
-            let mut bytes = Vec::with_capacity(samples.len() * 2);
-            for s in samples {
-                bytes.extend_from_slice(&s.to_le_bytes());
-            }
+    let prepared = match decoded_pcm {
+        Ok(samples) => match prepare_decoded_pcm(samples, state.channels, &orig_buf) {
+            Some(p) => Ok(p),
+            None => Err(None),
+        },
+        Err(e) => Err(Some(e)),
+    };
+    let (mut nb, pcm) = match prepared {
+        Ok(p) => {
             if is_xma_voice {
                 XMA_BUFFERS_DECODED.fetch_add(1, Ordering::Relaxed);
             } else {
                 OPUS_BUFFERS_DECODED.fetch_add(1, Ordering::Relaxed);
             }
-            bytes.into_boxed_slice()
+            p
         }
-        res => {
+        Err(err) => {
             let err_counter = if is_xma_voice { &XMA_DECODE_ERRORS } else { &OPUS_DECODE_ERRORS };
             let codec_name = if is_xma_voice { "XMA" } else { "Opus" };
             let prev = err_counter.fetch_add(1, Ordering::Relaxed);
             if prev == 0 {
-                match res {
-                    Err(e) => crate::xlog_warn!("XAudio2: {codec_name} decode error ({e}) – substituting silence"),
-                    Ok(_) => crate::xlog_warn!("XAudio2: {codec_name} buffer decoded 0 samples – substituting silence"),
+                match err {
+                    Some(e) => crate::xlog_warn!("XAudio2: {codec_name} decode error ({e}) – substituting silence"),
+                    None => crate::xlog_warn!("XAudio2: {codec_name} buffer decoded 0 complete frames – substituting silence"),
                 }
             }
-            let sb = silent_buffer(&fallback_info, &orig_buf, std::ptr::null(), SILENCE_BYTES);
-            nb = sb;
+            let Some(fallback) = prepare_fallback_silence(&fallback_info, &orig_buf, silence()) else {
+                return E_FAIL;
+            };
             SILENCED.fetch_add(1, Ordering::Relaxed);
-            vec![0u8; sb.audio_bytes as usize].into_boxed_slice()
+            fallback
         }
     };
 
-    let pcm_ptr = pcm_bytes.as_ptr();
-    let pcm_len = pcm_bytes.len() as u32;
-    let boxed = Box::new(DecodedBuffer { orig_context: orig_buf.context as usize, _pcm: pcm_bytes });
+    let boxed = Box::new(DecodedBuffer { orig_context: orig_buf.context as usize, _pcm: pcm });
+    if !boxed._pcm.is_empty() {
+        nb.audio_data = boxed._pcm.as_ptr() as *const u8;
+        nb.audio_bytes = (boxed._pcm.len() * 2) as u32;
+    }
     let token = &*boxed as *const DecodedBuffer as usize;
     state.live_buffers.lock().unwrap().insert(token, boxed);
 
-    nb.audio_data = pcm_ptr;
-    nb.audio_bytes = pcm_len;
     nb.context = token as *mut c_void;
 
     let hr = orig(this, &nb, std::ptr::null());
@@ -1103,7 +1222,11 @@ unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XA
             return submit_decoded_buffer(this, orig, &state, buf.read_unaligned());
         }
     }
-    let info = XMA.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
+    let info = if SILENT_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+        XMA.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())
+    } else {
+        None
+    };
     match info {
         Some(i) if !buf.is_null() => {
             let s = silence();
@@ -1159,8 +1282,11 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
 unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     let Some(orig) = original(this, VOICE_DESTROY) else { return };
     let orig: DestroyVoiceFn = std::mem::transmute(orig);
-    if let Some(m) = XMA.lock().unwrap().as_mut() {
-        m.remove(&(this as usize));
+    if SILENT_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+        let mut g = XMA.lock().unwrap();
+        if g.as_mut().and_then(|m| m.remove(&(this as usize))).is_some() {
+            SILENT_LIVE_COUNT.fetch_sub(1, Ordering::Release);
+        }
     }
     let decoded_handle = if DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
         DECODED_VOICES.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)))
@@ -1785,5 +1911,61 @@ mod tests {
             assert_eq!(submit(guard.voice, &sb2, std::ptr::null()), S_OK);
             assert_eq!(flush(guard.voice), S_OK);
         }
+    }
+
+    #[test]
+    fn prepare_decoded_pcm_is_zero_copy_and_whole_frame_clamped() {
+        let orig = buffer(16, 0, 10, 0, 0, 0);
+        // Empty and < 1 full frame return None so caller falls back to shared silence.
+        assert!(prepare_decoded_pcm(Vec::new(), 2, &orig).is_none());
+        assert!(prepare_decoded_pcm(vec![0x1234i16], 2, &orig).is_none());
+
+        // 5 samples for 2 channels -> 2 complete frames (4 samples, 8 bytes), zero copy.
+        let samples = vec![0x1234i16, -1i16, 0x0055i16, 0x7FFFi16, 0x1111i16];
+        let orig_ptr = samples.as_ptr();
+        let (nb, out) = prepare_decoded_pcm(samples, 2, &orig).expect("2 whole frames");
+        assert_eq!(out.as_ptr(), orig_ptr, "PCM Vec<i16> must not reallocate or copy");
+        assert_eq!((out.len(), { nb.audio_bytes }, { nb.play_length }), (4, 8, 2));
+        let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 2) };
+        assert_eq!(&bytes[..4], &[0x34, 0x12, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn fast_originals_serves_entries_lock_free_and_respects_overflow() {
+        let fast = FastOriginals::new();
+        let slow = Mutex::new(Vec::new());
+        assert_eq!(fast.lookup(0x1000, 1), Ok(None));
+        for i in 0..FAST_ORIG_CAP {
+            let entry = (0x1000 + i * 8, i % 4, 0x9000 + i);
+            slow.lock().unwrap().push(entry);
+            fast.push(i, entry.0, entry.1, entry.2);
+        }
+        assert_eq!(fast.lookup(0x1000, 0), Ok(Some(0x9000)));
+        assert_eq!(fast.lookup(0x1000 + (FAST_ORIG_CAP - 1) * 8, (FAST_ORIG_CAP - 1) % 4), Ok(Some(0x9000 + FAST_ORIG_CAP - 1)));
+        assert_eq!(fast.lookup(0xDEAD, 0), Err(()));
+
+        // The 33rd entry cannot be mirrored. Exercise the exact production helper and
+        // verify it consults the isolated slow registry only after fast-table saturation.
+        let overflow = (0xDEAD, 7, 0xBEEF);
+        slow.lock().unwrap().push(overflow);
+        assert_eq!(lookup_original(&fast, &slow, overflow.0, overflow.1), Some(overflow.2));
+        assert_eq!(lookup_original(&fast, &slow, 0xBAD, 7), None);
+    }
+
+    #[test]
+    fn decode_fallback_uses_shared_or_bounded_owned_silence() {
+        let info = XmaInfo { channels: 2, rate: 48_000, samples_encoded: 48_000, bytes_per_block: 0x1000, block_count: 1, ..Default::default() };
+        let orig = buffer(0x1000, 0, 480, 0, 0, 0);
+        let shared = 0x4000 as *const u8;
+        let (nb, pcm) = prepare_fallback_silence(&info, &orig, shared).expect("shared silence");
+        assert!(pcm.is_empty() && pcm.capacity() == 0);
+        assert_eq!(({ nb.audio_data }, { nb.audio_bytes }), (shared, 480 * 4));
+
+        let huge = buffer(0x1000, 0, u32::MAX, 0, 0, 0);
+        let (nb, pcm) = prepare_fallback_silence(&info, &huge, std::ptr::null()).expect("owned silence");
+        assert_eq!(nb.audio_bytes as usize, OWNED_SILENCE_BYTES);
+        assert_eq!(pcm.len() * std::mem::size_of::<i16>(), OWNED_SILENCE_BYTES);
+        assert_eq!({ nb.audio_data }, pcm.as_ptr() as *const u8);
+        assert!(pcm.iter().all(|&sample| sample == 0));
     }
 }

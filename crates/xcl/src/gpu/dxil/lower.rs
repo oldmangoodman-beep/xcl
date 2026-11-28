@@ -100,7 +100,7 @@ impl Init {
         }
         let v = self.first(s, var);
         let cur = s.m.current_block();
-        let before = s.m.set_insert_before_term(false);
+        let before = s.m.set_insert_before_term(true);
         s.m.set_block(self.entry);
         let i32 = s.m.i32();
         let p = s.m.alloca(i32, 4);
@@ -133,6 +133,7 @@ impl Init {
             }
         }
         let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(true);
         s.m.set_block(self.entry);
         self.touched.insert(var);
         let io = self.io.expect("io");
@@ -146,7 +147,50 @@ impl Init {
             s.raw_load(io, off, 1)[0]
         };
         s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
         v
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::{Init, VAR_BUDGET};
+    use crate::gpu::dxil::{container::Stage, shader::Shader};
+    use std::collections::{BTreeSet, HashMap};
+
+    fn after_terminated_entry() -> (Shader, Init) {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let io = s.raw_uav(0, 0);
+        let entry = s.m.current_block();
+        let body = s.m.new_block();
+        s.m.br(body);
+        s.m.set_block(body);
+        let init = Init {
+            io: Some(io),
+            compute: None,
+            vgpr_base: None,
+            entry,
+            touched: BTreeSet::new(),
+            slots: HashMap::new(),
+            mem: None,
+        };
+        (s, init)
+    }
+
+    #[test]
+    fn lazy_register_load_precedes_an_entry_terminator() {
+        let (mut s, mut init) = after_terminated_entry();
+        let _ = init.first(&mut s, 4);
+        s.m.ret();
+        s.try_finish([1, 1, 1], None).expect("lazy register load after an entry branch");
+    }
+
+    #[test]
+    fn compact_register_slot_precedes_an_entry_terminator() {
+        let (mut s, mut init) = after_terminated_entry();
+        let _ = init.slot(&mut s, VAR_BUDGET);
+        s.m.ret();
+        s.try_finish([1, 1, 1], None).expect("compact register slot after an entry branch");
     }
 }
 
@@ -156,7 +200,6 @@ pub enum Partner {
     /// several console waves per group: the halves pair up through arrival counters
     Spin,
     Missing,
-    Unsupported(&'static str),
 }
 
 #[derive(Default, Clone, Copy)]
@@ -187,6 +230,8 @@ pub struct Lw {
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
     /// Some(globallycoherent)
     pub heap_mem: Option<bool>,
+    /// Heap windows read without a branch (`recomp::HEAP_FLAT`; compute programs only).
+    pub heap_flat: bool,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
@@ -226,6 +271,9 @@ pub struct Lw {
     pub xw: Option<(super::ops::GroupShared, u32)>,
     /// arrival counters of the spin exchange (two per console wave)
     pub xc: Option<(super::ops::GroupShared, u32)>,
+    /// hardware waves of a compute or mesh thread group (None: another kind of entry), as the
+    /// HLSL emitter's `compute_or_mesh_hw_waves`
+    pub barrier_waves: Option<u32>,
     /// console waves per group, this thread's console wave and its partner half's lanes
     pub waves: u32,
     pub cw: Value,
@@ -1016,6 +1064,18 @@ impl Lw {
     fn sopp(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         match name {
             "s_barrier" => {
+                // A compute or mesh group of several hardware waves: this barrier waits for
+                // every one of them at a barrier, and a console wave that has left – s_endpgm
+                // behind a branch around the barrier, the loop budget – or that ran one barrier
+                // fewer never arrives. On the console the waves left go on; on NVIDIA they wait
+                // for ever and the GPU hangs (`recomp::emit::PRELUDE_SAFE_BARRIER`). A retail
+                // title's mesh programs all have it: the first wave of a group whose vertex or
+                // primitive count is 0 runs a barrier the other waves branch around, then the
+                // one they all run. The HLSL path counts the waves still there
+                // (`xcl_s_barrier`): such a program is left to it.
+                if self.barrier_waves.is_some_and(|w| w > 1) && crate::gpu::recomp::emit::safe_barrier_wanted() {
+                    return err(d, "s_barrier in a group of several hardware waves");
+                }
                 self.s.barrier(super::ops::barrier::GROUP_SYNC);
                 Ok(())
             }
@@ -1703,20 +1763,20 @@ impl Lw {
             }
             "s_bfm_b64" => {
                 nz = false;
-                let wdt = self.andc(al, 63);
-                let off = self.andc(bl, 63);
-                let all = self.c64(u64::MAX);
-                let k64 = self.c(64);
-                let sh = self.sub(k64, wdt);
-                let sh = self.andc(sh, 63);
-                let sh = self.zext64(sh);
-                let m = self.bin(BinOp::LShr, all, sh);
-                let wz = self.cmpc(Pred::Eq, wdt, 0);
-                let z64 = self.c64(0);
-                let m = self.sel(wz, z64, m);
-                let off = self.zext64(off);
-                let r = self.bin(BinOp::Shl, m, off);
-                self.unpack64(r)
+                if let (Some(av), Some(bv)) = (self.s.m.const_u64(al), self.s.m.const_u64(bl)) {
+                    let r = ((1u64 << (av & 63)).wrapping_sub(1)) << (bv & 63);
+                    (self.c(r as u32), self.c((r >> 32) as u32))
+                } else {
+                    let wdt = self.andc(al, 63);
+                    let off = self.andc(bl, 63);
+                    let one = self.c64(1);
+                    let w64 = self.zext64(wdt);
+                    let bit = self.bin(BinOp::Shl, one, w64);
+                    let m = self.sub(bit, one);
+                    let o64 = self.zext64(off);
+                    let r = self.bin(BinOp::Shl, m, o64);
+                    self.unpack64(r)
+                }
             }
             "s_bfe_u64" | "s_bfe_i64" => {
                 let v = self.pack64(al, ah);
@@ -1804,22 +1864,22 @@ impl Lw {
         self.trunc32(h)
     }
     pub fn bfm(&mut self, a: Value, b: Value) -> Value {
-        let w = self.andc(a, 31);
-        let wz = self.cmpc(Pred::Eq, w, 0);
-        let k = self.c(32);
-        let s = self.sub(k, w);
-        let s = self.andc(s, 31);
-        let all = self.c(u32::MAX);
-        let m = self.bin(BinOp::LShr, all, s);
-        let m = self.selc(wz, 0, m);
-        self.shl(m, b)
+        let m = if let Some(av) = self.s.m.const_u64(a) {
+            self.c((1u32 << (av & 31)).wrapping_sub(1))
+        } else {
+            let w = self.andc(a, 31);
+            let one = self.c(1);
+            let bit = self.bin(BinOp::Shl, one, w);
+            self.sub(bit, one)
+        };
+        if let (Some(mv), Some(bv)) = (self.s.m.const_u64(m), self.s.m.const_u64(b)) {
+            self.c((mv as u32) << (bv & 31))
+        } else {
+            self.shl(m, b)
+        }
     }
     pub fn ffbh_i(&mut self, v: Value) -> Value {
-        let z = self.c(0);
-        let neg = self.cmp(Pred::SLt, v, z);
-        let n = self.not(v);
-        let x = self.sel(neg, n, v);
-        self.lzcnt(x)
+        self.s.bit_count(BitCount::FirstbitSHi, v)
     }
     pub fn sbfe_u(&mut self, v: Value, c: Value) -> Value {
         let o = self.andc(c, 31);
@@ -2192,5 +2252,138 @@ mod saveexec_tests {
         assert_eq!(r.sgpr[126], 0xF000_FF00, "final EXEC_LO");
         assert_eq!(r.sgpr[127], 0xCAFE_BABE, "EXEC_HI must remain untouched in wave32");
         assert_eq!(r.scc, 1, "SCC = (final EXEC_LO != 0)");
+    }
+}
+
+#[cfg(test)]
+mod bfm_ffbh_tests {
+    use super::super::kernel::{self, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner;
+
+    fn prog(insns: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in insns {
+            code.extend(encode(name, enc, fields, None).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn bfm_and_ffbh_i_ir_and_gpu_parity() {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+
+        // 1. Constant S_BFM_B64 folds with zero i64 ops and zero Int64Ops flag.
+        // Inline integers: 128 + k (k in 0..=64) => 160 = 32, 144 = 16, 128 = 0.
+        let const_bfm64 = prog(&[
+            ("S_BFM_B64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 160), ("SSRC1", 144)]),
+            ("S_BFM_B64", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 128), ("SSRC1", 144)]),
+        ]);
+        let dxil_const64 = kernel::translate(&const_bfm64, ko).expect("translate const s_bfm_b64");
+        validate::validate(&dxil_const64).expect("validate const s_bfm_b64");
+        let dis_const64 = validate::disassemble(&dxil_const64).expect("disasm const s_bfm_b64");
+        assert!(!dis_const64.contains("64-Bit integer"), "const s_bfm_b64 must not require Int64Ops:\n{dis_const64}");
+
+        // 2. V_FFBH_I32 / S_FLBIT_I32 lower directly to dx.op.unaryBits.i32(34, ...) (FirstbitSHi).
+        let ffbh_code = prog(&[
+            ("V_FFBH_I32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 256)]),
+            ("S_FLBIT_I32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 0)]),
+        ]);
+        let dxil_ffbh = kernel::translate(&ffbh_code, ko).expect("translate ffbh_i");
+        validate::validate(&dxil_ffbh).expect("validate ffbh_i");
+        let dis_ffbh = validate::disassemble(&dxil_ffbh).expect("disasm ffbh_i");
+        assert!(dis_ffbh.contains("call i32 @dx.op.unaryBits.i32(i32 34,"), "ffbh_i must emit FirstbitSHi:\n{dis_ffbh}");
+        assert!(!dis_ffbh.contains("icmp slt"), "ffbh_i must not emit manual sign-bit branch/select:\n{dis_ffbh}");
+
+        // 3. Dynamic V_BFM_B32 / S_BFM_B32 / S_BFM_B64 lower without icmp/select.
+        let bfm_code = prog(&[
+            ("V_BFM_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257)]),
+            ("S_BFM_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 2), ("SSRC1", 3)]),
+            ("S_BFM_B64", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 2), ("SSRC1", 3)]),
+        ]);
+        let dxil_bfm = kernel::translate(&bfm_code, ko).expect("translate dynamic bfm");
+        validate::validate(&dxil_bfm).expect("validate dynamic bfm");
+        let dis_bfm = validate::disassemble(&dxil_bfm).expect("disasm dynamic bfm");
+        assert!(!dis_bfm.contains("select i32"), "bfm must not emit select:\n{dis_bfm}");
+        assert!(!dis_bfm.contains("select i64"), "s_bfm_b64 must not emit select:\n{dis_bfm}");
+
+        // 4. GPU parity across edge cases.
+        if !matches!(runner::wave32_supported(), Ok(true)) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        // Constant s_bfm_b64 GPU check.
+        let r0 = runner::run(&dxil_const64, &runner::KernelState::default(), &[]).expect("run const s_bfm_b64");
+        let want_const64 = ((1u64 << 32) - 1) << 16;
+        assert_eq!(r0.sgpr[0], want_const64 as u32);
+        assert_eq!(r0.sgpr[1], (want_const64 >> 32) as u32);
+        assert_eq!((r0.sgpr[2], r0.sgpr[3]), (0, 0));
+
+        // V_FFBH_I32 / S_FLBIT_I32 GPU check.
+        let ffbh_vals: [u32; 12] = [
+            0,
+            u32::MAX,
+            1,
+            (-2i32) as u32,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0x0000_0080,
+            0xFFFF_FF7F,
+            0x0001_0000,
+            0xFFFE_FFFF,
+            0x4000_0000,
+            0xBFFF_FFFF,
+        ];
+        let mut st_f = runner::KernelState::default();
+        st_f.sgpr[0] = 0xFFFF_FF7F;
+        for (l, &v) in ffbh_vals.iter().enumerate() {
+            st_f.vgpr[l][0] = v;
+        }
+        let rf = runner::run(&dxil_ffbh, &st_f, &[]).expect("run ffbh_i");
+        let ref_ffbh_i = |v: u32| -> u32 {
+            let x = if (v as i32) < 0 { !v } else { v };
+            if x == 0 { u32::MAX } else { x.leading_zeros() }
+        };
+        for (l, &v) in ffbh_vals.iter().enumerate() {
+            assert_eq!(rf.vgpr[l][1], ref_ffbh_i(v), "v_ffbh_i32({v:#010x})");
+        }
+        assert_eq!(rf.sgpr[1], ref_ffbh_i(st_f.sgpr[0]), "s_flbit_i32");
+
+        // Dynamic V_BFM_B32 / S_BFM_B32 / S_BFM_B64 GPU check.
+        let pairs: [(u32, u32); 12] = [
+            (0, 0),
+            (0, 17),
+            (1, 0),
+            (1, 31),
+            (16, 8),
+            (31, 0),
+            (31, 1),
+            (32, 0),
+            (35, 33),
+            (63, 0),
+            (63, 1),
+            (64, 15),
+        ];
+        let mut st_b = runner::KernelState::default();
+        for (l, &(w, o)) in pairs.iter().enumerate() {
+            st_b.vgpr[l][0] = w;
+            st_b.vgpr[l][1] = o;
+        }
+        for &(sw, so) in &[(0u32, 16u32), (31, 1), (32, 32), (63, 1), (64, 5)] {
+            st_b.sgpr[2] = sw;
+            st_b.sgpr[3] = so;
+            let rb = runner::run(&dxil_bfm, &st_b, &[]).expect("run bfm");
+            for (l, &(w, o)) in pairs.iter().enumerate() {
+                let want32 = ((1u32 << (w & 31)).wrapping_sub(1)) << (o & 31);
+                assert_eq!(rb.vgpr[l][2], want32, "v_bfm_b32({w}, {o})");
+            }
+            let want_s32 = ((1u32 << (sw & 31)).wrapping_sub(1)) << (so & 31);
+            assert_eq!(rb.sgpr[4], want_s32, "s_bfm_b32({sw}, {so})");
+            let want_s64 = ((1u64 << (sw & 63)).wrapping_sub(1)) << (so & 63);
+            assert_eq!(rb.sgpr[6], want_s64 as u32, "s_bfm_b64 lo({sw}, {so})");
+            assert_eq!(rb.sgpr[7], (want_s64 >> 32) as u32, "s_bfm_b64 hi({sw}, {so})");
+        }
     }
 }

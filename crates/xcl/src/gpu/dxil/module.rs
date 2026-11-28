@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use super::bitstream::{signed, BitWriter};
 
 mod opt;
+#[cfg(test)]
+pub(crate) use opt::NO_SELECT_FOLD;
 pub(super) mod split;
 
 // ---------------------------------------------------------------- types
@@ -254,6 +256,7 @@ pub struct Module {
     insts: Vec<InstDef>,
     def_block: Vec<Block>,
     blocks: Vec<Vec<u32>>,
+    preserve_block_boundary: Vec<bool>,
     cur: Block,
     insert_before_term: bool,
     md: Vec<MdDef>,
@@ -282,6 +285,7 @@ impl Module {
             insts: Vec::new(),
             def_block: Vec::new(),
             blocks: vec![Vec::new()],
+            preserve_block_boundary: vec![false],
             cur: Block(0),
             insert_before_term: false,
             md: Vec::new(),
@@ -517,7 +521,12 @@ impl Module {
 
     pub fn new_block(&mut self) -> Block {
         self.blocks.push(Vec::new());
+        self.preserve_block_boundary.push(false);
         Block(self.blocks.len() as u32 - 1)
+    }
+    /// Prevents CFG simplification from merging this block into its predecessor.
+    pub fn preserve_block_boundary(&mut self, b: Block) {
+        self.preserve_block_boundary[b.0 as usize] = true;
     }
     pub fn entry_block(&self) -> Block {
         Block(0)
@@ -815,6 +824,31 @@ impl Module {
         self.try_to_bitcode(triple, datalayout).unwrap_or_else(|e| panic!("DXIL builder: {e}"))
     }
 
+    /// Static resource ranges referenced by reachable `createHandleFromBinding`
+    /// calls. A dynamic binding descriptor makes the result unknowable.
+    pub(super) fn referenced_bindings(&self) -> Option<Vec<(u8, u32, u32, u32)>> {
+        let (order, _) = self.block_layout();
+        let mut refs = Vec::new();
+        for &block in &order {
+            for &inst in &self.blocks[block] {
+                let Op::Call(func, args) = &self.insts[inst as usize].op else { continue };
+                if self.funcs[*func as usize].name != "dx.op.createHandleFromBinding" {
+                    continue;
+                }
+                let Some(&Value::Const(bind)) = args.get(1) else { return None };
+                let ConstDef::Aggregate(_, fields) = &self.consts[bind as usize] else { return None };
+                let [lower, upper, space, class] = fields.as_slice() else { return None };
+                refs.push((
+                    self.const_u64(*class)? as u8,
+                    self.const_u64(*space)? as u32,
+                    self.const_u64(*lower)? as u32,
+                    self.const_u64(*upper)? as u32,
+                ));
+            }
+        }
+        Some(refs)
+    }
+
     fn write_bitcode(&mut self, triple: &str, datalayout: &str) -> Vec<u8> {
         // Every type the writer references must exist before the type table:
         // pointers to the declared functions (call / metadata operands).
@@ -827,37 +861,10 @@ impl Module {
         // are dropped. Value numbering follows that order.
         let (order, pos) = self.block_layout();
 
-        // Global variables nothing references (e.g. an exchange array the code never
-        // needed) are left out: the validator rejects unused internal declarations.
-        // Likewise declarations of functions no longer called (after `optimize`).
-        let mut gused = vec![false; self.globals.len()];
-        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
-        {
-            let mut mark = |v: Value| match v {
-                Value::Global(g) => gused[g as usize] = true,
-                Value::Func(f) => fused[f as usize] = true,
-                _ => {}
-            };
-            for &b in &order {
-                for &i in &self.blocks[b] {
-                    let op = &self.insts[i as usize].op;
-                    if let Op::Call(f, _) = op {
-                        mark(Value::Func(*f));
-                    }
-                    op.for_each_operand(&mut mark);
-                }
-            }
-            for c in &self.consts {
-                if let ConstDef::Aggregate(_, e) = c {
-                    e.iter().copied().for_each(&mut mark);
-                }
-            }
-            for m in &self.md {
-                if let MdDef::Val(_, v) = m {
-                    mark(*v);
-                }
-            }
-        }
+        // Global variables, declarations, and module constants nothing references
+        // are left out: the validator rejects unused internal declarations, and
+        // pruning dead constants keeps BLOCK_CONSTANTS compact after `optimize`.
+        let (gused, fused, cused) = self.live_values(&order, &pos);
         let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
         let mut n_globals = 0u64;
         for (g, used) in gused.iter().enumerate() {
@@ -876,7 +883,11 @@ impl Module {
             }
         }
         let fmap = &fmap;
-        let n_consts = self.consts.len() as u64;
+        let (mut cmap, mut n_consts) = (vec![None; self.consts.len()], 0u64);
+        for (c, &used) in cused.iter().enumerate() {
+            if used { cmap[c] = Some(n_consts); n_consts += 1; }
+        }
+        let cmap = &cmap;
         let const_base = n_globals + n_funcs;
         let inst_base = const_base + n_consts;
 
@@ -897,7 +908,7 @@ impl Module {
             match v {
                 Value::Global(g) => gmap[g as usize].expect("use of a dropped global"),
                 Value::Func(f) => n_globals + fmap[f as usize].expect("use of a dropped function"),
-                Value::Const(c) => const_base + c as u64,
+                Value::Const(c) => const_base + cmap[c as usize].expect("use of a dropped constant"),
                 Value::Inst(i) => inst_ids[i as usize].unwrap_or_else(|| {
                     self.fail(format!("use of a void instruction %{i}"));
                     0
@@ -952,10 +963,10 @@ impl Module {
         }
 
         // Module-level constants.
-        if !self.consts.is_empty() {
+        if n_consts > 0 {
             w.enter_block(BLOCK_CONSTANTS);
             let mut cur_ty = None;
-            for c in &self.consts {
+            for c in self.consts.iter().enumerate().filter(|(i, _)| cused[*i]).map(|x| x.1) {
                 let t = match c {
                     ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
                 };
@@ -1034,6 +1045,51 @@ impl Module {
 
     fn is_void(&self, t: Ty) -> bool {
         matches!(self.types[t.0 as usize], TypeDef::Void)
+    }
+
+    /// `(gused, fused, cused)` liveness over reachable blocks (`order`) and metadata.
+    fn live_values(&self, order: &[usize], pos: &[Option<u32>]) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+        let mut gused = vec![false; self.globals.len()];
+        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
+        let mut cused = vec![false; self.consts.len()];
+        let mut work = Vec::new();
+        let mark = |v: Value, g: &mut [bool], f: &mut [bool], c: &mut [bool], w: &mut Vec<Value>| match v {
+            Value::Global(i) if !g[i as usize] => { g[i as usize] = true; w.push(v); }
+            Value::Func(i) => f[i as usize] = true,
+            Value::Const(i) if !c[i as usize] => { c[i as usize] = true; w.push(v); }
+            _ => {}
+        };
+        for &b in order {
+            for &i in &self.blocks[b] {
+                match &self.insts[i as usize].op {
+                    Op::Call(f, args) => {
+                        mark(Value::Func(*f), &mut gused, &mut fused, &mut cused, &mut work);
+                        args.iter().for_each(|&a| mark(a, &mut gused, &mut fused, &mut cused, &mut work));
+                    }
+                    Op::Phi(inc) => for &(v, pred) in inc {
+                        if pos.get(pred.0 as usize).copied().flatten().is_some() {
+                            mark(v, &mut gused, &mut fused, &mut cused, &mut work);
+                        }
+                    },
+                    op => op.for_each_operand(|v| mark(v, &mut gused, &mut fused, &mut cused, &mut work)),
+                }
+            }
+        }
+        for m in &self.md {
+            if let MdDef::Val(_, v) = m { mark(*v, &mut gused, &mut fused, &mut cused, &mut work); }
+        }
+        while let Some(v) = work.pop() {
+            match v {
+                Value::Global(g) => if let Some(init) = self.globals[g as usize].init {
+                    mark(init, &mut gused, &mut fused, &mut cused, &mut work);
+                },
+                Value::Const(c) => if let ConstDef::Aggregate(_, elems) = &self.consts[c as usize] {
+                    elems.iter().for_each(|&e| mark(e, &mut gused, &mut fused, &mut cused, &mut work));
+                },
+                _ => {}
+            }
+        }
+        (gused, fused, cused)
     }
 
     fn write_types(&self, w: &mut BitWriter) {
@@ -1541,6 +1597,7 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::dxil::{container::Stage, shader::{self, Shader}, validate};
 
     #[test]
     fn sign_extension_does_not_intern_unrelated_integer_types() {
@@ -1568,5 +1625,106 @@ mod tests {
         assert!(matches!(first.op, Op::Cast(CastOp::SExt, source, ty)
             if source == bit && module.int_width(ty) == Some(32)));
         assert!(matches!(second.op, Op::Cast(CastOp::SExt, Value::Inst(0), ty) if ty == i64));
+    }
+
+    fn symtab_names(bc: &[u8]) -> Vec<String> {
+        assert!(bc.starts_with(&[b'B', b'C', 0xC0, 0xDE]));
+        let (mut bit, mut w, mut blk, mut stack, mut out) = (32usize, 2u32, 0u32, Vec::new(), Vec::new());
+        let bits = |bit: &mut usize, n: u32| (0..n).fold(0u64, |v, k| { let b = (bc[*bit / 8] >> (*bit % 8)) & 1; *bit += 1; v | ((b as u64) << k) });
+        let vbr = |bit: &mut usize, n: u32| {
+            let (mut o, mut s, hi) = (0u64, 0u32, 1u64 << (n - 1));
+            loop { let c = bits(bit, n); o |= (c & (hi - 1)) << s; if c & hi == 0 { return o; } s += n - 1; }
+        };
+        while bit + w as usize <= bc.len() * 8 {
+            match bits(&mut bit, w) {
+                0 => { bit = (bit + 31) & !31; if let Some((pw, pb)) = stack.pop() { w = pw; blk = pb; } else { break; } }
+                1 => { let (id, nw) = (vbr(&mut bit, 8) as u32, vbr(&mut bit, 4) as u32); bit = ((bit + 31) & !31) + 32; stack.push((w, blk)); w = nw; blk = id; }
+                3 => {
+                    let (code, n) = (vbr(&mut bit, 6) as u32, vbr(&mut bit, 6) as usize);
+                    let ops: Vec<u64> = (0..n).map(|_| vbr(&mut bit, 6)).collect();
+                    if blk == BLOCK_VALUE_SYMTAB && code == VST_CODE_ENTRY { out.push(String::from_utf8(ops[1..].iter().map(|&x| x as u8).collect()).unwrap()); }
+                }
+                other => panic!("unexpected abbrev {other}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn unused_scalar_constants_produce_identical_bitcode() {
+        let build = |with_dead: bool| {
+            let mut m = Module::new();
+            m.define_entry("main");
+            let (entry, merge, i32) = (m.entry_block(), m.new_block(), m.i32());
+            let (c_i, c_f, c_md) = (m.i32c(7), m.f32c(1.0f32.to_bits()), m.i32c(99));
+            let _ = m.md_value(c_md);
+            let sum = m.bin(BinOp::Add, c_i, c_i);
+            let _ = m.fbin(BinOp::Add, c_f, c_f, fmf::NONE);
+            m.br(merge); m.set_block(merge);
+            let phi = m.phi(i32); m.add_incoming(phi, sum, entry); m.ret();
+            let mut dead = Vec::new();
+            if with_dead {
+                for k in 0..256u32 { dead.extend([m.i32c(10_000 + k), m.f32c((2.0f32 + k as f32).to_bits())]); }
+                let unreach = m.new_block(); m.set_block(unreach);
+                let (c_u, c_phi) = (m.i32c(0xDEAD_0001), m.i32c(0xDEAD_0002));
+                let _ = m.bin(BinOp::Add, c_u, c_u); m.br(merge);
+                m.add_incoming(phi, c_phi, unreach); dead.extend([c_u, c_phi]);
+            }
+            (m, [c_i, c_f, c_md], dead)
+        };
+        let ((mut clean, _, _), (mut noisy, live, dead)) = (build(false), build(true));
+        let (order, pos) = noisy.block_layout(); let (_, _, cused) = noisy.live_values(&order, &pos);
+        for v in live { let Value::Const(c) = v else { unreachable!() }; assert!(cused[c as usize]); }
+        for v in dead { let Value::Const(c) = v else { unreachable!() }; assert!(!cused[c as usize]); }
+        assert_eq!(clean.try_to_bitcode(shader::TRIPLE, shader::DATALAYOUT).unwrap(), noisy.try_to_bitcode(shader::TRIPLE, shader::DATALAYOUT).unwrap());
+    }
+
+    #[test]
+    fn dead_aggregate_does_not_retain_unused_global_while_live_global_init_is_kept() {
+        let mut m = Module::new(); m.define_entry("main");
+        let i32 = m.i32();
+        let (inner_ty, p_i32) = (m.array(2, i32), m.ptr(i32, 0));
+        let (outer_ty, dead_arr_ty) = (m.array(2, inner_ty), m.array(1, p_i32));
+        let (a0, a1, a2, a3, z, d_val) = (m.i32c(11), m.i32c(22), m.i32c(33), m.i32c(44), m.i32c(0), m.i32c(77));
+        let (r0, r1) = (m.aggregate(inner_ty, &[a0, a1]), m.aggregate(inner_ty, &[a2, a3]));
+        let live_init = m.aggregate(outer_ty, &[r0, r1]);
+        let g_live = m.global("live_tbl", outer_ty, 0, Some(live_init), true, 4);
+        let p = m.gep(g_live, &[z, z, z]); let _ = m.load(p, 4); m.ret();
+        let g_dead_inner = m.global("dead_inner_sym", i32, 0, Some(d_val), true, 4);
+        let dead_agg = m.aggregate(dead_arr_ty, &[g_dead_inner]);
+        let g_dead = m.global("dead_outer_sym", dead_arr_ty, 0, Some(dead_agg), true, 4);
+        let (order, pos) = m.block_layout(); let (gused, _, cused) = m.live_values(&order, &pos);
+        let (Value::Global(gl), Value::Global(gd), Value::Global(gdi)) = (g_live, g_dead, g_dead_inner) else { unreachable!() };
+        assert!(gused[gl as usize] && !gused[gd as usize] && !gused[gdi as usize], "globals: {gused:?}");
+        for v in [a0, a1, a2, a3, r0, r1, live_init, z] { let Value::Const(c) = v else { unreachable!() }; assert!(cused[c as usize]); }
+        for v in [d_val, dead_agg] { let Value::Const(c) = v else { unreachable!() }; assert!(!cused[c as usize]); }
+        let bc = m.try_to_bitcode(shader::TRIPLE, shader::DATALAYOUT).unwrap();
+        assert_eq!(bc, m.try_to_bitcode(shader::TRIPLE, shader::DATALAYOUT).unwrap());
+        let names = symtab_names(&bc);
+        assert!(names.iter().any(|n| n == "live_tbl") && !names.iter().any(|n| n == "dead_outer_sym" || n == "dead_inner_sym"), "{names:?}");
+    }
+
+    #[test]
+    fn pruned_direct_dxil_shader_with_live_table_and_dead_constants_validates() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let (uav, i32) = (s.raw_uav(0, 0), s.m.i32());
+        let (at, p_i32) = (s.m.array(4, i32), s.m.ptr(i32, 0));
+        let vals = [s.m.i32c(10), s.m.i32c(20), s.m.i32c(30), s.m.i32c(40)];
+        let init = s.m.aggregate(at, &vals); let tbl = s.m.global("live_tbl", at, 0, Some(init), true, 4);
+        let tid = s.thread_id_in_group(0);
+        let (c0, c2, c3) = (s.m.i32c(0), s.m.i32c(2), s.m.i32c(3));
+        let idx = s.m.bin(BinOp::And, tid, c3); let ptr = s.m.gep(tbl, &[c0, idx]);
+        let loaded = s.m.load(ptr, 4); let off = s.m.bin(BinOp::Shl, tid, c2);
+        s.raw_store(uav, off, &[loaded]);
+        for k in 0..64u32 { let _ = s.m.i32c(10_000 + k); }
+        let d0 = s.m.i32c(9999); let g_dead = s.m.global("dead_inner_tbl", i32, 0, Some(d0), true, 4);
+        let d_arr = s.m.array(1, p_i32); let _dead_agg = s.m.aggregate(d_arr, &[g_dead]);
+        let dxil = s.try_finish([1, 1, 1], None).expect("try_finish must succeed");
+        assert!(dxil.len() >= 32 && &dxil[..4] == b"DXBC");
+        if crate::gpu::recomp::dxc::create_instance().is_some() {
+            validate::validate(&dxil).expect("pruned DXIL shader must validate");
+            let dis = validate::disassemble(&dxil).expect("disassemble pruned DXIL shader");
+            assert!(dis.contains("@live_tbl") && !dis.contains("@dead_inner_tbl"), "unexpected globals:\n{dis}");
+        }
     }
 }
